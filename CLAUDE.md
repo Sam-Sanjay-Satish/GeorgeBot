@@ -24,27 +24,42 @@ relative to *this* repo's root.
 ## TL;DR Architecture
 
 ```
-user question + chat history
+user question + chat history + audience (undergrad | faculty | both)
    │
-   ├─ rewrite_and_route()  → MiniMax-M3 (official API, thinking DISABLED)
+   ├─ rewrite_and_route(…, audience)  → MiniMax-M3 (official API, thinking DISABLED)
    │                          (ONE call: standalone search query +
    │                          course_codes[] + program_query + wants_outline
-   │                          + topic_families[] + department)
+   │                          + topic_families[] + department; the topic_family
+   │                          vocabulary offered depends on audience)
    │
    ├─ graph_retrieve()   (only if course_codes / program_query present)
-   │     └─ GraphStore (course_graph.pkl + program_graph.pkl + course outlines)
+   │     └─ GraphStore (course_graph.pkl + program_graph.pkl + HEAT outlines)
    │        → prereqs, credits, cross-listings, descriptions, program
-   │          requirements, outline text. No vector search.
+   │          requirements, outline text. No vector search. Audience-independent.
    │
-   ├─ vector_retrieve(query)
-   │     └─ Voyage query embedding → Chroma georgebot_v2 top-40 question-vectors
-   │        → distance-filtered (MAX_CHUNK_DISTANCE=0.75) → collapse by
-   │          chunk_id → up to N_CONTEXT=4 distinct chunks (full text)
+   ├─ vector_retrieve(query, audience)
+   │     └─ Voyage query embedding (ONE) → queried against the selected
+   │        collection(s) — georgebot_v22_undergrad and/or _faculty — top-40
+   │        question-vectors each → distance-filtered (MAX_CHUNK_DISTANCE=0.75)
+   │        → merged by distance across collections → collapse by chunk_id →
+   │          up to N_CONTEXT=4 distinct chunks (full text)
    │
    └─ answer()  → MiniMax-M3 (official API, thinking DISABLED)
                   → answer from graph facts + vector chunks (supplied via the
                     SYSTEM prompt, numbered together) + format_sources()
 ```
+
+**Audience (v2.2).** The corpus is split into two Chroma collections —
+`georgebot_v22_undergrad` and `georgebot_v22_faculty` — with disjoint
+topic-family vocabularies (student services vs. HR/governance/research-admin).
+The **user** picks the scope per question via a frontend toggle
+(undergrad / faculty / both); there is no LLM audience-guessing. `audience`
+flows from the request → `rewrite_and_route` (which topic-family list to offer)
+and `vector_retrieve` (which collection(s) to search). `both` embeds once and
+distance-merges results across the two collections (globally-nearest N_CONTEXT,
+not N per corpus). Both collections share the embedding space (`voyage-4-large`,
+1024-d), which is what makes cross-collection distance-merge valid. The
+course/program graph is shared, so audience does not affect graph facts.
 
 Everything lives in **one engine class**, `GeorgeBot`, in `backend/chatbot.py`.
 `backend/api.py` is a thin FastAPI wrapper around it (also used by the CLI
@@ -133,9 +148,9 @@ reading this first:
 │   ├── Dockerfile             # backend container build (Railway); multi-stage python:3.14-slim, CMD python api.py
 │   ├── .dockerignore          # excludes volume artifacts (chroma_db/graph_data/taxonomy), .env, pycache
 │   ├── requirements.txt       # serving deps only (openai, voyageai, chromadb, networkx, fastapi, uvicorn)
-│   ├── chroma_db/             # Chroma vector DB, collection georgebot_v2 (gitignored — see Data below)
-│   ├── vector_taxonomy.json   # topic_families/department controlled vocabulary (gitignored)
-│   └── graph_data/            # course_graph.pkl, program_graph.pkl, course_outlines_final.json (gitignored)
+│   ├── chroma_db/             # Chroma vector DB, collections georgebot_v22_undergrad + _faculty (gitignored — see Data below)
+│   ├── vector_taxonomy.json   # per-audience topic_families + shared department vocab, generated from pipeline taxonomy.yaml (gitignored)
+│   └── graph_data/            # course_graph.pkl, program_graph.pkl, heat_outlines.json (gitignored)
 └── frontend/                  # React + Vite + TS chat UI (wired to the API)
     └── src/
         ├── App.tsx            # chat state; calls the backend, renders messages + sources
@@ -145,10 +160,17 @@ reading this first:
 ```
 
 `backend/graph_queries.py` is a **copy**, not a symlink, of
-`georgebot-pipeline`'s `data-pipeline/v2/course-graph/graph_queries.py`,
-repointed at `./graph_data/` instead of `./output/`. If the pipeline repo's
-version changes, re-copy and re-patch the paths here (or diff first — they
-drift if edited independently).
+`georgebot-pipeline`'s `course_graph/graph_queries.py`, patched two ways:
+(1) paths use this repo's env-var scheme (`GRAPH_DATA_DIR`/`DATA_DIR`/
+`./graph_data`) instead of the pipeline's `config.*`; (2) the outline loader
+reads v2.2's **`heat_outlines.json`** — a flat `{code: {course, term, url,
+text}}` dict, HEAT-only (eng/CS courses; others have no outline) — instead of
+the old list-shaped `course_outlines_final.json`. The **accessor API is
+identical** to the pipeline's (all 19 `GraphStore` methods). If the pipeline
+version changes, re-copy and re-apply those two patches (diff first — they
+drift if edited independently). The outline record shape is also read directly
+in `chatbot.py` (`_graph_context_text`, `format_sources`) — `term`/`text`/
+`url`, no nested `metadata`.
 
 ---
 
@@ -159,10 +181,21 @@ they're too large for a normal git push and don't belong in this repo's
 history. They're produced by `georgebot-pipeline` and get onto this app
 via a **Railway Volume**, not a git commit:
 
-1. Rerun/re-embed happens in `georgebot-pipeline`.
-2. Copy the fresh `chroma_db/`, `graph_data/`, `vector_taxonomy.json` into
-   this repo's `backend/` locally, for dev/testing — this refreshes your
-   *local* copy only.
+1. Rerun/re-embed happens in `georgebot-pipeline` (v2.2).
+2. Copy the fresh artifacts into this repo's `backend/` locally, for
+   dev/testing (refreshes your *local* copy only):
+   - `chroma_db/` ← pipeline `json_db/data/f_embed/chroma_db/` (both
+     collections live in one DB).
+   - `graph_data/course_graph.pkl` + `program_graph.pkl` ←
+     `course_graph/output/`; `graph_data/heat_outlines.json` ←
+     `acquisition/heat/output/heat_outlines.json`.
+   - `vector_taxonomy.json` is **generated**, not copied: run a small
+     script over the pipeline's `taxonomy.yaml` that derives `tf_<slug>`
+     keys and emits `{departments, topic_families_undergrad,
+     topic_families_faculty}` (each family list as `{slug, name}`). Slug
+     rule must match `f_embed/embed.py`. Verify generated slugs equal the
+     `tf_*` keys actually present in each collection before trusting the
+     filter.
 3. **Separately**, push the same data into the Railway Volume mounted on
    the backend service in production — copying locally does **not**
    propagate to Railway by itself.
@@ -253,8 +286,13 @@ cd frontend && npm run dev
 | Method | Path | Body | Returns |
 |---|---|---|---|
 | GET  | `/health` | — | `{status, chunks}` |
-| POST | `/api/chat` | `{question, history?}` | `{answer, sources[], search_query, n_chunks}` (JSON) |
-| POST | `/api/chat/stream` | `{question, history?}` | `text/event-stream` (SSE: `sources`, `token`, `done`, `error`) |
+| POST | `/api/chat` | `{question, history?, audience?}` | `{answer, sources[], search_query, n_chunks}` (JSON) |
+| POST | `/api/chat/stream` | `{question, history?, audience?}` | `text/event-stream` (SSE: `status`, `sources`, `token`, `done`, `error`) |
+
+`audience` is `"undergrad"` (default) `| "faculty" | "both"`; unrecognized
+values fall back to the default. The `status` SSE event fires before `token`s
+with a short, templated phase line (e.g. `"Looking up CSC 225…"`, `"Reading
+through sources…"`) derived from the route — no extra LLM call.
 
 `history` is a list of `{role: "user"|"assistant", content: str}`.
 
@@ -268,16 +306,18 @@ curl -s -X POST http://127.0.0.1:5001/api/chat -H 'Content-Type: application/jso
 ## Retrieval Pipeline — Full Detail (tune here)
 
 ### 1. Query rewrite + route — `MiniMax-M3` (thinking disabled)
-`rewrite_and_route(question, history)` is **one** call that returns JSON:
-`search_query`, `course_codes` (normalized, no space — `"CSC 225"` →
+`rewrite_and_route(question, history, audience)` is **one** call that returns
+JSON: `search_query`, `course_codes` (normalized, no space — `"CSC 225"` →
 `"CSC225"`), `program_query`, `wants_outline`, `completed_courses`,
 `topic_families` (0-3, copied verbatim from the taxonomy), `department`
 (copied verbatim, or null). `course_codes`/`program_query` are only meant
 to be populated for **structured catalog facts** (prereqs, credits,
 cross-listings, descriptions, program requirements, outline content) — a
-course code mentioned in passing should leave both empty. `topic_families`/
-`department` must match `vector_taxonomy.json` exactly (passed into the
-prompt in full) — anything not in that list is dropped on parse. On any
+course code mentioned in passing should leave both empty. The `topic_families`
+list shown in the prompt is **audience-dependent** (undergrad list, faculty
+list, or the union for `both`); `department` is one shared list. Both must
+match `vector_taxonomy.json` exactly (passed into the prompt in full) —
+anything not in the valid set for that audience is dropped on parse. On any
 failure (bad JSON, API error), falls back to vector-only with everything
 else empty/null/False. Note: MiniMax-M3 is **not fully deterministic even
 at temperature 0** — the exact rewritten `search_query` text varies run to
@@ -288,14 +328,23 @@ requests.
 Only runs when `course_codes` or `program_query` is non-empty.
 - **Per course code:** `_course_facts()` pulls title/credits/hours/description,
   `get_eligibility()`, `get_corequisites()`, `cross_listings()`,
-  `get_unlocks()`, `get_alternatives()`, `programs_requiring()`, and — if
-  `wants_outline` — `get_outline()` (truncated to 4000 chars, tagged
-  HISTORICAL with its term).
+  `get_unlocks()`, `get_alternatives()`, `programs_requiring()`,
+  `prereq_chain()` (full transitive prereq closure; rendered as the *deeper*
+  deps beyond the direct prereqs), and — if `wants_outline` — `get_outline()`
+  (truncated to 4000 chars, tagged HISTORICAL with its term).
 - **Program query:** `_program_facts()` calls `search_programs()` (fuzzy,
   token-based, can return multiple candidates). If ambiguous, the context
   block lists all candidates and the system prompt tells the model to ask
   the user to disambiguate. If exactly one match, pulls `get_program()` +
-  `program_requirement_groups()` + `program_specializations()`.
+  `program_requirement_groups()` + `program_specializations()` +
+  `program_courses()` (flat list of every course the program references,
+  capped at 60 in the rendered block).
+- These accessors run as a deterministic **bulk fetch** — the router names a
+  course/program, the code pulls the full fact set; the LLM does not pick
+  accessors. Two `GraphStore` methods remain intentionally unused:
+  `get_prereqs` (superseded by `get_eligibility`'s option-group view) and
+  `course_with_programs` (a convenience wrapper that only re-bundles accessors
+  already called here) — wiring either in would duplicate facts already shown.
 - `_graph_context_text()` renders this into numbered `[n]` blocks tagged
   `source=kuali`, same numbering scheme as vector chunks.
 
@@ -303,10 +352,14 @@ Only runs when `course_codes` or `program_query` is non-empty.
 - **Model:** `voyage-4-large`. Queries embed with `input_type="query"`; the
   index was built with `input_type="document"` (asymmetric — must stay
   matched; don't "simplify" this).
-- **Store:** Chroma `PersistentClient`, collection **`georgebot_v2`**,
-  cosine similarity, ~22,470 entries (one per reverse-HyDE question, 5 per
-  chunk, ~4,494 chunks). The *question* is embedded; the *full parent
-  chunk text* is the entry's `document`.
+- **Store:** Chroma `PersistentClient`, one DB, **two collections**
+  (`georgebot_v22_undergrad` ~42,585 vectors, `georgebot_v22_faculty`
+  ~20,350), cosine similarity. One entry per reverse-HyDE question (5 per
+  chunk); the *question* is embedded, the *full parent chunk text* is the
+  entry's `document`. `vector_retrieve(query, audience, …)` opens both at
+  load, embeds the query once, and queries whichever the audience selects;
+  for `both` it merges hits from the two by distance (`_merge_collapse`)
+  before collapsing. See the Audience note in the TL;DR.
 - `vector_retrieve(query)` pulls **`QUESTION_K = 40`** nearest
   question-vectors, drops any with cosine distance **> `MAX_CHUNK_DISTANCE`
   (0.75)**, then collapses the rest by `metadata.chunk_id` in rank order
@@ -447,19 +500,29 @@ after new corpus content lands.
 
 - React + Vite + TypeScript, Tailwind v4 + shadcn/ui.
 - `App.tsx` holds the message list; on send it appends a user msg + a
-  loading assistant msg, then calls `askGeorgeStream(text, priorMessages, handlers)`
-  (streaming). Tokens land in a queue and a client-side typewriter
-  (`REVEAL_CHARS_PER_TICK=3` / `REVEAL_TICK_MS=16`) paces the reveal so
-  bursty deltas read smoothly. **Sources are buffered and attached only when
+  loading assistant msg, then calls `askGeorgeStream(text, priorMessages,
+  audience, handlers)` (streaming). Tokens land in a queue and a client-side
+  typewriter (`REVEAL_CHARS_PER_TICK=3` / `REVEAL_TICK_MS=16`) paces the reveal
+  so bursty deltas read smoothly. **Sources are buffered and attached only when
   the reveal finishes** (`finish()`), so they appear with the completed
   answer, not mid-stream. `askGeorge()` (non-streaming `/api/chat`) still
   exists in `lib/api.ts` but isn't used by the UI.
-- `lib/api.ts`: `askGeorgeStream` POSTs to `${VITE_API_BASE ??
-  'http://127.0.0.1:5001'}/api/chat/stream` and hand-parses the SSE frames
-  (`sources`/`token`/`done`/`error`); builds `history` from prior non-loading
-  messages; maps API sources to the UI `Source` type. `cleanTitle()` trims
-  the raw page-`<title>` breadcrumb tail (drops faculty/university/`Home`
-  segments, keeps the two most specific parts) so source labels read cleanly.
+- **Audience toggle** (`components/AudienceToggle.tsx`): a segmented
+  Undergrad / Faculty / Both control rendered above `ChatInput`; the selection
+  (`Audience` in `types.ts`) lives in `App` state, defaults to `undergrad`, and
+  is passed into every `askGeorgeStream` call as the request `audience`. This is
+  the only audience signal — the backend does not guess it.
+- **Status line** (`MessageBubble.tsx`): while the assistant message is
+  `loading`, a small muted line (from the `status` SSE event, stored on
+  `Message.status`) shows the pre-answer phase before the dots; it's cleared
+  when the first `token` arrives.
+- `lib/api.ts`: `askGeorgeStream(question, priorMessages, audience, handlers)`
+  POSTs to `${VITE_API_BASE ?? 'http://127.0.0.1:5001'}/api/chat/stream` and
+  hand-parses the SSE frames (`status`/`sources`/`token`/`done`/`error`); builds
+  `history` from prior non-loading messages; maps API sources to the UI `Source`
+  type. `cleanTitle()` trims the raw page-`<title>` breadcrumb tail (drops
+  faculty/university/`Home` segments, keeps the two most specific parts) so
+  source labels read cleanly.
 - **Branding**: browser tab uses `frontend/public/favicon.svg` (a violet-
   gradient "G" mark) + `<title>GeorgeBot</title>`; the assistant message
   avatar (`MessageBubble.tsx`) and header both render a "G".
@@ -468,23 +531,31 @@ after new corpus content lands.
 Every Chroma entry (one per question) carries, in `metadata`:
 ```json
 {
-  "chunk_id": "5ebf5c9d3c87278c#0",
-  "doc_id": "5ebf5c9d3c87278c",
-  "url": "https://...",
+  "chunk_id": "004b89e2d172a946#1",
+  "doc_id": "004b89e2d172a946",
+  "origin": "https://...",           // v2.2: was "url" in v2
   "title": "...",
-  "document_type": "campus / facilities / services",
-  "department": "general / cross-departmental",
-  "source_file": "webpage | document",
+  "document_type": "policy / regulation document",
+  "department": "English",
+  "source": "webpage | document | calendar",   // v2.2: was "source_file"
   "topic_families": "pipe | joined | string",
-  "tf_advising_program_planning": true,
+  "tf_degree_programs_requirements_curriculum": true,
   "tf_...": "one boolean per family this chunk belongs to",
   "question_index": 0,
-  "question": "..."
+  "question": "...",
+  "src_doc_type": "layout", "src_filetype": "pdf", "src_path_prefix": "humanities"  // extra v2.2 passthrough, mostly unused at serve time
 }
 ```
+**v2.2 key renames the serving code depends on:** `url` → **`origin`**,
+`source_file` → **`source`** (both read in `_build_context` / `format_sources`).
 `department` and `tf_<slug>` booleans are the actual filter keys.
 `topic_families` (pipe-joined) is display-only. `chunk_id` is what
-`vector_retrieve()` collapses on.
+`vector_retrieve()` collapses on. **The `tf_<slug>` set differs per collection**
+(undergrad vs. faculty have disjoint families) — slug =
+`"tf_"+re.sub(r"[^a-z0-9]+","_",name.lower())`, matching the pipeline's
+`f_embed/embed.py`. `vector_taxonomy.json` carries both lists
+(`topic_families_undergrad` / `topic_families_faculty`) so `_build_where`
+uses the right one per audience.
 
 `format_sources()` returns `source` values `webpage | document | kuali |
 heat` (plus occasional `calendar`). UI badge enum: `webpage → uvic_html`,

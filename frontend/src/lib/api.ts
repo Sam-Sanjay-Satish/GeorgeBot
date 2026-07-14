@@ -1,4 +1,4 @@
-import type { Message, Source } from '@/types'
+import type { Audience, Message, Source } from '@/types'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:5001'
 
@@ -85,11 +85,12 @@ function toHistory(messages: Message[]): { role: string; content: string }[] {
 export async function askGeorge(
   question: string,
   priorMessages: Message[],
+  audience: Audience = 'undergrad',
 ): Promise<{ answer: string; sources: Source[] }> {
   const res = await fetch(`${API_BASE}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, history: toHistory(priorMessages) }),
+    body: JSON.stringify({ question, history: toHistory(priorMessages), audience }),
   })
   if (!res.ok) {
     throw new Error(`API error ${res.status}`)
@@ -117,12 +118,13 @@ interface StreamHandlers {
 export async function askGeorgeStream(
   question: string,
   priorMessages: Message[],
+  audience: Audience,
   handlers: StreamHandlers,
 ): Promise<void> {
   const res = await fetch(`${API_BASE}/api/chat/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, history: toHistory(priorMessages) }),
+    body: JSON.stringify({ question, history: toHistory(priorMessages), audience }),
   })
   if (!res.ok || !res.body) {
     handlers.onError(`API error ${res.status}`)

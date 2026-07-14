@@ -8,11 +8,15 @@ Two retrieval paths, routed per-query by a single MiniMax-M3 call:
                    descriptions, program requirements, outlines) come straight
                    from `graph_queries.GraphStore` (course_graph.pkl +
                    program_graph.pkl + course outlines). No vector search.
-  - Vector path  — everything else hits the v2 Chroma collection
-                   (`georgebot_v2`), which stores one entry per reverse-HyDE
-                   question (5 per chunk). A query embeds once, we pull the
-                   nearest question-vectors, then collapse by `chunk_id` back
-                   to distinct parent chunks (full text + metadata).
+  - Vector path  — everything else hits the v2.2 Chroma DB, which splits the
+                   corpus into two collections (`georgebot_v22_undergrad`,
+                   `georgebot_v22_faculty`), each storing one entry per
+                   reverse-HyDE question (5 per chunk). The caller-supplied
+                   `audience` (undergrad / faculty / both) selects which to
+                   search. A query embeds once, we pull the nearest
+                   question-vectors from the selected collection(s), merge by
+                   distance, then collapse by `chunk_id` back to distinct
+                   parent chunks (full text + metadata).
 
 Then MiniMax-M3 reads whichever context was assembled and writes the final,
 source-cited answer (see `_call_llm`/`answer`/`answer_stream`). Single
@@ -115,7 +119,14 @@ def _iter_visible_deltas(chunks):
     if not in_think and pending:
         yield pending
 
-COLLECTION_NAME = "georgebot_v2"
+# v2.2 splits the corpus into two Chroma collections in one DB. The user picks
+# which to search per request (undergrad / faculty / both) — see `audience`.
+COLLECTION_NAMES = {
+    "undergrad": "georgebot_v22_undergrad",
+    "faculty": "georgebot_v22_faculty",
+}
+VALID_AUDIENCES = ("undergrad", "faculty", "both")
+DEFAULT_AUDIENCE = "undergrad"
 VOYAGE_MODEL = "voyage-4-large"
 
 # Single provider — official MiniMax API (OpenAI-compatible), not the
@@ -177,23 +188,39 @@ class GeorgeBot:
 
         if not TAXONOMY_FILE.exists():
             print(f"ERROR: taxonomy file not found at {TAXONOMY_FILE}. "
-                  f"Run data-pipeline/v2/final-databases/embed_questions.py and copy "
-                  f"output/taxonomy.json here as vector_taxonomy.json.", file=sys.stderr)
+                  f"Generate it from georgebot-pipeline v2.2's taxonomy.yaml (per-"
+                  f"audience topic_families + departments) as vector_taxonomy.json.",
+                  file=sys.stderr)
             sys.exit(1)
         taxonomy = json.loads(TAXONOMY_FILE.read_text())
-        self.topic_family_names = [t["name"] for t in taxonomy["topic_families"]]
-        self.topic_family_slugs = {t["name"]: t["slug"] for t in taxonomy["topic_families"]}
         self.departments = taxonomy["departments"]
-        print(f"  Taxonomy: {len(self.topic_family_names)} topic families, {len(self.departments)} departments")
+        # topic_families are per-audience in v2.2 (undergrad and faculty have
+        # disjoint vocabularies). Keep name-lists (for the router prompt) and
+        # name->slug maps (for Chroma `tf_<slug>` filtering) keyed by audience.
+        self.topic_family_names = {}   # audience -> [name, ...]
+        self.topic_family_slugs = {}   # audience -> {name: slug}
+        for aud in COLLECTION_NAMES:
+            fams = taxonomy[f"topic_families_{aud}"]
+            self.topic_family_names[aud] = [t["name"] for t in fams]
+            self.topic_family_slugs[aud] = {t["name"]: t["slug"] for t in fams}
+        # Union map for audience="both" (validating router output across both).
+        self.topic_family_slugs_all = {
+            name: slug for m in self.topic_family_slugs.values() for name, slug in m.items()
+        }
+        print(f"  Taxonomy: "
+              + ", ".join(f"{len(v)} {a}" for a, v in self.topic_family_names.items())
+              + f" topic families, {len(self.departments)} departments")
 
         if not CHROMA_DIR.exists():
-            print(f"ERROR: Chroma DB not found at {CHROMA_DIR}. "
-                  f"Run data-pipeline/v2/final-databases/embed_questions.py and copy "
-                  f"output/chroma_db/ here.", file=sys.stderr)
+            print(f"ERROR: Chroma DB not found at {CHROMA_DIR}. Copy georgebot-"
+                  f"pipeline v2.2's f_embed/chroma_db/ here.", file=sys.stderr)
             sys.exit(1)
         chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-        self.collection = chroma_client.get_collection(COLLECTION_NAME)
-        print(f"  Chroma collection '{COLLECTION_NAME}': {self.collection.count():,} question-vectors")
+        self.collections = {
+            aud: chroma_client.get_collection(name) for aud, name in COLLECTION_NAMES.items()
+        }
+        for aud, coll in self.collections.items():
+            print(f"  Chroma collection '{coll.name}' ({aud}): {coll.count():,} question-vectors")
 
         self.gs = GraphStore.load()
         print(f"  Course graph: {self.gs.cg.number_of_nodes():,} nodes; "
@@ -209,17 +236,26 @@ class GeorgeBot:
         resp = self.voyage.embed([text], model=VOYAGE_MODEL, input_type="query")
         return resp.embeddings[0]
 
-    def _build_where(self, topic_families: list[str], department: str | None) -> dict | None:
-        """Build a Chroma `where` clause from router-predicted topic families / department.
+    @staticmethod
+    def _audiences(audience: str) -> tuple[str, ...]:
+        """Collections to search for the requested audience."""
+        return ("undergrad", "faculty") if audience == "both" else (audience,)
 
-        Unknown family names (not in the taxonomy) are silently dropped —
-        harmless, since an unrecognized field just doesn't exist to filter on.
+    def _build_where(self, topic_families: list[str], department: str | None,
+                      audience: str) -> dict | None:
+        """Build a Chroma `where` clause from router-predicted topic families /
+        department, for one audience's collection.
+
+        Family names not in this audience's taxonomy are silently dropped —
+        harmless, and exactly what makes audience="both" work: a family
+        predicted from the other corpus's vocabulary just doesn't filter here.
         `department` is expanded to [department, GENERAL_DEPARTMENT] so a
         department-specific question still surfaces genuinely cross-cutting
         content (e.g. university-wide policies) alongside the department's own.
         """
         clauses = []
-        slugs = [self.topic_family_slugs[f] for f in topic_families if f in self.topic_family_slugs]
+        slug_map = self.topic_family_slugs[audience]
+        slugs = [slug_map[f] for f in topic_families if f in slug_map]
         if slugs:
             clauses.append({"$or": [{s: True} for s in slugs]} if len(slugs) > 1 else {slugs[0]: True})
         if department:
@@ -230,59 +266,90 @@ class GeorgeBot:
             return clauses[0]
         return {"$and": clauses}
 
-    def _query_chunks(self, emb: list[float], n: int, where: dict | None,
-                       exclude: set[str]) -> tuple[dict[str, dict], list[str]]:
+    def _query_candidates(self, collection, emb: list[float],
+                           where: dict | None) -> list[tuple[float, dict]]:
+        """Nearest question-vectors from ONE collection, distance-cutoff applied,
+        collapsed to distinct chunks (nearest occurrence wins), returned as
+        (distance, chunk) pairs nearest-first."""
         kwargs: dict = {"query_embeddings": [emb], "n_results": QUESTION_K,
                          "include": ["documents", "metadatas", "distances"]}
         if where:
             kwargs["where"] = where
-        res = self.collection.query(**kwargs)
-        chunks: dict[str, dict] = {}
-        order: list[str] = []
-        ids = res["ids"][0] if res["ids"] else []
+        res = collection.query(**kwargs)
         docs = res["documents"][0] if res["documents"] else []
         metas = res["metadatas"][0] if res["metadatas"] else []
         dists = res["distances"][0] if res["distances"] else []
-        for _qid, doc, meta, dist in zip(ids, docs, metas, dists):
+        out: list[tuple[float, dict]] = []
+        seen: set[str] = set()
+        for doc, meta, dist in zip(docs, metas, dists):
             if dist > MAX_CHUNK_DISTANCE:
                 break  # Chroma returns hits sorted nearest-first; nothing after this is closer
             cid = meta.get("chunk_id")
-            if not cid or cid in chunks or cid in exclude:
+            if not cid or cid in seen:
                 continue
-            chunks[cid] = {"chunk_id": cid, "text": doc, "metadata": meta}
+            seen.add(cid)
+            out.append((dist, {"chunk_id": cid, "text": doc, "metadata": meta}))
+        return out
+
+    @staticmethod
+    def _merge_collapse(candidate_lists: list[list[tuple[float, dict]]], n: int,
+                         exclude: set[str]) -> list[dict]:
+        """Merge per-collection candidate lists by cosine distance (valid across
+        collections since they share the embedding space), collapse to n distinct
+        chunks by chunk_id, skipping `exclude`."""
+        merged = sorted((c for lst in candidate_lists for c in lst), key=lambda x: x[0])
+        chunks: dict[str, dict] = {}
+        order: list[str] = []
+        for _dist, ch in merged:
+            cid = ch["chunk_id"]
+            if cid in chunks or cid in exclude:
+                continue
+            chunks[cid] = ch
             order.append(cid)
             if len(order) >= n:
                 break
-        return chunks, order
+        return [chunks[cid] for cid in order]
 
-    def vector_retrieve(self, query: str, n: int = N_CONTEXT,
-                         topic_families: list[str] | None = None,
+    def vector_retrieve(self, query: str, audience: str = DEFAULT_AUDIENCE,
+                         n: int = N_CONTEXT, topic_families: list[str] | None = None,
                          department: str | None = None) -> list[dict]:
         """
-        Query the reverse-HyDE question index, collapse hits to distinct chunks.
+        Query the reverse-HyDE question index(es) for the requested audience,
+        collapse hits to distinct chunks.
+
+        One query embedding is run against each selected collection and the
+        results are merged by distance (see `_merge_collapse`), so audience=
+        "both" returns the globally-nearest n chunks across the two corpora
+        rather than n-per-corpus.
 
         Soft filter with backfill: if topic_families/department were predicted
-        by the router, run a filtered pass first so on-topic chunks rank
-        first; then top up with an unfiltered pass (deduped) so a wrong or
-        overly-narrow prediction never drops recall to zero, it just
-        re-prioritizes what's already found by plain vector similarity.
+        by the router, run a filtered pass first so on-topic chunks rank first;
+        then top up with an unfiltered pass (deduped) so a wrong or overly-narrow
+        prediction never drops recall to zero — it just re-prioritizes what plain
+        vector similarity already found.
 
-        Both passes apply MAX_CHUNK_DISTANCE, so a genuinely off-topic query
-        can return fewer than n chunks — even zero — rather than being padded
-        out to n with irrelevant ones just to hit the count.
+        Both passes apply MAX_CHUNK_DISTANCE, so a genuinely off-topic query can
+        return fewer than n chunks — even zero — rather than being padded out to
+        n with irrelevant ones just to hit the count.
         """
         emb = self._embed_query(query)
-        where = self._build_where(topic_families or [], department) if (topic_families or department) else None
+        auds = self._audiences(audience)
+        has_filter = bool(topic_families or department)
 
-        chunks: dict[str, dict] = {}
-        order: list[str] = []
-        if where:
-            chunks, order = self._query_chunks(emb, n, where, exclude=set())
-        if len(order) < n:
-            more_chunks, more_order = self._query_chunks(emb, n - len(order), None, exclude=set(order))
-            chunks.update(more_chunks)
-            order.extend(more_order)
-        return [chunks[cid] for cid in order]
+        results: list[dict] = []
+        if has_filter:
+            filtered = [
+                self._query_candidates(self.collections[a], emb,
+                                       self._build_where(topic_families or [], department, a))
+                for a in auds
+            ]
+            results = self._merge_collapse(filtered, n, exclude=set())
+
+        if len(results) < n:
+            exclude = {r["chunk_id"] for r in results}
+            unfiltered = [self._query_candidates(self.collections[a], emb, None) for a in auds]
+            results += self._merge_collapse(unfiltered, n - len(results), exclude=exclude)
+        return results
 
     # -- graph retrieval --------------------------------------------------------
 
@@ -301,6 +368,10 @@ class GeorgeBot:
             "prereq_text": course.get("prereq_text"),
             "prereq_courses": eligibility.get("courses", []),
             "non_course_requirements": eligibility.get("non_course", []),
+            # Full transitive prereq closure (everything needed before this
+            # course, directly or via a chain), minus the direct prereqs already
+            # listed above — so it only shows the *deeper* dependencies.
+            "prereq_chain": sorted(self.gs.prereq_chain(code)),
             "corequisites": coreqs.get("courses", []),
             "cross_listed": self.gs.cross_listings(code),
             "unlocks": self.gs.get_unlocks(code),
@@ -342,6 +413,9 @@ class GeorgeBot:
                 {"label": g["label"], "tree": g["tree"]} for g in groups
             ],
             "specializations": [s["title"] for s in specs],
+            # Flat list of every course referenced anywhere in the program
+            # (groups + specializations) — quick "does this program require X".
+            "all_courses": self.gs.program_courses(m["pid"]),
         }
         if completed:
             result["completed_given"] = completed
@@ -374,6 +448,10 @@ class GeorgeBot:
                 lines.append(f"Prerequisite text (calendar): {c['prereq_text']}")
             if c.get("prereq_courses"):
                 lines.append(f"Prerequisite course codes: {', '.join(c['prereq_courses'])}")
+            # Deeper (transitive) prereqs beyond the direct ones already listed.
+            deeper = [x for x in c.get("prereq_chain", []) if x not in set(c.get("prereq_courses", []))]
+            if deeper:
+                lines.append(f"Full prerequisite chain also requires (indirectly): {', '.join(deeper)}")
             if c.get("non_course_requirements"):
                 nc = "; ".join(r.get("description", "") for r in c["non_course_requirements"])
                 lines.append(f"Other requirements: {nc}")
@@ -407,10 +485,9 @@ class GeorgeBot:
                     lines.append(f"Non-course requirements (cannot verify from completed list): {unk}")
             if c.get("outline"):
                 o = c["outline"]
-                meta = o.get("metadata", {})
-                term = meta.get("term_code", "unknown term")
+                term = o.get("term", "unknown term")
                 lines.append(
-                    f"HISTORICAL course outline (term {term}, source={meta.get('source', 'unknown')}):\n"
+                    f"HISTORICAL course outline (term {term}, source=heat):\n"
                     f"{o.get('text', '')[:4000]}"
                 )
             blocks.append("\n".join(lines))
@@ -445,6 +522,12 @@ class GeorgeBot:
                         lines.append(f"Requirement group \"{g['label']}\": {json.dumps(g['tree'])[:1500]}")
                 if program.get("specializations"):
                     lines.append(f"Specializations: {', '.join(program['specializations'])}")
+                if program.get("all_courses"):
+                    ac = program["all_courses"]
+                    shown = ", ".join(ac[:60])
+                    more = f" (+{len(ac) - 60} more)" if len(ac) > 60 else ""
+                    lines.append(f"All courses referenced by this program (may include "
+                                  f"options, not all required): {shown}{more}")
                 blocks.append("\n".join(lines))
             elif not program.get("matches"):
                 blocks.append(
@@ -486,12 +569,25 @@ class GeorgeBot:
             return THINK_TAG_RE.sub("", content).strip()
         return None
 
-    def rewrite_and_route(self, question: str, history: list[dict]) -> dict:
+    def rewrite_and_route(self, question: str, history: list[dict],
+                          audience: str = DEFAULT_AUDIENCE) -> dict:
         """
         One minimax-m3 call: rewrite the question into a standalone search query
         AND classify whether it needs structured course/program facts (graph
         route) or general document retrieval (vector route).
+
+        `audience` selects which topic-family vocabulary the router chooses from
+        (undergrad / faculty / both) — it must match the collection(s) that
+        vector_retrieve will search, or the predicted families won't filter.
         """
+        # Topic-family vocabulary the router may choose from for this audience.
+        if audience == "both":
+            family_names = self.topic_family_names["undergrad"] + self.topic_family_names["faculty"]
+            valid_families = set(self.topic_family_slugs_all)
+        else:
+            family_names = self.topic_family_names[audience]
+            valid_families = set(self.topic_family_slugs[audience])
+
         convo = ""
         if history:
             lines = []
@@ -525,7 +621,7 @@ class GeorgeBot:
             f'  "topic_families": array of 1-3 entries copied VERBATIM from this '
             f"exact list, whichever best describe what the question is about "
             f"(empty array if none fit well — don't force a bad match):\n"
-            f"{json.dumps(self.topic_family_names)}\n"
+            f"{json.dumps(family_names)}\n"
             f'  "department": copied VERBATIM from this exact list, the single '
             f"department/faculty the question is clearly about (e.g. the user "
             f"named a program, or asked something specific to one department's "
@@ -557,7 +653,7 @@ class GeorgeBot:
                 "course_codes": [c.replace(" ", "").upper() for c in (data.get("course_codes") or [])],
                 "program_query": data.get("program_query") or None,
                 "wants_outline": bool(data.get("wants_outline")),
-                "topic_families": [f for f in (data.get("topic_families") or []) if f in self.topic_family_slugs],
+                "topic_families": [f for f in (data.get("topic_families") or []) if f in valid_families],
                 "department": dept,
             }
         except Exception as e:
@@ -571,15 +667,15 @@ class GeorgeBot:
         for i, ch in enumerate(chunks, offset + 1):
             meta = ch.get("metadata", {})
             tags = []
-            if meta.get("source_file"):
-                tags.append(f"source={meta['source_file']}")
+            if meta.get("source"):
+                tags.append(f"source={meta['source']}")
             if meta.get("document_type"):
                 tags.append(f"type={meta['document_type']}")
             if meta.get("department"):
                 tags.append(f"department={meta['department']}")
             if meta.get("topic_families"):
                 tags.append(f"topics={meta['topic_families']}")
-            header = f"[{i}] {' | '.join(tags)}\nURL: {meta.get('url', 'n/a')}"
+            header = f"[{i}] {' | '.join(tags)}\nURL: {meta.get('origin', 'n/a')}"
             blocks.append(f"{header}\n{ch.get('text', '')}")
         text = "\n\n".join(blocks)
         if graph_text:
@@ -758,14 +854,14 @@ class GeorgeBot:
                 })
                 if c.get("outline"):
                     n += 1
-                    meta = c["outline"].get("metadata", {})
+                    o = c["outline"]
                     sources.append({
                         "n": n,
-                        "url": url,
-                        "source": "heat" if meta.get("source") == "heat" else "kuali",
+                        "url": o.get("url") or url,
+                        "source": "heat",
                         "title": f"{c['code']} outline",
                         "course_code": c["code"],
-                        "term": meta.get("term_code"),
+                        "term": o.get("term"),
                         "historical": True,
                     })
             program = graph_facts.get("program")
@@ -789,7 +885,7 @@ class GeorgeBot:
         for ch in chunks:
             n += 1
             meta = ch.get("metadata", {})
-            url = meta.get("url", "")
+            url = meta.get("origin", "")
             key = url or ch.get("chunk_id", str(n))
             if key in seen:
                 continue
@@ -797,7 +893,7 @@ class GeorgeBot:
             sources.append({
                 "n": n,
                 "url": url,
-                "source": meta.get("source_file", ""),
+                "source": meta.get("source", ""),
                 "title": meta.get("title") or "",
                 "document_type": meta.get("document_type") or None,
                 "department": meta.get("department") or None,
@@ -807,9 +903,16 @@ class GeorgeBot:
 
     # -- orchestration ------------------------------------------------------
 
-    def retrieve(self, question: str, history: list[dict]) -> tuple[dict, list[dict], dict]:
-        """Route the question, run retrieval, and return (route, chunks, graph_facts)."""
-        route = self.rewrite_and_route(question, history)
+    def retrieve(self, question: str, history: list[dict],
+                 audience: str = DEFAULT_AUDIENCE) -> tuple[dict, list[dict], dict]:
+        """Route the question, run retrieval, and return (route, chunks, graph_facts).
+
+        `audience` (undergrad / faculty / both) selects which collection(s) the
+        vector path searches and which topic-family vocabulary the router uses.
+        Graph facts are corpus-independent (the course/program graph is shared),
+        so audience doesn't affect them.
+        """
+        route = self.rewrite_and_route(question, history, audience)
         graph_facts = {}
         if route["course_codes"] or route["program_query"]:
             graph_facts = self.graph_retrieve(
@@ -817,13 +920,15 @@ class GeorgeBot:
                 route["completed_courses"],
             )
         chunks = self.vector_retrieve(
-            route["search_query"], topic_families=route["topic_families"], department=route["department"],
+            route["search_query"], audience=audience,
+            topic_families=route["topic_families"], department=route["department"],
         )
         return route, chunks, graph_facts
 
-    def ask(self, question: str, history: list[dict] | None = None) -> dict:
+    def ask(self, question: str, history: list[dict] | None = None,
+            audience: str = DEFAULT_AUDIENCE) -> dict:
         history = history or []
-        route, chunks, graph_facts = self.retrieve(question, history)
+        route, chunks, graph_facts = self.retrieve(question, history, audience)
         graph_text = self._graph_context_text(graph_facts) if graph_facts else ""
         n_graph_blocks = len(graph_facts.get("courses", [])) + (1 if graph_facts.get("program") else 0)
         context = self._build_context(chunks, graph_text, n_graph_blocks)
@@ -843,10 +948,12 @@ class GeorgeBot:
 def main() -> None:
     parser = argparse.ArgumentParser(description="GeorgeBot RAG backend — CLI smoke test")
     parser.add_argument("--ask", required=True, help="one-shot CLI question")
+    parser.add_argument("--audience", default=DEFAULT_AUDIENCE, choices=VALID_AUDIENCES,
+                         help=f"corpus to search (default {DEFAULT_AUDIENCE})")
     args = parser.parse_args()
 
     bot = GeorgeBot()
-    result = bot.ask(args.ask)
+    result = bot.ask(args.ask, audience=args.audience)
     print(f"\nSearch query: {result['search_query']}")
     print(f"Chunks used:  {result['n_chunks']}\n")
     print("Answer:")

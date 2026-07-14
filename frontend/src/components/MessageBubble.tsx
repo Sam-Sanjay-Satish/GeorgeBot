@@ -32,18 +32,19 @@ export function MessageBubble({ message }: Props) {
           }`}
         >
           {message.loading ? (
-            <span className="flex gap-2 items-center h-5">
-              {message.status && (
-                <span className="text-sm text-muted-foreground animate-pulse">
-                  {message.status}
-                </span>
-              )}
-              <span className="flex gap-1 items-center">
-                <span className="w-1.5 h-1.5 rounded-full bg-current animate-bounce [animation-delay:0ms]" />
-                <span className="w-1.5 h-1.5 rounded-full bg-current animate-bounce [animation-delay:150ms]" />
-                <span className="w-1.5 h-1.5 rounded-full bg-current animate-bounce [animation-delay:300ms]" />
+            // Once we have status text, show it alone — the dots are just a
+            // placeholder for the pre-status beat.
+            message.status ? (
+              <span className="flex items-center h-5 text-sm text-muted-foreground animate-pulse">
+                {message.status}
               </span>
-            </span>
+            ) : (
+              <span className="flex gap-1 items-center h-5">
+                <span className="w-1 h-1 rounded-full bg-current animate-bounce [animation-delay:0ms]" />
+                <span className="w-1 h-1 rounded-full bg-current animate-bounce [animation-delay:150ms]" />
+                <span className="w-1 h-1 rounded-full bg-current animate-bounce [animation-delay:300ms]" />
+              </span>
+            )
           ) : isUser ? (
             message.content
           ) : (
@@ -52,6 +53,7 @@ export function MessageBubble({ message }: Props) {
                 prose-p:my-2 first:prose-p:mt-0 last:prose-p:mb-0
                 prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5
                 prose-headings:mt-3 prose-headings:mb-1.5 first:prose-headings:mt-0
+                prose-h1:text-lg prose-h2:text-base prose-h3:text-sm prose-h4:text-sm
                 prose-pre:my-2 prose-strong:text-inherit prose-headings:text-inherit
                 prose-a:text-inherit prose-a:underline"
             >

@@ -29,12 +29,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from chatbot import GeorgeBot
+from chatbot import DEFAULT_AUDIENCE, VALID_AUDIENCES, GeorgeBot
 
 
 class ChatRequest(BaseModel):
     question: str = ""
     history: list[dict] = []
+    # Which v2.2 corpus to search: "undergrad" | "faculty" | "both". Chosen by
+    # the user via the frontend toggle; anything unrecognized falls back to the
+    # default rather than erroring.
+    audience: str = DEFAULT_AUDIENCE
+
+
+def _clean_audience(value: str | None) -> str:
+    return value if value in VALID_AUDIENCES else DEFAULT_AUDIENCE
 
 
 def _course_label(code: str) -> str:
@@ -88,14 +96,15 @@ def create_app(bot: GeorgeBot) -> FastAPI:
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "chunks": bot.collection.count()}
+        return {"status": "ok",
+                "chunks": sum(c.count() for c in bot.collections.values())}
 
     @app.post("/api/chat")
     def chat(req: ChatRequest):
         question = (req.question or "").strip()
         if not question:
             return {"error": "missing 'question'"}
-        return bot.ask(question, req.history)
+        return bot.ask(question, req.history, audience=_clean_audience(req.audience))
 
     @app.post("/api/chat/stream")
     def chat_stream(req: ChatRequest):
@@ -103,13 +112,15 @@ def create_app(bot: GeorgeBot) -> FastAPI:
         if not question:
             return {"error": "missing 'question'"}
 
+        audience = _clean_audience(req.audience)
+
         def generate():
             try:
                 # Retrieval is inlined (rather than one bot.retrieve() call) so we
                 # can emit "status" events at each phase transition during the gap
                 # before answer tokens start streaming. Status text is templated
                 # from route state — no extra LLM call, no added latency.
-                route = bot.rewrite_and_route(question, req.history)
+                route = bot.rewrite_and_route(question, req.history, audience)
                 yield f"event: status\ndata: {json.dumps(_route_status(route))}\n\n"
 
                 graph_facts = {}
@@ -119,7 +130,8 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                         route["wants_outline"], route["completed_courses"],
                     )
                 chunks = bot.vector_retrieve(
-                    route["search_query"], topic_families=route["topic_families"],
+                    route["search_query"], audience=audience,
+                    topic_families=route["topic_families"],
                     department=route["department"],
                 )
 

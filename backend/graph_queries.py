@@ -43,7 +43,7 @@ else:
 
 _COURSE_PKL = _GRAPH_DIR / "course_graph.pkl"
 _PROGRAM_PKL = _GRAPH_DIR / "program_graph.pkl"
-_OUTLINES_JSON = _GRAPH_DIR / "course_outlines_final.json"
+_OUTLINES_JSON = _GRAPH_DIR / "heat_outlines.json"
 
 
 def _norm(code: str) -> str:
@@ -266,11 +266,13 @@ def _find_alternatives_in_tree(node: dict, target: str, out: set) -> None:
 
 
 def _load_outlines(path=_OUTLINES_JSON) -> dict:
-    """Load course_outlines_final.json → dict keyed by course_code."""
+    """Load v2.2's heat_outlines.json — a flat {code: {course, term, url, text}}
+    dict (HEAT-only, i.e. eng/CS courses; other courses have no outline) — and
+    re-key with _norm() for lookup safety."""
     if not path.exists():
         return {}
-    outlines = json.loads(path.read_text())
-    return {o["metadata"]["course_code"]: o for o in outlines if o.get("metadata", {}).get("course_code")}
+    raw = json.loads(path.read_text())
+    return {_norm(code): rec for code, rec in raw.items()}
 
 
 class GraphStore:

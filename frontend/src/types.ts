@@ -1,5 +1,10 @@
 export type MessageRole = 'user' | 'assistant'
 
+// Which v2.2 corpus the backend should search for a question.
+export type Audience = 'undergrad' | 'faculty' | 'both'
+
+export type Theme = 'light' | 'dark'
+
 export interface Source {
   url: string
   title: string
