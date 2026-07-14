@@ -33,16 +33,16 @@ export function MessageBubble({ message }: Props) {
         >
           {message.loading ? (
             <span className="flex gap-2 items-center h-5">
+              {message.status && (
+                <span className="text-sm text-muted-foreground animate-pulse">
+                  {message.status}
+                </span>
+              )}
               <span className="flex gap-1 items-center">
                 <span className="w-1.5 h-1.5 rounded-full bg-current animate-bounce [animation-delay:0ms]" />
                 <span className="w-1.5 h-1.5 rounded-full bg-current animate-bounce [animation-delay:150ms]" />
                 <span className="w-1.5 h-1.5 rounded-full bg-current animate-bounce [animation-delay:300ms]" />
               </span>
-              {message.status && (
-                <span className="text-xs text-muted-foreground animate-pulse">
-                  {message.status}
-                </span>
-              )}
             </span>
           ) : isUser ? (
             message.content

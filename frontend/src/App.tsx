@@ -190,7 +190,7 @@ export default function App() {
             </div>
             <p className="text-base font-medium text-foreground">Ask GeorgeBot anything about UVic</p>
             <p className="text-sm max-w-xs">
-              Courses, registration, campus life, faculty info — all sourced from uvic.ca.
+              Courses, registration, campus life, and anything else — all sourced from uvic.ca.
             </p>
           </div>
         ) : (

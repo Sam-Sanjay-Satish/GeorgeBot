@@ -57,7 +57,7 @@ def _route_status(route: dict) -> str:
         return "Looking up courses…"
     if route.get("program_query"):
         return "Checking program requirements…"
-    return "Searching…"
+    return "Finding relevant UVic documents…"
 
 
 def create_app(bot: GeorgeBot) -> FastAPI:
@@ -131,7 +131,7 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                 # gap). If nothing was retrieved, "Reading sources…" would be
                 # misleading, so fall back to a neutral "Thinking…".
                 has_context = bool(chunks) or n_graph_blocks > 0
-                yield f"event: status\ndata: {json.dumps('Reading sources…' if has_context else 'Thinking…')}\n\n"
+                yield f"event: status\ndata: {json.dumps('Reading through sources…' if has_context else 'Thinking…')}\n\n"
 
                 # Emit sources first so the UI can render them immediately.
                 sources = bot.format_sources(chunks, graph_facts)
