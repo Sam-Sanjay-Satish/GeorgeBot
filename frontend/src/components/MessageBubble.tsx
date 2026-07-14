@@ -52,7 +52,7 @@ export function MessageBubble({ message }: Props) {
               className="prose prose-sm dark:prose-invert max-w-none
                 prose-p:my-2 first:prose-p:mt-0 last:prose-p:mb-0
                 prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5
-                prose-headings:mt-3 prose-headings:mb-1.5 first:prose-headings:mt-0
+                prose-headings:mt-5 prose-headings:mb-1.5 first:prose-headings:mt-0
                 prose-h1:text-lg prose-h2:text-base prose-h3:text-sm prose-h4:text-sm
                 prose-pre:my-2 prose-strong:text-inherit prose-headings:text-inherit
                 prose-a:text-inherit prose-a:underline"

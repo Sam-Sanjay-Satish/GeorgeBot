@@ -40,8 +40,13 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (pinnedRef.current) {
-      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    // Instant jump (not smooth): during the typewriter reveal this runs every
+    // ~16ms, and overlapping smooth-scroll animations keep dragging toward the
+    // bottom even after the user scrolls up, fighting them. A direct scrollTop
+    // set has no in-flight animation to fight.
+    const el = scrollRef.current
+    if (el && pinnedRef.current) {
+      el.scrollTop = el.scrollHeight
     }
   }, [messages])
 

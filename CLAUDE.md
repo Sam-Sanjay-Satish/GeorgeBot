@@ -200,6 +200,34 @@ via a **Railway Volume**, not a git commit:
    the backend service in production — copying locally does **not**
    propagate to Railway by itself.
 
+**How the Volume actually got seeded (done 2026-07-15).** A Railway Volume
+is only reachable from *inside* the running container — there's no upload-to-
+volume file API — so the seed goes over `railway ssh`:
+1. Build a clean local tar of the three artifacts. **Set `COPYFILE_DISABLE=1`
+   (or `--no-mac-metadata`)** — macOS `tar` otherwise injects `._*`
+   AppleDouble members that `--exclude '._*'` does NOT catch (they're
+   synthesized at archive time), which is how the old junk got on the Volume.
+   Checksum it (`shasum -a 256`).
+2. Stream it in: `cat v22.tar | railway ssh -- "cat > /data/_upload.tar"`.
+   `railway ssh` command mode preserves binary stdin (verified with a
+   checksum round-trip), so no base64 needed. ~1.2 GB took ~9 min (~4.5 MB/s).
+3. Verify the container-side `sha256sum` matches, extract to a **staging dir**
+   (`/data/_new`) — non-destructive, the live service keeps serving the old
+   files — sanity-check (chroma `list_collections()` counts, taxonomy keys),
+   then atomically swap (`rm -rf` old + `mv` staged into place) and delete the
+   tarball. Removing the old chroma while the service runs is safe (Linux
+   deleted-but-open inodes); the new data loads on the **next restart**.
+4. **Code and data must be deployed together.** The old single-collection
+   code crashes on the v2.2 data (`get_collection("georgebot_v2")` → not
+   found) and vice-versa. Deploy the matching code (git push → Railway
+   rebuild) as part of the same migration; don't restart the old deployment
+   against new data.
+
+**Current production Volume state:** `georgebot-volume`, mounted at **`/data`**
+on the backend service, `DATA_DIR=/data` set. Holds v2.2 (`chroma_db/` two
+collections, `graph_data/{course_graph.pkl, program_graph.pkl,
+heat_outlines.json}`, `vector_taxonomy.json`), ~1.3 GB of a 5 GB volume.
+
 **Pointing the code at the Volume (env vars — this landed 2026-07-14).**
 The artifact paths are no longer hardcoded. They resolve, in priority order:
 
@@ -217,10 +245,12 @@ because `chatbot.py` calls `GraphStore.load()` with no args). **For
 Railway: mount one Volume and set `DATA_DIR=<mount-path>`**, then drop the
 three artifacts under it — no per-deploy code change.
 
-## Deployment (Railway)
+## Deployment (Railway backend + Vercel frontend)
 
-- Two services from this one repo, each scoped via Railway's **Root
-  Directory** setting: one → `backend`, one → `frontend`.
+- **Split hosting:** the **backend** runs on **Railway** (Root Directory
+  `backend`, at `georgebot-production.up.railway.app`); the **frontend** is
+  deployed on **Vercel** (Root Directory `frontend`, served at
+  `georgebot.org` / `www.georgebot.org`). Both come from this one repo.
 - **Backend build: `backend/Dockerfile`** (multi-stage `python:3.14-slim`;
   final `CMD python api.py`, which reads `$PORT` and binds `0.0.0.0`).
   Because a Dockerfile is present, Railway builds the backend service with
@@ -229,27 +259,32 @@ three artifacts under it — no per-deploy code change.
   The image deliberately does **not** bake in `chroma_db/`/`graph_data/`/
   `vector_taxonomy.json` (they're gitignored and `.dockerignore`d) — those
   arrive at runtime via the Volume below.
-- **Frontend build: no Dockerfile** (by choice) — Railway's default
-  Nixpacks/Vite detection builds it from the `frontend/` Root Directory.
-- Backend service needs a **Volume** for the three artifacts above (mount
-  path TBD — see "Data" section; this requires a `chatbot.py` path change
-  that hasn't landed yet).
+- **Frontend build: Vercel** (Vite/framework auto-detection, Root Directory
+  `frontend`) — no Dockerfile. Vercel auto-deploys on push to `main`.
+- Backend service has a **Volume** (`georgebot-volume`) mounted at **`/data`**
+  holding the three artifacts, with `DATA_DIR=/data` set. Live as of
+  2026-07-15 — see "Data" section for how it was seeded and how to re-seed.
 - Backend env vars: `MINIMAX_SUB_KEY`, `VOYAGE_API_KEY`. Railway also
   injects `PORT` automatically — `api.py`'s `main()` already reads
   `$PORT`/`$HOST` (default `0.0.0.0`) so no Railway-side config needed for
   that part; this was a real gap fixed on 2026-07-14 (originally hardcoded
   `127.0.0.1:5001`, which would not have bound correctly on Railway).
-- Frontend service: set `VITE_API_BASE` to the backend's Railway URL
-  (defaults to `http://127.0.0.1:5001` otherwise, which is dev-only).
-- Rebuild scoping: Railway's **Watch Paths** can restrict each service to
-  rebuild only on changes under its own `backend/`/`frontend/` — set this
-  up to avoid frontend rebuilds on backend-only commits and vice versa.
+- Frontend (Vercel): set `VITE_API_BASE` to the backend's Railway URL
+  (`https://georgebot-production.up.railway.app`); it defaults to
+  `http://127.0.0.1:5001` otherwise, which is dev-only. The backend's
+  `CORS_ALLOW_ORIGINS` must include the Vercel domain(s) — currently
+  `https://georgebot.org,https://www.georgebot.org`.
+- Rebuild scoping: Railway's **Watch Paths** restrict the backend service to
+  rebuild only on changes under `backend/`; Vercel's ignored-build-step /
+  root-directory settings similarly keep the frontend from rebuilding on
+  backend-only commits. Set both so a backend-only push doesn't rebuild the
+  frontend and vice-versa.
 - Repo is intentionally **public** (companion pipeline repo is private) —
   this was a deliberate choice: monorepo-vs-split reasoning landed on
-  "split by visibility, not by deploy mechanics," since Railway's
-  Root-Directory/Watch-Paths features already solve the deploy-noise
-  problem within one repo. Don't re-merge these repos without revisiting
-  that reasoning.
+  "split by visibility, not by deploy mechanics," since per-service
+  Root-Directory + watch/ignore settings (Railway for the backend, Vercel
+  for the frontend) already solve the deploy-noise problem within one repo.
+  Don't re-merge these repos without revisiting that reasoning.
 
 ---
 
@@ -478,12 +513,18 @@ after new corpus content lands.
   per-call latency is lower, but the throughput ceiling is unchanged. If it
   becomes a live-traffic problem: a dedicated/higher Token Plan tier,
   pay-as-you-go, or request queuing/backoff.
-- **Railway Volume wiring — code side done (2026-07-14), Railway side
-  still TBD.** The artifact paths now read from env
-  (`DATA_DIR`, or per-artifact `CHROMA_DIR`/`TAXONOMY_FILE`/`GRAPH_DATA_DIR`),
-  falling back to the `BASE_DIR`-relative defaults — see "Data" above. What
-  remains is the actual Railway side: create the Volume, pick a mount path,
-  set `DATA_DIR` to it, and push the three artifacts into it.
+- **Railway Volume — DONE (2026-07-15).** `georgebot-volume` at `/data`,
+  `DATA_DIR=/data`, seeded with the v2.2 artifacts and live in production
+  (`/health` → `chunks: 62935`). Re-seeding procedure is in "Data" above.
+- **Cold start after a redeploy — first few requests are slow, then fast.**
+  Expected, not a bug: a fresh container has none of the ~1.2 GB `chroma_db`
+  in the OS page cache, and the Volume is network-attached storage, so early
+  queries read the HNSW index + SQLite off disk; once the working set is
+  cached in RAM (and the Voyage/MiniMax keep-alive connections are
+  established, and each collection's HNSW graph is loaded on its first query)
+  it hits steady-state speed. Self-resolving. Optional fix if it ever
+  matters: a boot warm-up that fires a throwaway retrieval per collection
+  before serving real traffic (not implemented).
 - **This repo has no venv/lockfile of its own yet** — currently dev-tested
   by borrowing `georgebot-pipeline`'s venv. Fine short-term since both
   repos share a machine during this transition, but worth fixing before
@@ -523,6 +564,13 @@ after new corpus content lands.
   type. `cleanTitle()` trims the raw page-`<title>` breadcrumb tail (drops
   faculty/university/`Home` segments, keeps the two most specific parts) so
   source labels read cleanly.
+- **Theme / dark mode** (`components/ThemeToggle.tsx`): a sun/moon button in
+  the header (left of the account menu) toggles the `.dark` class on
+  `document.documentElement` (the CSS variant in `index.css`), persisted to
+  `localStorage` and initialized from saved choice or `prefers-color-scheme`.
+  Light-mode page background is white with slightly-darker (`--muted`) chat
+  bubbles; dark-mode background is a dark grey (`oklch(0.19)`), a step below
+  the card/bubble surfaces so they stay layered.
 - **Branding**: browser tab uses `frontend/public/favicon.svg` (a violet-
   gradient "G" mark) + `<title>GeorgeBot</title>`; the assistant message
   avatar (`MessageBubble.tsx`) and header both render a "G".
