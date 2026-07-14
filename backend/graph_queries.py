@@ -23,15 +23,27 @@ Quick CLI smoke test:
 """
 
 import json
+import os
 import pathlib
 import pickle
 
 import networkx as nx
 
 _HERE = pathlib.Path(__file__).parent
-_COURSE_PKL = _HERE / "graph_data" / "course_graph.pkl"
-_PROGRAM_PKL = _HERE / "graph_data" / "program_graph.pkl"
-_OUTLINES_JSON = _HERE / "graph_data" / "course_outlines_final.json"
+
+# Graph-artifact dir: BASE_DIR-relative by default (local dev), or a Railway
+# Volume mount via env. GRAPH_DATA_DIR wins; else DATA_DIR/graph_data; else
+# ./graph_data. Mirrors the CHROMA_DIR/TAXONOMY_FILE scheme in chatbot.py.
+if os.getenv("GRAPH_DATA_DIR"):
+    _GRAPH_DIR = pathlib.Path(os.environ["GRAPH_DATA_DIR"])
+elif os.getenv("DATA_DIR"):
+    _GRAPH_DIR = pathlib.Path(os.environ["DATA_DIR"]) / "graph_data"
+else:
+    _GRAPH_DIR = _HERE / "graph_data"
+
+_COURSE_PKL = _GRAPH_DIR / "course_graph.pkl"
+_PROGRAM_PKL = _GRAPH_DIR / "program_graph.pkl"
+_OUTLINES_JSON = _GRAPH_DIR / "course_outlines_final.json"
 
 
 def _norm(code: str) -> str:

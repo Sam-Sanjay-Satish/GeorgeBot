@@ -117,6 +117,8 @@ reading this first:
 │   ├── chatbot.py             # GeorgeBot engine — routing + retrieval + LLM pipeline (tune here)
 │   ├── graph_queries.py       # GraphStore — copy of georgebot-pipeline's course-graph/graph_queries.py
 │   ├── api.py                 # FastAPI server (thin wrapper over GeorgeBot); Railway PORT/HOST-aware
+│   ├── Dockerfile             # backend container build (Railway); multi-stage python:3.14-slim, CMD python api.py
+│   ├── .dockerignore          # excludes volume artifacts (chroma_db/graph_data/taxonomy), .env, pycache
 │   ├── requirements.txt       # serving deps only (openai, voyageai, chromadb, networkx, fastapi, uvicorn)
 │   ├── chroma_db/             # Chroma vector DB, collection georgebot_v2 (gitignored — see Data below)
 │   ├── vector_taxonomy.json   # topic_families/department controlled vocabulary (gitignored)
@@ -150,16 +152,39 @@ via a **Railway Volume**, not a git commit:
    *local* copy only.
 3. **Separately**, push the same data into the Railway Volume mounted on
    the backend service in production — copying locally does **not**
-   propagate to Railway by itself. (As of this writing the exact
-   volume-mount path and any code change to point `chatbot.py`'s
-   `CHROMA_DIR`/`TAXONOMY_FILE`/`graph_data` paths at that mount — they're
-   currently hardcoded relative to `backend/` via `BASE_DIR = Path(__file__).parent`
-   — is still **pending**; don't assume it's wired up without checking.)
+   propagate to Railway by itself.
+
+**Pointing the code at the Volume (env vars — this landed 2026-07-14).**
+The artifact paths are no longer hardcoded. They resolve, in priority order:
+
+- `CHROMA_DIR` / `TAXONOMY_FILE` / `GRAPH_DATA_DIR` — per-artifact absolute
+  overrides; each wins over everything below when set.
+- `DATA_DIR` — common base for all three at once (the one-Volume case):
+  `$DATA_DIR/chroma_db`, `$DATA_DIR/vector_taxonomy.json`,
+  `$DATA_DIR/graph_data`.
+- **Neither set** → the original `BASE_DIR`-relative defaults under
+  `backend/` (local dev, unchanged).
+
+`CHROMA_DIR`/`TAXONOMY_FILE` resolve in `chatbot.py`; the graph-data dir
+resolves in `graph_queries.py` (same scheme — it computes its own paths
+because `chatbot.py` calls `GraphStore.load()` with no args). **For
+Railway: mount one Volume and set `DATA_DIR=<mount-path>`**, then drop the
+three artifacts under it — no per-deploy code change.
 
 ## Deployment (Railway)
 
 - Two services from this one repo, each scoped via Railway's **Root
   Directory** setting: one → `backend`, one → `frontend`.
+- **Backend build: `backend/Dockerfile`** (multi-stage `python:3.14-slim`;
+  final `CMD python api.py`, which reads `$PORT` and binds `0.0.0.0`).
+  Because a Dockerfile is present, Railway builds the backend service with
+  it instead of Nixpacks — the service's Root Directory **must** be
+  `backend` so the build context and the Dockerfile's `COPY . .` resolve.
+  The image deliberately does **not** bake in `chroma_db/`/`graph_data/`/
+  `vector_taxonomy.json` (they're gitignored and `.dockerignore`d) — those
+  arrive at runtime via the Volume below.
+- **Frontend build: no Dockerfile** (by choice) — Railway's default
+  Nixpacks/Vite detection builds it from the `frontend/` Root Directory.
 - Backend service needs a **Volume** for the three artifacts above (mount
   path TBD — see "Data" section; this requires a `chatbot.py` path change
   that hasn't landed yet).
@@ -375,11 +400,12 @@ after new corpus content lands.
   problem, options to explore: a dedicated/higher Token Plan tier,
   request queuing/backoff, or revisiting whether adaptive thinking is
   worth the latency for this specific product requirement.
-- **Railway Volume wiring is not done yet** — `chatbot.py`'s
-  `CHROMA_DIR`/`TAXONOMY_FILE`/graph-data paths are hardcoded relative to
-  `backend/` (`BASE_DIR = Path(__file__).parent`). Needs an env-var
-  override (or similar) before a Volume mount actually gets picked up in
-  production.
+- **Railway Volume wiring — code side done (2026-07-14), Railway side
+  still TBD.** The artifact paths now read from env
+  (`DATA_DIR`, or per-artifact `CHROMA_DIR`/`TAXONOMY_FILE`/`GRAPH_DATA_DIR`),
+  falling back to the `BASE_DIR`-relative defaults — see "Data" above. What
+  remains is the actual Railway side: create the Volume, pick a mount path,
+  set `DATA_DIR` to it, and push the three artifacts into it.
 - **This repo has no venv/lockfile of its own yet** — currently dev-tested
   by borrowing `georgebot-pipeline`'s venv. Fine short-term since both
   repos share a machine during this transition, but worth fixing before

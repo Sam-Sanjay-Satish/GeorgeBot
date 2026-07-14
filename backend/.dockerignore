@@ -1,0 +1,12 @@
+# Serving artifacts come from the Railway Volume at runtime, not the image.
+chroma_db/
+graph_data/
+vector_taxonomy.json
+
+# Secrets + local cruft
+.env
+__pycache__/
+*.pyc
+
+Dockerfile
+.dockerignore

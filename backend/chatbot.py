@@ -39,8 +39,17 @@ import time
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent          # backend/
-CHROMA_DIR = BASE_DIR / "chroma_db"
-TAXONOMY_FILE = BASE_DIR / "vector_taxonomy.json"
+
+# Serving-artifact locations. Default to BASE_DIR-relative paths (local dev,
+# artifacts copied into backend/); override via env for a Railway Volume mount.
+#   DATA_DIR      — common base for all three at once (one Volume, one mount):
+#                   $DATA_DIR/{chroma_db, vector_taxonomy.json, graph_data}.
+#   CHROMA_DIR /
+#   TAXONOMY_FILE — per-artifact overrides; win over DATA_DIR when set.
+# graph_data lives in graph_queries.py (GRAPH_DATA_DIR / DATA_DIR, same scheme).
+_DATA_DIR = Path(os.environ["DATA_DIR"]) if os.getenv("DATA_DIR") else BASE_DIR
+CHROMA_DIR = Path(os.getenv("CHROMA_DIR", _DATA_DIR / "chroma_db"))
+TAXONOMY_FILE = Path(os.getenv("TAXONOMY_FILE", _DATA_DIR / "vector_taxonomy.json"))
 GENERAL_DEPARTMENT = "general / cross-departmental"
 THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
