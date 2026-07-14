@@ -1,0 +1,12 @@
+# GeorgeBot webapp backend — RAG serving (FastAPI)
+# Run from webapp/backend/: python3 api.py   (paths are __file__-relative)
+# Needs chroma_db/ (collection georgebot_v2) and graph_data/ present
+# (copied from data-pipeline/v2/final-databases/ and data-pipeline/v2/course-graph/).
+
+openai           # MiniMax-M3 (official API, OpenAI-compatible) — route/rewrite + answer
+voyageai         # voyage-4-large query embeddings
+chromadb         # local vector DB (read-only at serve time)
+networkx         # course/program graph (graph_queries.GraphStore)
+fastapi          # HTTP API
+uvicorn          # ASGI server
+python-dotenv    # loads .env (MINIMAX_SUB_KEY, VOYAGE_API_KEY)

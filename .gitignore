@@ -1,0 +1,13 @@
+backend/chroma_db/
+backend/graph_data/
+backend/vector_taxonomy.json
+
+.env
+venv/
+__pycache__/
+*.pyc
+
+node_modules/
+frontend/dist/
+
+.DS_Store
