@@ -37,10 +37,25 @@ class ChatRequest(BaseModel):
 def create_app(bot: GeorgeBot) -> FastAPI:
     app = FastAPI(title="GeorgeBot")
 
-    # Wide-open CORS — this server is for local frontend testing only.
+    # CORS allow-list. Prod origins come from CORS_ALLOW_ORIGINS (comma-
+    # separated, e.g. "https://georgebot.ca,https://www.georgebot.ca"); local
+    # dev origins are always included so `npm run dev` keeps working. Set the
+    # env var on Railway to your Vercel URL + custom domain(s). If it's unset
+    # AND CORS_ALLOW_ALL isn't truthy, we fall back to dev-only origins (safe
+    # default — a stray browser origin gets blocked, not silently allowed).
+    dev_origins = [
+        "http://localhost:5173", "http://127.0.0.1:5173",  # Vite dev server
+        "http://localhost:3000", "http://127.0.0.1:3000",
+    ]
+    env_origins = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()]
+    if os.getenv("CORS_ALLOW_ALL", "").lower() in ("1", "true", "yes"):
+        allow_origins = ["*"]
+    else:
+        allow_origins = env_origins + dev_origins
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=allow_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )
