@@ -29,14 +29,23 @@ export default function App() {
   })
   const bottomRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
-  // Whether the user is stuck to the bottom. Only auto-scroll on new content
-  // when true, so scrolling up mid-stream isn't yanked back down.
-  const pinnedRef = useRef(true)
+  // Whether we keep the view stuck to the bottom as new content streams in.
+  // An upward wheel/scroll turns this off *immediately* (intent), and it only
+  // turns back on once the user returns to the very bottom — otherwise the
+  // 16ms re-snap traps them, since a single wheel notch is smaller than any
+  // position threshold and gets snapped back before it registers.
+  const followRef = useRef(true)
+
+  function handleWheel(e: React.WheelEvent) {
+    if (e.deltaY < 0) followRef.current = false // scrolling up = stop following
+  }
 
   function handleScroll() {
     const el = scrollRef.current
     if (!el) return
-    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+    if (dist < 4) followRef.current = true // returned to the bottom → resume
+    else if (dist > 120) followRef.current = false // clearly scrolled away (scrollbar/keys)
   }
 
   useEffect(() => {
@@ -45,7 +54,7 @@ export default function App() {
     // bottom even after the user scrolls up, fighting them. A direct scrollTop
     // set has no in-flight animation to fight.
     const el = scrollRef.current
-    if (el && pinnedRef.current) {
+    if (el && followRef.current) {
       el.scrollTop = el.scrollHeight
     }
   }, [messages])
@@ -213,7 +222,7 @@ export default function App() {
       </header>
 
       {/* Messages */}
-      <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-4 py-6">
+      <div ref={scrollRef} onScroll={handleScroll} onWheel={handleWheel} className="flex-1 overflow-y-auto px-4 py-6">
         {messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-center gap-3 text-muted-foreground pt-24">
             <div className="w-14 h-14 rounded-full bg-muted flex items-center justify-center text-2xl font-bold text-foreground">
