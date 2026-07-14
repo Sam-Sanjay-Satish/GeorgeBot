@@ -15,4 +15,7 @@ export interface Message {
   content: string
   sources?: Source[]
   loading?: boolean
+  // Transient pre-answer phase text (e.g. "Looking up CSC 225…"), shown only
+  // while `loading` and cleared once answer tokens begin.
+  status?: string
 }

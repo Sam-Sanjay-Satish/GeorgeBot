@@ -13,6 +13,9 @@ HTTP API:
   GET  /health
   POST /api/chat          {question, history?}  -> {answer, sources, ...}  (JSON)
   POST /api/chat/stream   {question, history?}  -> text/event-stream (SSE)
+                          SSE events: status, sources, token, done, error
+                          ("status" fires before tokens with a short, templated
+                          phase message, e.g. "Looking up CSC 225…")
 
 Env (.env): MINIMAX_SUB_KEY, VOYAGE_API_KEY
 """
@@ -32,6 +35,29 @@ from chatbot import GeorgeBot
 class ChatRequest(BaseModel):
     question: str = ""
     history: list[dict] = []
+
+
+def _course_label(code: str) -> str:
+    """Display form of a normalized course code: "CSC225" -> "CSC 225"."""
+    for i, ch in enumerate(code):
+        if ch.isdigit():
+            return f"{code[:i]} {code[i:]}".strip()
+    return code
+
+
+def _route_status(route: dict) -> str:
+    """Short, Claude.ai-style status line derived purely from the route.
+
+    Templated from known state (no LLM call, no latency). Falls back to a
+    plain "Searching…" when nothing more specific is known."""
+    codes = route.get("course_codes") or []
+    if codes:
+        if len(codes) == 1:
+            return f"Looking up {_course_label(codes[0])}…"
+        return "Looking up courses…"
+    if route.get("program_query"):
+        return "Checking program requirements…"
+    return "Searching…"
 
 
 def create_app(bot: GeorgeBot) -> FastAPI:
@@ -79,10 +105,34 @@ def create_app(bot: GeorgeBot) -> FastAPI:
 
         def generate():
             try:
-                route, chunks, graph_facts = bot.retrieve(question, req.history)
+                # Retrieval is inlined (rather than one bot.retrieve() call) so we
+                # can emit "status" events at each phase transition during the gap
+                # before answer tokens start streaming. Status text is templated
+                # from route state — no extra LLM call, no added latency.
+                route = bot.rewrite_and_route(question, req.history)
+                yield f"event: status\ndata: {json.dumps(_route_status(route))}\n\n"
+
+                graph_facts = {}
+                if route["course_codes"] or route["program_query"]:
+                    graph_facts = bot.graph_retrieve(
+                        route["course_codes"], route["program_query"],
+                        route["wants_outline"], route["completed_courses"],
+                    )
+                chunks = bot.vector_retrieve(
+                    route["search_query"], topic_families=route["topic_families"],
+                    department=route["department"],
+                )
+
                 graph_text = bot._graph_context_text(graph_facts) if graph_facts else ""
                 n_graph_blocks = len(graph_facts.get("courses", [])) + (1 if graph_facts.get("program") else 0)
                 context = bot._build_context(chunks, graph_text, n_graph_blocks)
+
+                # Second status covers the answer-generation wait (the biggest
+                # gap). If nothing was retrieved, "Reading sources…" would be
+                # misleading, so fall back to a neutral "Thinking…".
+                has_context = bool(chunks) or n_graph_blocks > 0
+                yield f"event: status\ndata: {json.dumps('Reading sources…' if has_context else 'Thinking…')}\n\n"
+
                 # Emit sources first so the UI can render them immediately.
                 sources = bot.format_sources(chunks, graph_facts)
                 yield f"event: sources\ndata: {json.dumps(sources)}\n\n"

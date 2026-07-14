@@ -139,7 +139,7 @@ reading this first:
 └── frontend/                  # React + Vite + TS chat UI (wired to the API)
     └── src/
         ├── App.tsx            # chat state; calls the backend, renders messages + sources
-        ├── lib/api.ts         # askGeorge() → POST /api/chat; maps API sources → UI Source
+        ├── lib/api.ts         # askGeorgeStream() → SSE /api/chat/stream (askGeorge/non-stream also here); maps + cleanTitle sources
         ├── types.ts           # Message, Source
         └── components/        # MessageBubble, SourcePanel, SourceBadge, ChatInput, ...
 ```
@@ -447,11 +447,22 @@ after new corpus content lands.
 
 - React + Vite + TypeScript, Tailwind v4 + shadcn/ui.
 - `App.tsx` holds the message list; on send it appends a user msg + a
-  loading assistant msg, calls `askGeorge(text, priorMessages)`, then
-  fills the answer + sources (or an error string if unreachable).
-- `lib/api.ts` posts to `${VITE_API_BASE ?? 'http://127.0.0.1:5001'}/api/chat`,
-  builds `history` from prior non-loading messages, maps API sources to
-  the UI `Source` type.
+  loading assistant msg, then calls `askGeorgeStream(text, priorMessages, handlers)`
+  (streaming). Tokens land in a queue and a client-side typewriter
+  (`REVEAL_CHARS_PER_TICK=3` / `REVEAL_TICK_MS=16`) paces the reveal so
+  bursty deltas read smoothly. **Sources are buffered and attached only when
+  the reveal finishes** (`finish()`), so they appear with the completed
+  answer, not mid-stream. `askGeorge()` (non-streaming `/api/chat`) still
+  exists in `lib/api.ts` but isn't used by the UI.
+- `lib/api.ts`: `askGeorgeStream` POSTs to `${VITE_API_BASE ??
+  'http://127.0.0.1:5001'}/api/chat/stream` and hand-parses the SSE frames
+  (`sources`/`token`/`done`/`error`); builds `history` from prior non-loading
+  messages; maps API sources to the UI `Source` type. `cleanTitle()` trims
+  the raw page-`<title>` breadcrumb tail (drops faculty/university/`Home`
+  segments, keeps the two most specific parts) so source labels read cleanly.
+- **Branding**: browser tab uses `frontend/public/favicon.svg` (a violet-
+  gradient "G" mark) + `<title>GeorgeBot</title>`; the assistant message
+  avatar (`MessageBubble.tsx`) and header both render a "G".
 
 ### Vector chunk metadata schema (what you can filter / rank / display on)
 Every Chroma entry (one per question) carries, in `metadata`:

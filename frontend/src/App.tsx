@@ -95,11 +95,25 @@ export default function App() {
 
     try {
       await askGeorgeStream(text, priorMessages, {
+        onStatus: (status) => {
+          // Transient pre-answer phase line; overwritten by later status events
+          // and cleared once the first token arrives (see onToken).
+          setMessages((prev) =>
+            prev.map((m) => (m.id === loadingId ? { ...m, status } : m))
+          )
+        },
         onSources: (sources) => {
           // Buffer only — finish() attaches these once the reveal completes.
           bufferedSources = sources
         },
         onToken: (token) => {
+          // First token: drop the status line so it doesn't linger beside the
+          // streaming answer.
+          if (revealed === '' && pending === '') {
+            setMessages((prev) =>
+              prev.map((m) => (m.id === loadingId ? { ...m, status: undefined } : m))
+            )
+          }
           pending += token
           startFlushing()
         },

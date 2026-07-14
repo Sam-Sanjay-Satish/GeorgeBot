@@ -103,6 +103,7 @@ export async function askGeorge(
 }
 
 interface StreamHandlers {
+  onStatus: (text: string) => void
   onSources: (sources: Source[]) => void
   onToken: (text: string) => void
   onDone: () => void
@@ -111,7 +112,8 @@ interface StreamHandlers {
 
 // POST + manually parsed SSE — EventSource doesn't support POST bodies, so we
 // read the fetch response stream directly and split on the "event:\ndata:\n\n"
-// frame format the backend (/api/chat/stream) emits.
+// frame format the backend (/api/chat/stream) emits. Events: status (pre-answer
+// phase text), sources, token, done, error.
 export async function askGeorgeStream(
   question: string,
   priorMessages: Message[],
@@ -149,7 +151,9 @@ export async function askGeorgeStream(
 
       try {
         const data = JSON.parse(rawData)
-        if (event === 'sources') {
+        if (event === 'status') {
+          handlers.onStatus(data as string)
+        } else if (event === 'sources') {
           handlers.onSources((data as ApiSource[]).map(mapSource))
         } else if (event === 'token') {
           handlers.onToken(data as string)
