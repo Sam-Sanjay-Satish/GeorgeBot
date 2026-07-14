@@ -17,11 +17,13 @@ Two retrieval paths, routed per-query by a single MiniMax-M3 call:
 Then MiniMax-M3 reads whichever context was assembled and writes the final,
 source-cited answer (see `_call_llm`/`answer`/`answer_stream`). Single
 provider — the official MiniMax API (OpenAI-compatible), not the Kesar-
-proxied alias. Route/rewrite runs with `thinking: "disabled"` (mechanical
-classification, ~90x faster per the measured MiniMax finding); the answer
-step runs with `thinking: "adaptive"` (real judgment payoff from reasoning
-over multi-chunk context). Both set `reasoning_split: True` so hidden
-reasoning never leaks into visible content.
+proxied alias. Both route/rewrite AND the answer step run with
+`thinking: "disabled"` — the answer step was switched off (from adaptive)
+once the reference material moved into the system prompt and the prompt was
+rewritten to own the "ignore irrelevant material / answer from own knowledge"
+behavior directly (see `SYSTEM_PROMPT` / `_system_prompt_with_context`), for
+~2x lower answer latency. Both set `reasoning_split: True` so any hidden
+reasoning stays out of visible content.
 
 Usage:
   python3 backend/chatbot.py --ask "your question"   # one-shot CLI (no server)
@@ -52,6 +54,66 @@ CHROMA_DIR = Path(os.getenv("CHROMA_DIR", _DATA_DIR / "chroma_db"))
 TAXONOMY_FILE = Path(os.getenv("TAXONOMY_FILE", _DATA_DIR / "vector_taxonomy.json"))
 GENERAL_DEPARTMENT = "general / cross-departmental"
 THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+def _suffix_prefix_len(s: str, tag: str) -> int:
+    """Length of the longest *proper* suffix of `s` that is a prefix of `tag`.
+
+    Used to decide how many trailing chars to hold back mid-stream in case a
+    `<think>`/`</think>` tag is split across chunk boundaries (e.g. a chunk
+    ending in "</thi" might be the start of a closing tag).
+    """
+    for k in range(min(len(s), len(tag) - 1), 0, -1):
+        if s[-k:] == tag[:k]:
+            return k
+    return 0
+
+
+def _iter_visible_deltas(chunks):
+    """Yield only the visible answer text from a stream of raw `content` deltas,
+    dropping any `<think>...</think>` span — even when the tags are split across
+    chunk boundaries. Streaming equivalent of `THINK_TAG_RE.sub("", ...)`.
+
+    `reasoning_split: True` is supposed to keep reasoning out of `content`
+    entirely (it lands in a separate `reasoning_content` field we never read),
+    but leaks were observed in practice (see `_call_llm`), so filter defensively.
+    """
+    pending = ""
+    in_think = False
+    for chunk in chunks:
+        if not chunk:
+            continue
+        pending += chunk
+        while True:
+            if in_think:
+                idx = pending.find(_THINK_CLOSE)
+                if idx == -1:
+                    # No close yet — discard reasoning, keep only a possible
+                    # partial closing tag at the tail so we can match it later.
+                    keep = _suffix_prefix_len(pending, _THINK_CLOSE)
+                    pending = pending[len(pending) - keep:] if keep else ""
+                    break
+                pending = pending[idx + len(_THINK_CLOSE):]
+                in_think = False
+                continue
+            idx = pending.find(_THINK_OPEN)
+            if idx == -1:
+                # Emit everything except a possible partial opening tag.
+                keep = _suffix_prefix_len(pending, _THINK_OPEN)
+                emit = pending[:len(pending) - keep] if keep else pending
+                if emit:
+                    yield emit
+                pending = pending[len(pending) - keep:] if keep else ""
+                break
+            if idx > 0:
+                yield pending[:idx]
+            pending = pending[idx + len(_THINK_OPEN):]
+            in_think = True
+    # Flush any trailing text that wasn't a real (partial) tag.
+    if not in_think and pending:
+        yield pending
 
 COLLECTION_NAME = "georgebot_v2"
 VOYAGE_MODEL = "voyage-4-large"
@@ -526,102 +588,146 @@ class GeorgeBot:
 
     SYSTEM_PROMPT = (
         "You are GeorgeBot, a helpful assistant that answers questions about the "
-        "University of Victoria (UVic) for students and staff. Answer ONLY using the "
-        "numbered context chunks provided in the user message.\n\n"
-        "Rules:\n"
-        "- Ground every claim in the provided chunks — every specific fact (a "
-        "status like 'no longer offered', a course sequence, a number, a date, "
-        "a policy detail) must be something the chunk text actually states, not "
-        "something you infer, extrapolate, or reconstruct from partial/messy "
-        "data. If you're piecing together a narrative from data that doesn't "
-        "clearly state it, that's fabrication even if it sounds plausible — stop "
-        "and state only what's explicit instead.\n"
-        "- Some chunks are PDF program-worksheets or curriculum grids (course-"
-        "by-term tables) that lose their row/column structure in extraction and "
-        "read as a flattened run-on list of course codes and terms. Treat these "
-        "as unreliable for anything beyond 'this course appears somewhere in "
-        "this program's plan' — do not infer sequencing, prerequisites, "
-        "term-by-term order, or offering status from a jumbled table you can't "
-        "confidently parse. When in doubt whether you're reading a garbled "
-        "table correctly, say so explicitly rather than presenting a guess as fact.\n"
-        "- The chunks are retrieved by similarity search, not guaranteed relevance —"
-        " not every numbered chunk is necessarily accurate or on-topic for this "
-        "specific question. Use each chunk's tags (source/type/department/topics) "
-        "and content to judge fit before relying on it; silently ignore chunks that "
-        "don't actually address the question rather than forcing them into the "
-        "answer or citing them just because they were retrieved.\n"
-        "- If the chunks don't cover the specific thing asked, don't say so and "
-        "don't describe what the chunks do cover instead — that reads as a "
-        "broken non-answer. Just answer the question directly and helpfully, the "
-        "way you would with no context at all, and if there's a specific UVic "
-        "fact you can't confirm, point the user to where they can get it (e.g. "
-        "'check your course syllabus or ask your professor directly for office "
-        "hours') instead of explaining that you don't have it.\n"
-        "- Course outlines marked HISTORICAL are past-term snapshots only. When you "
-        "cite one, always name the specific term. Never present historical grading "
-        "weights, instructors, or schedules as current — for current course "
-        "details, direct the user to Brightspace or the department.\n"
-        "- source=kuali chunks are the official course/program catalog — treat them "
-        "as the authoritative, current source for prerequisites, credits, and "
-        "program requirements.\n"
+        "University of Victoria (UVic) for students and staff.\n\n"
+        "USING THE REFERENCE MATERIAL\n"
+        "Alongside the user's question you are given additional reference "
+        "material supplied by the SYSTEM — not by the user. The user did not "
+        "write, choose, attach, or see this material, and is not aware it "
+        "exists. Never speak as though the user provided it, and never refer to "
+        "'the reference material', 'the provided information', or 'the context' "
+        "when talking to the user.\n"
+        "This material is gathered automatically and is NOT guaranteed to be "
+        "relevant — some of it may be off-topic or only loosely related to what "
+        "was actually asked. Read it, keep only the parts that genuinely help "
+        "answer the question, and silently ignore everything else. If none of it "
+        "is relevant, ignore all of it and answer from your own knowledge as a "
+        "knowledgeable UVic assistant.\n"
+        "Never tell the user that reference material is missing, irrelevant, or "
+        "insufficient, and never describe what it happens to cover instead of "
+        "answering — that reads as a broken non-answer. Just answer the question "
+        "directly and helpfully. If there is a specific UVic fact you cannot "
+        "confirm, point the user to where they can get it (e.g. 'check your "
+        "course syllabus or ask your department directly') rather than saying "
+        "you don't have it.\n\n"
+        "ACCURACY\n"
+        "- Ground specific facts (a status like 'no longer offered', a course "
+        "sequence, a number, a date, a policy detail) in what the reference "
+        "material actually states — do not infer, extrapolate, or reconstruct "
+        "them from partial or messy data. Piecing together a plausible-sounding "
+        "narrative from material that doesn't clearly state it is fabrication; "
+        "state only what is explicit instead.\n"
+        "- Some material comes from PDF program-worksheets or curriculum grids "
+        "(course-by-term tables) that lose their row/column structure and read "
+        "as a flattened run-on list of course codes and terms. Treat these as "
+        "unreliable for anything beyond 'this course appears somewhere in this "
+        "program's plan' — do not infer sequencing, prerequisites, term-by-term "
+        "order, or offering status from a jumbled table you can't confidently "
+        "parse. When unsure whether you are reading such a table correctly, say "
+        "so rather than presenting a guess as fact.\n"
+        "- Material tagged source=kuali is the official course/program catalog — "
+        "treat it as the authoritative, current source for prerequisites, "
+        "credits, and program requirements.\n"
+        "- Course outlines tagged HISTORICAL are past-term snapshots only. When "
+        "you rely on one, always name the specific term, and never present "
+        "historical grading weights, instructors, or schedules as current — for "
+        "current course details, direct the user to Brightspace or the "
+        "department.\n"
+        "- When the material states 'Given completed courses [...]: prerequisites "
+        "satisfied = ...' or 'outstanding requirements by group', that "
+        "evaluation was computed programmatically from the courses the user said "
+        "they've taken — trust it over your own tally, but flag any listed "
+        "non-course requirements (year standing, GPA, permission, etc.) since "
+        "those can't be auto-verified from a course list.\n"
         "- If a program search returned multiple candidates, ask the user to "
-        "clarify which one they mean rather than guessing.\n"
-        "- When a chunk states 'Given completed courses [...]: prerequisites "
-        "satisfied = ...' or 'outstanding requirements by group', that evaluation "
-        "was computed programmatically from the courses the user said they've "
-        "taken — trust it over your own tally, but flag any listed non-course "
-        "requirements (year standing, GPA, permission, etc.) since those can't be "
-        "auto-verified from a course list.\n"
+        "clarify which one they mean rather than guessing.\n\n"
+        "STYLE\n"
         "- Be concise and direct. Use plain text (no LaTeX)."
     )
 
-    def _answer_messages(self, question: str, context: str, history: list[dict]) -> list[dict]:
-        context = context or "(no relevant context found)"
+    def _system_prompt_with_context(self, context: str) -> str:
+        """Build the system message: instructions + the retrieved reference
+        material, framed as system-supplied (NOT part of the user turn) so the
+        model doesn't treat it as something the user typed or attached."""
+        context = (context or "").strip()
+        if context:
+            ref = (
+                "\n\n=== BEGIN SYSTEM-SUPPLIED REFERENCE MATERIAL ===\n"
+                "(The user did not provide or see the following. It was gathered "
+                "automatically and may include irrelevant items — use only what "
+                "helps, ignore the rest; if none is relevant, answer from your "
+                "own knowledge.)\n\n"
+                f"{context}\n"
+                "=== END SYSTEM-SUPPLIED REFERENCE MATERIAL ==="
+            )
+        else:
+            ref = (
+                "\n\n=== SYSTEM-SUPPLIED REFERENCE MATERIAL ===\n"
+                "None was gathered for this question. Answer from your own "
+                "knowledge as a knowledgeable UVic assistant.\n"
+                "=== END SYSTEM-SUPPLIED REFERENCE MATERIAL ==="
+            )
+        return self.SYSTEM_PROMPT + ref
+
+    def _answer_messages(self, question: str, history: list[dict]) -> list[dict]:
+        """Conversation turns + the user's question only — the reference
+        material lives in the system prompt (see `_system_prompt_with_context`),
+        never in the user turn."""
         messages: list[dict] = []
         for turn in history[-MAX_HISTORY_TURNS:]:
             role = turn.get("role")
             if role in ("user", "assistant") and turn.get("content"):
                 messages.append({"role": role, "content": turn["content"]})
-        messages.append({
-            "role": "user",
-            "content": f"Context chunks:\n\n{context}\n\n---\n\nQuestion: {question}",
-        })
+        messages.append({"role": "user", "content": question})
         return messages
 
     def answer(self, question: str, context: str, history: list[dict]) -> str:
-        """MiniMax-M3, thinking adaptive (route/rewrite stays disabled — mechanical)."""
-        messages = self._answer_messages(question, context, history)
-        text = self._call_llm(messages, system=self.SYSTEM_PROMPT, max_tokens=ANSWER_MAX_TOKENS,
-                               thinking="adaptive")
+        """MiniMax-M3, thinking disabled — reference material is supplied via the
+        system prompt (`_system_prompt_with_context`), not the user turn."""
+        messages = self._answer_messages(question, history)
+        text = self._call_llm(messages, system=self._system_prompt_with_context(context),
+                               max_tokens=ANSWER_MAX_TOKENS, thinking="disabled")
         return text or "Sorry, I couldn't generate an answer right now — please try again."
 
     def answer_stream(self, question: str, context: str, history: list[dict]):
-        """Streamed MiniMax-M3 answer, thinking adaptive.
+        """Streamed MiniMax-M3 answer, thinking disabled — yielded token-by-token.
 
-        Buffered in full, not replayed token-by-token: a `<think>` block can
-        span multiple stream chunks, and `reasoning_split` isn't 100%
-        reliable at keeping it out of `content` (see `_call_llm`), so it's
-        not safe to forward raw deltas — strip after the full response lands.
+        The reference material rides in the system prompt (not the user turn),
+        so the model treats it as system-supplied. Raw `content` deltas are
+        still piped through `_iter_visible_deltas` as a safety net, which drops
+        any `<think>...</think>` span even when a tag straddles chunk boundaries
+        (`reasoning_split` isn't 100% reliable — see `_call_llm`). This lets the
+        answer stream to the client incrementally instead of landing as one
+        buffered chunk. Leading whitespace on the first visible piece is trimmed
+        to match the non-streaming `answer()` behavior.
         """
-        messages = self._answer_messages(question, context, history)
-        full_messages = [{"role": "system", "content": self.SYSTEM_PROMPT}] + messages
+        messages = self._answer_messages(question, history)
+        full_messages = (
+            [{"role": "system", "content": self._system_prompt_with_context(context)}] + messages
+        )
         stream = self.llm.chat.completions.create(
             model=MINIMAX_MODEL,
             max_tokens=ANSWER_MAX_TOKENS,
             messages=full_messages,
-            extra_body={"reasoning_split": True, "thinking": {"type": "adaptive"}},
+            extra_body={"reasoning_split": True, "thinking": {"type": "disabled"}},
             stream=True,
         )
-        parts: list[str] = []
-        for event in stream:
-            delta = event.choices[0].delta
-            text = getattr(delta, "content", None)
-            if text:
-                parts.append(text)
-        full_text = THINK_TAG_RE.sub("", "".join(parts)).strip()
-        if full_text:
-            yield full_text
-        else:
+
+        def _content_deltas():
+            for event in stream:
+                delta = event.choices[0].delta
+                text = getattr(delta, "content", None)
+                if text:
+                    yield text
+
+        emitted = False
+        for piece in _iter_visible_deltas(_content_deltas()):
+            if not emitted:
+                piece = piece.lstrip()
+                if not piece:
+                    continue
+            emitted = True
+            yield piece
+        if not emitted:
             yield "Sorry, I couldn't generate an answer right now — please try again."
 
     # -- source formatting --------------------------------------------------

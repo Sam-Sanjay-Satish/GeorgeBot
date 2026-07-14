@@ -41,9 +41,9 @@ user question + chat history
    │        → distance-filtered (MAX_CHUNK_DISTANCE=0.75) → collapse by
    │          chunk_id → up to N_CONTEXT=4 distinct chunks (full text)
    │
-   └─ answer()  → MiniMax-M3 (official API, thinking ADAPTIVE)
-                  → cited answer (graph facts + vector chunks numbered together)
-                  + format_sources()
+   └─ answer()  → MiniMax-M3 (official API, thinking DISABLED)
+                  → answer from graph facts + vector chunks (supplied via the
+                    SYSTEM prompt, numbered together) + format_sources()
 ```
 
 Everything lives in **one engine class**, `GeorgeBot`, in `backend/chatbot.py`.
@@ -60,20 +60,27 @@ cross-provider fallback** anymore. Every call sets
 
 - **Route/rewrite: `thinking: "disabled"`** — mechanical classification,
   ~90x faster per a measured MiniMax finding, and doesn't need reasoning.
-- **Answer: `thinking: "adaptive"`** — deliberately *not* disabled here.
-  Disabling it was tried first and broke a specific product requirement
-  (below); adaptive fixed it, at a real latency cost (11s–60s+ observed,
-  occasional multi-minute stalls under back-to-back calls — see
-  "Known issues" below).
-- `reasoning_split` is supposed to keep `<think>...</think>` text out of
-  visible `content` regardless of the `thinking` setting, but **isn't
-  100% reliable** — a leak was observed and reproduced even with the flag
-  set. `_call_llm` and `answer_stream` both defensively regex-strip any
-  `<think>...</think>` block from the final text as a safety net. The
-  streaming path (`answer_stream`) buffers the **full** response before
-  yielding anything (can't safely forward raw deltas — a `<think>` block
-  can span multiple stream chunks), so `/api/chat/stream`'s `token` event
-  currently arrives as one big chunk, not word-by-word.
+- **Answer: `thinking: "disabled"`** (as of 2026-07-14 — was `"adaptive"`).
+  Adaptive was originally adopted because a `disabled` answer step leaked
+  retrieval internals (see "what NOT to over-fix" below); it was switched
+  back to `disabled` once two things landed together: (a) the reference
+  material moved out of the *user* turn and into the **SYSTEM** prompt (via
+  `_system_prompt_with_context`), and (b) `SYSTEM_PROMPT` was rewritten to
+  own the "ignore irrelevant material / if nothing's relevant answer from
+  your own knowledge / never announce missing context" behavior directly.
+  A live 8-question benchmark confirmed the rewrite holds up on `disabled`
+  (0/8 leaked internals) at ~2x lower answer latency (adaptive ~7.8s avg
+  vs disabled ~4.8s). **If you see retrieval-internals leakage return,
+  fix the prompt — do not silently flip back to adaptive without re-reading
+  that section.**
+- `reasoning_split` keeps `<think>...</think>` text out of visible `content`
+  (reasoning lands in a separate `reasoning_content` field we never read).
+  With the answer step now on `thinking: "disabled"` there should be no
+  reasoning at all, but `_call_llm` (regex) and `answer_stream`
+  (`_iter_visible_deltas`, a streaming tag-stripper) both still strip any
+  `<think>` block defensively. `answer_stream` now forwards visible deltas
+  **incrementally** (token-by-token), so `/api/chat/stream`'s `token` event
+  streams progressively — the frontend (`askGeorgeStream`) is wired to it.
 
 **Prompt/retrieval behavior — what NOT to over-fix.** Two real product
 requirements drove recent changes, and the fixes matter more than the
@@ -81,16 +88,22 @@ prompt wording used to get there — don't re-litigate from scratch without
 reading this first:
 
 1. *"Don't expose retrieval internals — no 'I don't have that information
-   in the provided context' type non-answers."* Tried multiple prompt-only
-   fixes (banned-phrase lists, worked examples, "hard rule" framing) —
-   none were fully reliable; MiniMax-M3 with `thinking: "disabled"` on the
-   answer step reliably ignored even a literal banned-word list. Switching
-   the answer step to `thinking: "adaptive"` fixed it far more effectively
-   than any further prompt engineering. Current `SYSTEM_PROMPT` rule for
-   this is deliberately a single plain paragraph, **not** a heavily
-   enforced one — that's intentional (explicit user direction: don't
-   over-enforce in the prompt; let the model + thinking setting do the
-   work).
+   in the provided context' type non-answers."* History (still worth
+   knowing): early prompt-only fixes (banned-phrase lists, worked examples,
+   "hard rule" framing) were unreliable with a `disabled` answer step, so
+   the answer step was moved to `thinking: "adaptive"`, which fixed it.
+   **That is no longer how it's solved.** As of 2026-07-14 the answer step
+   is back on `disabled`, and the fix now lives in the prompt + message
+   structure: the retrieved material is supplied via the **SYSTEM** prompt
+   (not the user turn) so the model knows *the user didn't write or see it*,
+   and `SYSTEM_PROMPT` explicitly instructs it to ignore irrelevant
+   material, answer from its own knowledge when nothing is relevant, and
+   never announce missing/insufficient context. This is now a **deliberately
+   enforced** prompt rule (reversing the earlier "keep it a single plain
+   paragraph, don't over-enforce" guidance — that assumed adaptive thinking
+   was carrying the load; it no longer is). Verified across an 8-question
+   live batch, including the two cases that used to leak (`parking cost`,
+   `clubs`) and an off-topic query that must answer from own knowledge.
 2. *"If retrieved chunks are irrelevant, don't force them into context —
    answer from general knowledge instead."* This turned out to be a
    **retrieval-layer** problem, not a prompt problem: distance alone
@@ -331,15 +344,21 @@ taxonomy quality** — see `georgebot-pipeline`'s
 dedup history (46 raw families → 31) if you see a filtering-related miss
 after new corpus content lands.
 
-### 4. Fetch + answer — `MiniMax-M3` (thinking adaptive)
+### 4. Fetch + answer — `MiniMax-M3` (thinking disabled)
 - `_build_context()` numbers graph blocks first, then vector chunks
   (`source=webpage|document`, `type=<document_type>`,
   `department=<department>`, `topics=<pipe-joined topic_families>`) + URL
   + full chunk text.
-- `answer()`/`answer_stream()` call MiniMax-M3 with `thinking: "adaptive"`,
-  `max_tokens=1500`, `SYSTEM_PROMPT`, and the last `MAX_HISTORY_TURNS`
-  conversation turns. Both defensively strip any leaked `<think>` block
-  (see "Single LLM provider" above) before returning.
+- **The assembled context is injected into the SYSTEM message, not the user
+  turn** — `_system_prompt_with_context()` wraps it in explicit
+  "SYSTEM-SUPPLIED REFERENCE MATERIAL (the user didn't write or see this)"
+  delimiters, and `_answer_messages()` puts only the question in the user
+  turn. This is what stops the model treating the material as user-provided.
+- `answer()`/`answer_stream()` call MiniMax-M3 with `thinking: "disabled"`,
+  `max_tokens=1500`, the context-augmented system prompt, and the last
+  `MAX_HISTORY_TURNS` conversation turns. Both defensively strip any leaked
+  `<think>` block (see "Single LLM provider" above); `answer_stream`
+  forwards visible deltas incrementally (token-by-token).
 
 ### Tunable constants (top of `chatbot.py`)
 
@@ -355,7 +374,13 @@ after new corpus content lands.
 | `MAX_HISTORY_TURNS` | 6 | trailing turns kept for rewrite + answer |
 
 ### System prompt (answer model) — behavioral contract
-- Answer **only** from the numbered context chunks; cite chunk numbers inline (`[1]`, `[2][5]`).
+- **Reference material is framed as SYSTEM-supplied, and the word "chunk"
+  never appears in the prompt** (explicit user direction). The prompt tells
+  the model the user didn't write or see the material, that some of it may
+  be irrelevant (ignore it), and that if none is relevant it should answer
+  from its own knowledge — never announcing missing/insufficient context.
+  Runs on `thinking: "disabled"`, so the prompt carries this behavior itself
+  (see "what NOT to over-fix" #1).
 - **Anti-fabrication rule for garbled table data (real incident, root-caused).**
   A user reported the bot confidently claiming "CSC 116 is no longer offered"
   plus a fabricated course-sequencing narrative, and — worse — when asked to
@@ -371,14 +396,14 @@ after new corpus content lands.
 - Chunks are retrieved by similarity search, not guaranteed relevance — use
   each chunk's tags + content to judge fit; silently drop chunks that don't
   address the question rather than forcing them in.
-- **If the chunks don't cover what's asked, don't say so and don't describe
-  what they do cover instead** — answer directly and helpfully as you would
-  with no context, and for any specific UVic fact you can't confirm, point
-  the user to where to get it (e.g. "check your syllabus or ask your
-  professor") instead of explaining you don't have it. (See "what NOT to
-  over-fix" above — this is deliberately a single plain rule, not a
-  heavily-enforced one; the `thinking: adaptive` setting on the answer step
-  does more of the actual work here than the wording does.)
+- **If the material doesn't cover what's asked, don't say so and don't
+  describe what it does cover instead** — answer directly and helpfully as
+  you would with no context, and for any specific UVic fact you can't
+  confirm, point the user to where to get it (e.g. "check your syllabus or
+  ask your professor") instead of explaining you don't have it. (See "what
+  NOT to over-fix" #1 above — as of 2026-07-14 this is a deliberately
+  enforced prompt rule + SYSTEM-message framing, not a single plain
+  paragraph leaning on adaptive thinking.)
 - Course outlines marked **HISTORICAL** are past-term snapshots; always
   name the term when citing one; never present historical grading/
   instructors/schedules as current.
@@ -392,14 +417,14 @@ after new corpus content lands.
 
 ## Known issues / open items
 
-- **Answer-step latency with `thinking: adaptive`**: observed 11s–60s+ per
-  call, and a full stall past 90s when a few calls landed close together —
-  most likely MiniMax's account-level Token Plan rate limit (opaque,
-  token-throughput-based, not a flat request cap) rather than a hang on
-  GeorgeBot's side. Not yet mitigated. If this becomes a live-traffic
-  problem, options to explore: a dedicated/higher Token Plan tier,
-  request queuing/backoff, or revisiting whether adaptive thinking is
-  worth the latency for this specific product requirement.
+- **MiniMax account-level Token Plan rate limit (429)**: opaque,
+  token-throughput-based (not a flat request cap). Hit reliably under
+  back-to-back calls (e.g. batch testing) — surfaces as `rate_limit_error
+  (2062)` and, in `rewrite_and_route`, falls back to vector-only. The answer
+  step now runs `thinking: "disabled"` (~4.8s avg vs ~7.8s on adaptive), so
+  per-call latency is lower, but the throughput ceiling is unchanged. If it
+  becomes a live-traffic problem: a dedicated/higher Token Plan tier,
+  pay-as-you-go, or request queuing/backoff.
 - **Railway Volume wiring — code side done (2026-07-14), Railway side
   still TBD.** The artifact paths now read from env
   (`DATA_DIR`, or per-artifact `CHROMA_DIR`/`TAXONOMY_FILE`/`GRAPH_DATA_DIR`),
@@ -410,8 +435,10 @@ after new corpus content lands.
   by borrowing `georgebot-pipeline`'s venv. Fine short-term since both
   repos share a machine during this transition, but worth fixing before
   this repo is truly standalone.
-- **Frontend**: `/api/chat/stream` is implemented server-side but not
-  wired into the UI (`App.tsx` uses non-streaming `/api/chat`). Login is a
+- **Frontend**: `App.tsx` uses the streaming endpoint (`askGeorgeStream` →
+  `/api/chat/stream`); tokens now arrive incrementally and a client-side
+  typewriter (`REVEAL_CHARS_PER_TICK`/`REVEAL_TICK_MS`) paces the reveal.
+  Sources are buffered and shown only after the reveal completes. Login is a
   mock shell (no real OAuth). `mockData.ts` exists but is unused.
 
 ---

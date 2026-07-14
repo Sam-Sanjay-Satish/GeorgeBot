@@ -42,10 +42,28 @@ function titleFromUrl(url: string): string {
   }
 }
 
+// Raw page <title>s are breadcrumb-y ("Program Declaration - Engineering -
+// Faculty of Engineering and Computer Science"). Split on the breadcrumb
+// separators (only when space-padded, so hyphenated words like "Co-operative"
+// survive), drop trailing org/faculty/site segments, and keep the two most
+// specific parts.
+function cleanTitle(raw: string): string {
+  const parts = raw
+    .split(/\s+[|–—-]\s+/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+  const noise = /^(faculty of\b|university of victoria$|uvic$|home$|index$)/i
+  const kept = parts.filter((p) => !noise.test(p))
+  const use = (kept.length ? kept : parts).slice(0, 2)
+  return use.join(' — ') || raw.trim()
+}
+
 function mapSource(s: ApiSource): Source {
   const title = s.course_code
     ? `${s.course_code}${s.term ? ` — ${s.term}` : ''}`
-    : s.title || titleFromUrl(s.url)
+    : s.title
+      ? cleanTitle(s.title)
+      : titleFromUrl(s.url)
   return {
     url: s.url,
     title,

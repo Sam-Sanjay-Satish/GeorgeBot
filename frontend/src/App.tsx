@@ -4,15 +4,15 @@ import { ChatInput } from './components/ChatInput'
 import { LoginPage } from './components/LoginPage'
 import { AccountMenu } from './components/AccountMenu'
 import { askGeorgeStream } from './lib/api'
-import type { Message } from './types'
+import type { Message, Source } from './types'
 
 // Tokens arrive from the backend in bursts (network + generation timing, not
 // a steady per-character rate), which reads as jittery/too-fast on screen.
 // Reveal characters from a local queue at a fixed pace instead of dumping
 // each token straight to the DOM the instant it arrives — this only affects
 // perceived typing speed, not actual backend response time.
-const REVEAL_CHARS_PER_TICK = 2
-const REVEAL_TICK_MS = 18
+const REVEAL_CHARS_PER_TICK = 3
+const REVEAL_TICK_MS = 16
 
 export default function App() {
   const [loggedIn, setLoggedIn] = useState(false)
@@ -50,6 +50,10 @@ export default function App() {
     let pending = ''
     let streamEnded = false
     let flushTimer: ReturnType<typeof setInterval> | null = null
+    // Sources arrive up-front from the backend, but we hold them back and only
+    // attach them once the answer has finished revealing — so they appear
+    // together with the completed message rather than before it's done typing.
+    let bufferedSources: Source[] | null = null
 
     function updateContent() {
       setMessages((prev) =>
@@ -59,6 +63,23 @@ export default function App() {
       )
     }
 
+    // Streaming + reveal fully done: stop the timer, commit the final text, and
+    // now reveal the buffered sources.
+    function finish() {
+      if (flushTimer) {
+        clearInterval(flushTimer)
+        flushTimer = null
+      }
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === loadingId
+            ? { ...m, loading: false, content: revealed, sources: bufferedSources ?? m.sources }
+            : m
+        )
+      )
+      setLoading(false)
+    }
+
     function startFlushing() {
       if (flushTimer) return
       flushTimer = setInterval(() => {
@@ -66,10 +87,8 @@ export default function App() {
           revealed += pending.slice(0, REVEAL_CHARS_PER_TICK)
           pending = pending.slice(REVEAL_CHARS_PER_TICK)
           updateContent()
-        } else if (streamEnded && flushTimer) {
-          clearInterval(flushTimer)
-          flushTimer = null
-          setLoading(false)
+        } else if (streamEnded) {
+          finish()
         }
       }, REVEAL_TICK_MS)
     }
@@ -77,9 +96,8 @@ export default function App() {
     try {
       await askGeorgeStream(text, priorMessages, {
         onSources: (sources) => {
-          setMessages((prev) =>
-            prev.map((m) => (m.id === loadingId ? { ...m, sources } : m))
-          )
+          // Buffer only — finish() attaches these once the reveal completes.
+          bufferedSources = sources
         },
         onToken: (token) => {
           pending += token
@@ -87,11 +105,15 @@ export default function App() {
         },
         onDone: () => {
           streamEnded = true
-          if (pending.length === 0) setLoading(false)
+          if (pending.length === 0) finish()
         },
         onError: (message) => {
           streamEnded = true
           if (pending.length === 0) {
+            if (flushTimer) {
+              clearInterval(flushTimer)
+              flushTimer = null
+            }
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === loadingId

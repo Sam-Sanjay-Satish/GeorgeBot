@@ -1,4 +1,4 @@
-import { Bot, User } from 'lucide-react'
+import { User } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { SourcePanel } from './SourcePanel'
@@ -20,7 +20,7 @@ export function MessageBubble({ message }: Props) {
             : 'bg-muted text-muted-foreground'
         }`}
       >
-        {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+        {isUser ? <User className="w-4 h-4" /> : <span className="font-bold text-sm leading-none">G</span>}
       </div>
 
       <div className={`max-w-[78%] ${isUser ? 'items-end' : 'items-start'} flex flex-col`}>
