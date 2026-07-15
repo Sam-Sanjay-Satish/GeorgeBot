@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from banner import banner_retrieve
+from banner import banner_instructor_retrieve, banner_retrieve
 from chatbot import DEFAULT_AUDIENCE, VALID_AUDIENCES, GeorgeBot
 
 
@@ -59,6 +59,9 @@ def _route_status(route: dict) -> str:
 
     Templated from known state (no LLM call, no latency). Falls back to a
     plain "Searching…" when nothing more specific is known."""
+    instr = route.get("instructor_query")
+    if instr:
+        return f"Looking up what {instr} is teaching…"
     codes = route.get("course_codes") or []
     if codes and route.get("wants_availability"):
         if len(codes) == 1:
@@ -139,6 +142,10 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                 if route["course_codes"] and route["wants_availability"]:
                     banner_facts = banner_retrieve(
                         route["course_codes"], route["term_season"], route["term_year"],
+                    )
+                elif route["instructor_query"]:
+                    banner_facts = banner_instructor_retrieve(
+                        route["instructor_query"], route["term_season"], route["term_year"],
                     )
                 chunks = bot.vector_retrieve(
                     route["search_query"], audience=audience,

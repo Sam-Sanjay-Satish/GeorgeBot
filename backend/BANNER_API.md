@@ -5,7 +5,11 @@ section schedule, and instructor** from UVic's Banner registration system.
 Everything below was verified live against `banner.uvic.ca` on 2026-07-15
 (Fall 2026 / term `202609`). No auth required for read-only class search.
 
-**Status:** not yet implemented. This is a spec/notes doc to build from.
+**Status:** IMPLEMENTED (2026-07-15) in `backend/banner.py`, wired into the gated
+retrieval path in `chatbot.py`/`api.py`. This doc is the endpoint/field reference it
+was built from. Two live features ship: **course availability** (`banner_retrieve`,
+router `wants_availability`) and **instructor → courses reverse lookup**
+(`banner_instructor_retrieve`, router `instructor_query`).
 
 ---
 
@@ -112,6 +116,30 @@ GET /ssb/searchResults/getFacultyMeetingTimes?term=202609&courseReferenceNumber=
 Needed only because `searchResults` returns `faculty: []` (empty). This call
 populates the instructor. Keyed by CRN (`courseReferenceNumber`). One call per
 section if you want the prof.
+
+### `get_instructor` + instructor search — reverse lookup (what a prof teaches) ⭐
+Two-step, and there's a **sharp gotcha**. First resolve the name:
+```
+GET /ssb/classSearch/get_instructor?term=202609&searchTerm=Yong&offset=1&max=15
+→ [{ "code": "92738", "description": "Quinton Yong" }, ...]
+```
+Then search that instructor's sections (across all subjects):
+```
+GET /ssb/searchResults/searchResults?txt_instructor=92738&txt_term=202609&pageMaxSize=100
+→ same {success, totalCount, data:[<section>]} shape as a normal search
+```
+**GOTCHA: the `get_instructor` `code` is a SESSION-SCOPED EPHEMERAL id, not a stable
+PIDM.** It increments every session (observed `92736 → 92737 → 92738` across three
+handshakes), and using a code from a *different* session (or a stale one) fails —
+either HTTP 500 `Cannot get property 'pidm' on null object`, or a wrong-instructor
+result. So `get_instructor` and the `txt_instructor` search **must run on the same
+session, back-to-back.** In this codebase (`banner.search_by_instructor`) that's done
+with a **dedicated throwaway session per lookup** (own handshake → get_instructor →
+search), keeping the fragile ephemeral state off the shared module session; only the
+*result* is cached (120s by term+name). `get_instructor` may return multiple people
+(common surname) → disambiguate with the user. Sections returned this way also have
+`faculty: []`, but you already know the instructor (you searched by them), so no
+`getFacultyMeetingTimes` call is needed.
 
 ### HTML-only endpoints — SKIP (overlap with graph, must scrape HTML)
 - `POST /ssb/searchResults/getClassDetails`

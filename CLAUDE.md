@@ -29,7 +29,8 @@ user question + chat history + audience (undergrad | faculty | both)
    ├─ rewrite_and_route(…, audience)  → MiniMax-M3 (official API, thinking DISABLED)
    │                          (ONE call: standalone search query +
    │                          course_codes[] + program_query + wants_outline
-   │                          + wants_availability + term_season/term_year
+   │                          + wants_availability + instructor_query
+   │                          + term_season/term_year
    │                          + topic_families[] + department; the topic_family
    │                          vocabulary offered depends on audience)
    │
@@ -38,11 +39,13 @@ user question + chat history + audience (undergrad | faculty | both)
    │        → prereqs, credits, cross-listings, descriptions, program
    │          requirements, outline text. No vector search. Audience-independent.
    │
-   ├─ banner_retrieve()  (only if course_codes AND wants_availability — LIVE data)
+   ├─ banner_retrieve() / banner_instructor_retrieve()  (LIVE data, gated)
    │     └─ banner.py — UVic Banner 9 registration JSON (banner.uvic.ca), NOT the
-   │        static index: live seats/waitlist, per-section schedule/room, instructor,
-   │        delivery/campus, for the resolved term. In-process TTL cache. Best-effort
-   │        (returns {} on any failure). Audience-independent. See BANNER_API.md.
+   │        static index. Two gated paths: (a) course availability, when course_codes
+   │        AND wants_availability — live seats/waitlist, per-section schedule/room,
+   │        instructor; (b) instructor→courses reverse lookup, when instructor_query —
+   │        everything a named prof teaches that term (or an ambiguity/no-match note).
+   │        In-process TTL cache. Best-effort ({} on failure). See BANNER_API.md.
    │
    ├─ vector_retrieve(query, audience)
    │     └─ Voyage query embedding (ONE) → queried against the selected
@@ -351,8 +354,9 @@ curl -s -X POST http://127.0.0.1:5001/api/chat -H 'Content-Type: application/jso
 ### 1. Query rewrite + route — `MiniMax-M3` (thinking disabled)
 `rewrite_and_route(question, history, audience)` is **one** call that returns
 JSON: `search_query`, `course_codes` (normalized, no space — `"CSC 225"` →
-`"CSC225"`), `program_query`, `wants_outline`, `wants_availability`,
-`term_season` (`spring|summer|fall|null`), `term_year` (int|null),
+`"CSC225"`), `program_query`, `wants_outline`, `wants_availability`, `instructor_query`
+(prof name|null — reverse lookup), `term_season` (`spring|summer|fall|null`),
+`term_year` (int|null),
 `completed_courses`, `topic_families` (0-3, copied verbatim from the taxonomy),
 `department` (copied verbatim, or null). `course_codes` is populated for
 **structured catalog facts** (prereqs, credits, cross-listings, descriptions,
@@ -398,24 +402,34 @@ Only runs when `course_codes` or `program_query` is non-empty.
   `source=kuali`, same numbering scheme as vector chunks.
 
 ### 2b. Live availability — `banner.py` (UVic Banner 9, no LLM, no vector search)
-Gated live-data step, parallel to graph retrieval. Fires **only when
-`course_codes` is non-empty AND the router set `wants_availability`** (asked
-about seats/openings/waitlist/"is X full"/section times/where-it-meets/who-
-teaches-it). This is why the router prompt populates `course_codes` for
-availability questions too — not just catalog facts — or the gate would never
-open. See `BANNER_API.md` for the endpoint research.
+Gated live-data step, parallel to graph retrieval. Two firing conditions
+(mutually exclusive): (a) **`course_codes` non-empty AND `wants_availability`**
+(seats/openings/waitlist/"is X full"/section times/where-it-meets/who-teaches-it)
+→ `banner_retrieve`; (b) **`instructor_query` set** (which courses does prof X
+teach) → `banner_instructor_retrieve`. Case (a) is why the router populates
+`course_codes` for availability questions too — not just catalog facts — or the
+gate would never open. See `BANNER_API.md` for the endpoint research.
 - **Source of truth vs. the static index.** Chroma/graph are a static snapshot
   from a Railway Volume; Banner is *current, per-section, real-time* enrollment
   from `banner.uvic.ca` registration self-service (no auth for class search).
   Banner owns **only** live seats/waitlist, section schedule/room, instructor,
   delivery/campus — prereqs/credits/program requirements stay with the graph.
-- **`banner_retrieve(course_codes, season, year)`** resolves the term (default:
-  nearest current/upcoming non-"View Only" term; router-named term via
-  `term_season`/`term_year` wins — today's date is injected into the router
+- **`banner_retrieve(course_codes, season, year)`** (course availability) resolves
+  the term (default: nearest current/upcoming non-"View Only" term; router-named term
+  via `term_season`/`term_year` wins — today's date is injected into the router
   prompt so "next spring" resolves), then per course: `searchResults` (all
-  sections) + one `getFacultyMeetingTimes` per CRN (instructor; `searchResults`
-  returns `faculty: []`). Best-effort — returns `{}` on any failure so the answer
-  never breaks.
+  sections) + one `getFacultyMeetingTimes` per CRN, **fanned out over a thread pool**
+  since `searchResults` returns `faculty: []`. Best-effort — returns `{}` on any
+  failure so the answer never breaks.
+- **`banner_instructor_retrieve(name, season, year)`** (reverse lookup: what a prof
+  teaches) fires on `instructor_query`. `get_instructor` resolves the name → a
+  **session-scoped ephemeral instructor code** (NOT a stable id — it changes every
+  session), so the resolve + `txt_instructor` search must run back-to-back on one
+  session; `banner.search_by_instructor` uses a **dedicated throwaway session per
+  lookup** to keep that fragile state off the shared session, caching only the result
+  (120s). A common surname returns multiple `get_instructor` matches → the block tells
+  the model to ask the user to disambiguate (like the ambiguous-program flow). See the
+  `get_instructor` gotcha in `BANNER_API.md`.
 - **Caching is in-process + ephemeral (NOT the Volume)** — freshness is the point.
   Module-level `requests.Session` (3-step handshake, reused, `threading.Lock`-
   guarded since the SSE generator runs in a threadpool), 120s TTL on section

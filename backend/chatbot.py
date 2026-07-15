@@ -44,7 +44,7 @@ import sys
 import time
 from pathlib import Path
 
-from banner import banner_retrieve   # live class availability (session + TTL cache)
+from banner import banner_instructor_retrieve, banner_retrieve   # live class availability
 
 BASE_DIR = Path(__file__).parent          # backend/
 
@@ -539,15 +539,71 @@ class GeorgeBot:
         return "\n\n".join(blocks)
 
     @staticmethod
-    def _banner_context_text(banner_facts: dict, offset: int) -> tuple[str, int]:
-        """Render live Banner section data into numbered `[n]` blocks tagged
-        source=banner, one block per course, starting at `[offset+1]`. Returns
-        (text, n_blocks). Mirrors `_graph_context_text`'s numbering scheme so graph,
-        banner, and vector blocks share one continuous `[n]` sequence."""
+    def _banner_section_line(s: dict) -> str:
+        """One section rendered as a single line: seats, waitlist, schedule, instructor,
+        delivery/campus. Shared by the availability and instructor render paths."""
         def _hhmm(t: str | None) -> str:
             return f"{t[:2]}:{t[2:]}" if t and len(t) == 4 else "?"
 
+        seat = (f"{s['seats_available']} of {s['max_enrollment']} seats open "
+                f"({s['enrollment']} enrolled)")
+        parts = [f"  {s['section']} ({s.get('schedule_type', '')}): {seat} — "
+                 f"{'OPEN' if s.get('open') else 'FULL'}."]
+        if s.get("wait_capacity"):
+            parts.append(f"Waitlist {s.get('wait_count', '?')}/{s['wait_capacity']} "
+                         f"({s.get('wait_available', '?')} open).")
+        m = s.get("meeting")
+        if m and (m.get("days") or m.get("begin")):
+            when = " ".join(m.get("days") or []) or "days TBA"
+            loc = ""
+            room = m.get("room")
+            if room and room != "None specified":
+                loc = f", {m.get('building') or ''} {room}".rstrip()
+            parts.append(f"Meets {when} {_hhmm(m.get('begin'))}-{_hhmm(m.get('end'))}{loc}.")
+        profs = ", ".join(f"{p['name']}" + (f" ({p['email']})" if p.get("email") else "")
+                          for p in s.get("instructors", []) if p.get("name"))
+        parts.append(f"Instructor: {profs or 'TBA'}.")
+        extra = " ".join(x for x in [s.get("delivery"), s.get("campus")] if x)
+        if extra:
+            parts.append(extra + ".")
+        return " ".join(parts)
+
+    @classmethod
+    def _banner_context_text(cls, banner_facts: dict, offset: int) -> tuple[str, int]:
+        """Render live Banner data into numbered `[n]` blocks tagged source=banner,
+        starting at `[offset+1]`. Returns (text, n_blocks). Mirrors
+        `_graph_context_text`'s numbering so graph, banner, and vector blocks share one
+        continuous `[n]` sequence.
+
+        Two shapes (`kind`): "availability" -> one block per course (live seats);
+        "instructor" -> a single block listing everything a professor teaches (or an
+        ambiguity/no-match note the answer model acts on)."""
         term_label = banner_facts.get("term_label", "")
+
+        if banner_facts.get("kind") == "instructor":
+            i = offset + 1
+            query = banner_facts.get("instructor_query", "")
+            instr = banner_facts.get("instructor")
+            candidates = banner_facts.get("candidates", [])
+            courses = banner_facts.get("courses", [])
+            if not instr and candidates:
+                body = (f"Multiple instructors match \"{query}\" for {term_label}: "
+                        f"{'; '.join(candidates)}. Ask the user which one they mean before "
+                        f"answering.")
+            elif not courses:
+                body = (f"No classes found taught by an instructor matching \"{query}\" "
+                        f"in {term_label}. Tell the user that and suggest checking the "
+                        f"name/term, without inventing courses.")
+            else:
+                lines = [f"LIVE ({term_label}): {instr} is teaching the following "
+                         f"(current seat counts, subject to change):"]
+                for course in courses:
+                    lines.append(f" {course['code']}:")
+                    lines.extend(cls._banner_section_line(s) for s in course["sections"])
+                body = "\n".join(lines)
+            header = f"[{i}] source=banner instructor=\"{instr or query}\" term={term_label}"
+            return f"{header}\n{body}", 1
+
         blocks = []
         i = offset
         for course in banner_facts.get("courses", []):
@@ -558,30 +614,7 @@ class GeorgeBot:
                 f"LIVE class availability for {code} ({term_label}) — current seat "
                 f"counts pulled from UVic registration, subject to change:",
             ]
-            for s in course.get("sections", []):
-                seat = (f"{s['seats_available']} of {s['max_enrollment']} seats open "
-                        f"({s['enrollment']} enrolled)")
-                status = "OPEN" if s.get("open") else "FULL"
-                parts = [f"  {s['section']} ({s.get('schedule_type', '')}): {seat} — {status}."]
-                if s.get("wait_capacity"):
-                    parts.append(f"Waitlist {s.get('wait_count', '?')}/{s['wait_capacity']} "
-                                 f"({s.get('wait_available', '?')} open).")
-                m = s.get("meeting")
-                if m and (m.get("days") or m.get("begin")):
-                    when = " ".join(m.get("days") or []) or "days TBA"
-                    loc = ""
-                    room = m.get("room")
-                    if room and room != "None specified":
-                        loc = f", {m.get('building') or ''} {room}".rstrip()
-                    parts.append(f"Meets {when} {_hhmm(m.get('begin'))}-{_hhmm(m.get('end'))}{loc}.")
-                profs = ", ".join(f"{p['name']}"
-                                  + (f" ({p['email']})" if p.get("email") else "")
-                                  for p in s.get("instructors", []) if p.get("name"))
-                parts.append(f"Instructor: {profs or 'TBA'}.")
-                extra = " ".join(x for x in [s.get("delivery"), s.get("campus")] if x)
-                if extra:
-                    parts.append(extra + ".")
-                lines.append(" ".join(parts))
+            lines.extend(cls._banner_section_line(s) for s in course.get("sections", []))
             blocks.append("\n".join(lines))
         return "\n\n".join(blocks), i - offset
 
@@ -672,6 +705,11 @@ class GeorgeBot:
             f'spring\" using today\'s date above.\n'
             f'  "term_year": the 4-digit year of that term (e.g. 2026) when '
             f"determinable, otherwise null.\n"
+            f'  "instructor_query": if the user is asking WHICH courses or sections a '
+            f"specific professor/instructor teaches (a person-centric question, not "
+            f"about one named course), the instructor's name as written (e.g. "
+            f'"Yong", "Quinton Yong"); otherwise null. Leave course_codes empty when '
+            f"this is set — the lookup is by instructor, not course.\n"
             f'  "completed_courses": array of UVic course codes the user has '
             f"stated (anywhere in the conversation, not just the latest message) "
             f"that they have already taken/completed/passed, normalized the same "
@@ -724,6 +762,7 @@ class GeorgeBot:
                 "program_query": data.get("program_query") or None,
                 "wants_outline": bool(data.get("wants_outline")),
                 "wants_availability": bool(data.get("wants_availability")),
+                "instructor_query": (data.get("instructor_query") or None),
                 "term_season": season,
                 "term_year": year,
                 "topic_families": [f for f in (data.get("topic_families") or []) if f in valid_families],
@@ -732,8 +771,9 @@ class GeorgeBot:
         except Exception as e:
             print(f"  [rewrite_and_route] failed, falling back to vector-only: {e}", file=sys.stderr)
             return {"search_query": question, "course_codes": [], "program_query": None,
-                    "wants_outline": False, "wants_availability": False, "term_season": None,
-                    "term_year": None, "completed_courses": [], "topic_families": [], "department": None}
+                    "wants_outline": False, "wants_availability": False, "instructor_query": None,
+                    "term_season": None, "term_year": None, "completed_courses": [],
+                    "topic_families": [], "department": None}
 
     @staticmethod
     def _build_context(chunks: list[dict], graph_text: str, offset: int) -> str:
@@ -804,7 +844,10 @@ class GeorgeBot:
         "term, cite section codes (e.g. A01), and call out when a section is full "
         "or waitlist-only. These numbers change constantly, so present them as "
         "current-as-of-now, not a guarantee. (Contrast: source=kuali is the static "
-        "catalog; HISTORICAL outlines are past terms.)\n"
+        "catalog; HISTORICAL outlines are past terms.) A source=banner block may "
+        "instead list everything a named instructor teaches that term, or say the "
+        "name was ambiguous (ask the user which person they mean) or matched no "
+        "classes (tell them so — don't invent courses).\n"
         "- Course outlines tagged HISTORICAL are past-term snapshots only. When "
         "you rely on one, always name the specific term, and never present "
         "historical grading weights, instructors, or schedules as current — for "
@@ -969,6 +1012,7 @@ class GeorgeBot:
 
         if banner_facts:
             term_label = banner_facts.get("term_label", "")
+            instr = banner_facts.get("instructor")  # set only on the instructor path
             for course in banner_facts.get("courses", []):
                 n += 1
                 code = course["code"]
@@ -978,7 +1022,7 @@ class GeorgeBot:
                     # data itself is served inline, this is just a "look it up" pointer.
                     "url": "https://banner.uvic.ca/StudentRegistrationSsb/ssb/classSearch/classSearch",
                     "source": "banner",
-                    "title": f"{code} — live availability",
+                    "title": f"{code} — {'taught by ' + instr if instr else 'live availability'}",
                     "course_code": code,
                     "term": term_label or None,
                     "historical": False,
@@ -1031,6 +1075,10 @@ class GeorgeBot:
         if route["course_codes"] and route["wants_availability"]:
             banner_facts = banner_retrieve(
                 route["course_codes"], route["term_season"], route["term_year"],
+            )
+        elif route["instructor_query"]:
+            banner_facts = banner_instructor_retrieve(
+                route["instructor_query"], route["term_season"], route["term_year"],
             )
         chunks = self.vector_retrieve(
             route["search_query"], audience=audience,

@@ -68,6 +68,7 @@ _session: requests.Session | None = None
 _session_term: str | None = None                       # term currently bound to _session
 _sections_cache: dict[tuple, tuple[float, list]] = {}  # (term,subject,number) -> (t, sections)
 _faculty_cache: dict[tuple, tuple[float, list]] = {}   # (term, crn) -> (t, faculty)
+_instructor_cache: dict[tuple, tuple[float, dict]] = {}  # (term, name) -> (t, result)
 _terms_cache: tuple[float, list] | None = None         # (t, [{code, description}])
 
 
@@ -272,36 +273,123 @@ def search_sections(subject: str, number: str, term: str) -> list[dict]:
                 pool.map(lambda c: _fetch_faculty(session, term, c), unique_crns),
             ))
 
-    sections: list[dict] = []
-    for raw, crn in zip(data, crns):
-        meeting = _meeting_from_section(raw)
-        instructors = faculty_by_crn.get(crn, [])
-        sections.append({
-            "crn": crn,
-            "section": raw.get("sequenceNumber"),          # "A01"
-            "title": raw.get("courseTitle"),
-            "schedule_type": raw.get("scheduleTypeDescription"),   # Lecture / Lab / Tutorial
-            "seats_available": raw.get("seatsAvailable"),
-            "max_enrollment": raw.get("maximumEnrollment"),
-            "enrollment": raw.get("enrollment"),
-            "open": bool(raw.get("openSection")),
-            "wait_available": raw.get("waitAvailable"),
-            "wait_count": raw.get("waitCount"),
-            "wait_capacity": raw.get("waitCapacity"),
-            "delivery": raw.get("instructionalMethodDescription"),  # Face-to-face / Online
-            "campus": raw.get("campusDescription"),
-            "credits": raw.get("creditHours"),
-            "meeting": meeting,
-            "instructors": instructors,
-        })
+    sections = [_normalize_section(raw, faculty_by_crn.get(crn, []))
+                for raw, crn in zip(data, crns)]
 
     with _lock:
         _sections_cache[key] = (time.monotonic(), sections)
     return sections
 
 
+def _normalize_section(raw: dict, instructors: list[dict]) -> dict:
+    """Shape one raw Banner section object into the fields we serve. `instructors`
+    is passed in — the course path fetches it per CRN, the instructor-search path
+    already knows who it searched for."""
+    return {
+        "crn": str(raw.get("courseReferenceNumber") or ""),
+        "subject_course": raw.get("subjectCourse"),        # "CSC225"
+        "section": raw.get("sequenceNumber"),              # "A01"
+        "title": raw.get("courseTitle"),
+        "schedule_type": raw.get("scheduleTypeDescription"),   # Lecture / Lab / Tutorial
+        "seats_available": raw.get("seatsAvailable"),
+        "max_enrollment": raw.get("maximumEnrollment"),
+        "enrollment": raw.get("enrollment"),
+        "open": bool(raw.get("openSection")),
+        "wait_available": raw.get("waitAvailable"),
+        "wait_count": raw.get("waitCount"),
+        "wait_capacity": raw.get("waitCapacity"),
+        "delivery": raw.get("instructionalMethodDescription"),  # Face-to-face / Online
+        "campus": raw.get("campusDescription"),
+        "credits": raw.get("creditHours"),
+        "meeting": _meeting_from_section(raw),
+        "instructors": instructors,
+    }
+
+
 # ---------------------------------------------------------------------------
-# Top-level entry — gated call from chatbot.py
+# Instructor -> courses reverse lookup
+# ---------------------------------------------------------------------------
+
+def _get_instructor_matches(session: requests.Session, term: str, name: str) -> list[dict]:
+    """`get_instructor` autocomplete -> [{code, description}]. NOTE the `code` is a
+    SESSION-SCOPED ephemeral id (it changes every session), so it's only valid for a
+    `txt_instructor` search issued on this same session — never cache or reuse it."""
+    resp = session.get(f"{BASE}/classSearch/get_instructor",
+                       params={"term": term, "searchTerm": name, "offset": 1, "max": 15},
+                       timeout=HTTP_TIMEOUT)
+    return resp.json() or []
+
+
+def search_by_instructor(name: str, term: str) -> dict:
+    """Reverse lookup: which sections a professor teaches in `term`.
+
+    Returns `{"instructor": <resolved name|None>, "candidates": [names],
+    "sections": [section, ...]}`:
+      - exactly one instructor matched -> `instructor` set, `sections` populated.
+      - multiple matched (common surname) -> `candidates` lists them, `sections` empty
+        (caller asks the user to disambiguate).
+      - none matched -> all empty.
+
+    Uses a DEDICATED short-lived session for the whole handshake -> get_instructor ->
+    txt_instructor search sequence. The instructor `code` is session-ephemeral, so the
+    three calls must share one session; using a throwaway session (rather than the
+    module-shared one) keeps that fragile state off the shared session and out of the
+    lock — instructor lookups are rare and the RESULT is cached, so the extra handshake
+    is cheap. Cached 120s by (term, name)."""
+    key = (term, name.strip().lower())
+    with _lock:
+        hit = _instructor_cache.get(key)
+        if hit and (time.monotonic() - hit[0] < SECTIONS_TTL):
+            return hit[1]
+
+    session = _new_session()
+    session.get(f"{BASE}/registration", timeout=HTTP_TIMEOUT)
+    session.post(f"{BASE}/term/search?mode=search", data={"term": term}, timeout=HTTP_TIMEOUT)
+
+    matches = _get_instructor_matches(session, term, name)
+    # Fall back to the surname alone if a full "First Last" query found nothing.
+    if not matches and " " in name.strip():
+        matches = _get_instructor_matches(session, term, name.strip().split()[-1])
+
+    # Dedup by display name (one person can appear once per term-assignment).
+    descs = list(dict.fromkeys(m.get("description") for m in matches if m.get("description")))
+
+    if not descs:
+        result = {"instructor": None, "candidates": [], "sections": []}
+    elif len(descs) > 1:
+        result = {"instructor": None, "candidates": descs, "sections": []}
+    else:
+        code = matches[0]["code"]
+        resp = session.get(
+            f"{BASE}/searchResults/searchResults",
+            params={"txt_instructor": code, "txt_term": term, "pageOffset": 0,
+                    "pageMaxSize": 100, "sortColumn": "subjectDescription",
+                    "sortDirection": "asc"},
+            timeout=HTTP_TIMEOUT,
+        )
+        data = (resp.json() or {}).get("data") or []
+        # We already know the instructor (we searched by them); no per-CRN faculty call.
+        known = [{"name": descs[0], "email": None, "primary": True}]
+        sections = [_normalize_section(raw, known) for raw in data]
+        result = {"instructor": descs[0], "candidates": [descs[0]], "sections": sections}
+
+    with _lock:
+        _instructor_cache[key] = (time.monotonic(), result)
+    return result
+
+
+def _group_by_course(sections: list[dict]) -> list[dict]:
+    """Group flat sections into `[{code, sections}]` by subjectCourse, preserving
+    first-seen order (Banner already sorts by subject)."""
+    courses: dict[str, dict] = {}
+    for s in sections:
+        code = s.get("subject_course") or "?"
+        courses.setdefault(code, {"code": code, "sections": []})["sections"].append(s)
+    return list(courses.values())
+
+
+# ---------------------------------------------------------------------------
+# Top-level entries — gated calls from chatbot.py
 # ---------------------------------------------------------------------------
 
 def banner_retrieve(course_codes: list[str], season: str | None = None,
@@ -331,11 +419,42 @@ def banner_retrieve(course_codes: list[str], season: str | None = None,
                 courses.append({"code": code, "sections": sections})
         if not courses:
             return {}
-        return {"term": term, "term_label": term_label(term), "courses": courses}
+        return {"kind": "availability", "term": term, "term_label": term_label(term),
+                "courses": courses}
     except Exception as e:  # noqa: BLE001 — best-effort, never break the answer
         import sys
         print(f"  [banner_retrieve] failed, skipping live availability: {e}",
               file=sys.stderr)
+        return {}
+
+
+def banner_instructor_retrieve(name: str, season: str | None = None,
+                               year: int | None = None) -> dict:
+    """Reverse lookup: which courses/sections a professor teaches in the resolved term.
+
+    Best-effort (returns {} on failure, like `banner_retrieve`). Returns one of:
+
+        # resolved to one instructor
+        {"kind":"instructor", "term", "term_label", "instructor": "Quinton Yong",
+         "instructor_query": "Yong", "courses": [{"code","sections":[...]}]}
+        # ambiguous name — caller asks the user to pick
+        {"kind":"instructor", ..., "instructor": None, "candidates": ["A","B"]}
+        # no classes found for that name this term
+        {"kind":"instructor", ..., "instructor": None, "candidates": [], "courses": []}
+    """
+    try:
+        term = resolve_term(season, year)
+        if not term:
+            return {}
+        res = search_by_instructor(name, term)
+        out = {"kind": "instructor", "term": term, "term_label": term_label(term),
+               "instructor_query": name, "instructor": res["instructor"],
+               "candidates": res.get("candidates", []),
+               "courses": _group_by_course(res["sections"])}
+        return out
+    except Exception as e:  # noqa: BLE001 — best-effort, never break the answer
+        import sys
+        print(f"  [banner_instructor_retrieve] failed, skipping: {e}", file=sys.stderr)
         return {}
 
 
@@ -349,20 +468,54 @@ def _fmt_time(hhmm: str | None) -> str:
     return f"{hhmm[:2]}:{hhmm[2:]}"
 
 
+def _print_section(s: dict, show_course: bool = False) -> None:
+    sched = s.get("meeting")
+    when = ""
+    if sched:
+        days = "".join(sched["days"])
+        when = f"  {days} {_fmt_time(sched['begin'])}-{_fmt_time(sched['end'])}"
+        if sched.get("room") and sched["room"] != "None specified":
+            when += f"  {sched.get('building') or ''} {sched['room']}"
+    prof = ", ".join(i["name"] for i in s["instructors"]) or "TBA"
+    wl = f"  WL {s['wait_count']}/{s['wait_capacity']}" if s.get("wait_capacity") else ""
+    full = "" if s["open"] else "  [FULL]"
+    label = f"{s.get('subject_course', '')} " if show_course else ""
+    print(f"{label}{s['section']:<4} {s['schedule_type']:<8} "
+          f"seats {s['seats_available']}/{s['max_enrollment']} "
+          f"({s['enrollment']} enrolled){wl}{full}{when}  — {prof}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Banner live class availability — smoke test")
-    parser.add_argument("--course", required=True, help="normalized course code, e.g. CSC225")
+    parser.add_argument("--course", default=None, help="normalized course code, e.g. CSC225")
+    parser.add_argument("--instructor", default=None, help="professor name, e.g. 'Yong' (reverse lookup)")
     parser.add_argument("--term", default=None, help="explicit YYYYMM term (default: current/upcoming)")
     parser.add_argument("--season", default=None, choices=list(_SEASON_MM),
                         help="season hint if no explicit --term")
     parser.add_argument("--year", type=int, default=None, help="year hint if no explicit --term")
     args = parser.parse_args()
+    if not args.course and not args.instructor:
+        parser.error("pass --course or --instructor")
 
-    if args.term:
-        term = args.term
-    else:
-        term = resolve_term(args.season, args.year)
+    term = args.term or resolve_term(args.season, args.year)
     print(f"Resolved term: {term} ({term_label(term or '')})\n")
+
+    if args.instructor:
+        res = search_by_instructor(args.instructor, term)
+        if res["candidates"] and not res["instructor"]:
+            print(f"Multiple instructors match '{args.instructor}': "
+                  + "; ".join(res["candidates"]))
+            return
+        if not res["sections"]:
+            print(f"No classes found for an instructor matching '{args.instructor}'.")
+            return
+        print(f"{res['instructor']} teaches:")
+        for c in _group_by_course(res["sections"]):
+            print(f"  {c['code']}:")
+            for s in c["sections"]:
+                print("  ", end="")
+                _print_section(s)
+        return
 
     subject, num = split_course_code(args.course)
     sections = search_sections(subject, num, term)
@@ -370,20 +523,7 @@ def main() -> None:
         print("No sections found.")
         return
     for s in sections:
-        sched = s.get("meeting")
-        when = ""
-        if sched:
-            days = "".join(sched["days"])
-            when = f"  {days} {_fmt_time(sched['begin'])}-{_fmt_time(sched['end'])}"
-            if sched.get("room") and sched["room"] != "None specified":
-                when += f"  {sched.get('building') or ''} {sched['room']}"
-        prof = ", ".join(i["name"] for i in s["instructors"]) or "TBA"
-        wl = (f"  WL {s['wait_count']}/{s['wait_capacity']}"
-              if s.get("wait_capacity") else "")
-        full = "" if s["open"] else "  [FULL]"
-        print(f"{s['section']:<4} {s['schedule_type']:<8} "
-              f"seats {s['seats_available']}/{s['max_enrollment']} "
-              f"({s['enrollment']} enrolled){wl}{full}{when}  — {prof}")
+        _print_section(s)
 
 
 if __name__ == "__main__":
