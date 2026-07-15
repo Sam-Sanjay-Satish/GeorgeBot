@@ -540,8 +540,10 @@ class GeorgeBot:
 
     @staticmethod
     def _banner_section_line(s: dict) -> str:
-        """One section rendered as a single line: seats, waitlist, schedule, instructor,
-        delivery/campus. Shared by the availability and instructor render paths."""
+        """One section rendered as a single line: seats, waitlist, schedule (days/time),
+        instructor, and delivery mode. Shared by the availability and instructor render
+        paths. Location (building/room) and campus are intentionally omitted — UVic's
+        feed has no room, and campus reads misleadingly as one."""
         def _hhmm(t: str | None) -> str:
             return f"{t[:2]}:{t[2:]}" if t and len(t) == 4 else "?"
 
@@ -555,17 +557,14 @@ class GeorgeBot:
         m = s.get("meeting")
         if m and (m.get("days") or m.get("begin")):
             when = " ".join(m.get("days") or []) or "days TBA"
-            loc = ""
-            room = m.get("room")
-            if room and room != "None specified":
-                loc = f", {m.get('building') or ''} {room}".rstrip()
-            parts.append(f"Meets {when} {_hhmm(m.get('begin'))}-{_hhmm(m.get('end'))}{loc}.")
+            parts.append(f"Meets {when} {_hhmm(m.get('begin'))}-{_hhmm(m.get('end'))}.")
         profs = ", ".join(f"{p['name']}" + (f" ({p['email']})" if p.get("email") else "")
                           for p in s.get("instructors", []) if p.get("name"))
         parts.append(f"Instructor: {profs or 'TBA'}.")
-        extra = " ".join(x for x in [s.get("delivery"), s.get("campus")] if x)
-        if extra:
-            parts.append(extra + ".")
+        # Delivery mode only (online / in-person); campus is deliberately left out of
+        # the context (it's not a room and reads misleadingly as a location).
+        if s.get("delivery"):
+            parts.append(s["delivery"] + ".")
         return " ".join(parts)
 
     @classmethod
@@ -839,8 +838,9 @@ class GeorgeBot:
         "credits, and program requirements.\n"
         "- Material tagged source=banner is LIVE registration data for a specific "
         "term (named in the block) — current seat counts, waitlist space, section "
-        "meeting times/rooms, and instructors. Use it for 'is it full / how many "
-        "seats / when does it meet / who teaches it' questions. Always name the "
+        "meeting days/times, and instructors. Use it for 'is it full / how many "
+        "seats / when does it meet / who teaches it' questions. (Room numbers are not "
+        "available — don't state or guess one.) Always name the "
         "term, cite section codes (e.g. A01), and call out when a section is full "
         "or waitlist-only. These numbers change constantly, so present them as "
         "current-as-of-now, not a guarantee. (Contrast: source=kuali is the static "

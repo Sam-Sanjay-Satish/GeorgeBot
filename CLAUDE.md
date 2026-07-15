@@ -425,16 +425,18 @@ gate would never open. See `BANNER_API.md` for the endpoint research.
   teaches) fires on `instructor_query`. `get_instructor` resolves the name → a
   **session-scoped ephemeral instructor code** (NOT a stable id — it changes every
   session), so the resolve + `txt_instructor` search must run back-to-back on one
-  session; `banner.search_by_instructor` uses a **dedicated throwaway session per
-  lookup** to keep that fragile state off the shared session, caching only the result
+  session; `banner.search_by_instructor` uses its own **dedicated session** (as every
+  search here does) so that ephemeral state stays isolated, caching only the result
   (120s). A common surname returns multiple `get_instructor` matches → the block tells
   the model to ask the user to disambiguate (like the ambiguous-program flow). See the
   `get_instructor` gotcha in `BANNER_API.md`.
 - **Caching is in-process + ephemeral (NOT the Volume)** — freshness is the point.
-  Module-level `requests.Session` (3-step handshake, reused, `threading.Lock`-
-  guarded since the SSE generator runs in a threadpool), 120s TTL on section
-  payloads (seat counts must stay honest), hours-long TTL on the term list and
-  per-section instructor. See `BANNER_API.md` "Caching".
+  Each search uses its **own dedicated `requests.Session`** (`_handshake_session`),
+  NOT a shared one: Banner's `searchResults` replays the session's *previous* search
+  unless the form is reset, so a shared session leaks one course's sections into the
+  next query and races under concurrency. The `_lock` only guards the TTL cache dicts.
+  120s TTL on section payloads (seat counts must stay honest), hours-long TTL on the
+  term list and per-section instructor. See `BANNER_API.md` "Request flow"/"Caching".
 - `_banner_context_text()` (in `chatbot.py`) renders this into numbered `[n]`
   blocks tagged `source=banner`, inserted **graph → banner → vector** so all three
   share one continuous `[n]` sequence. `_assemble_context()` owns that ordering

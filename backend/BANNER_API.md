@@ -54,9 +54,15 @@ session before searching. Three steps:
 3. `GET  /ssb/searchResults/searchResults?txt_subject=CSC&txt_courseNumber=225&txt_term=202609&pageOffset=0&pageMaxSize=10`
    → the actual data (JSON).
 
-Hold ONE `requests.Session` (cookie jar) and reuse it across questions.
-Re-handshake only when it expires (401 / empty results after previously
-working). Optionally keep one session per term.
+**Use a dedicated `requests.Session` per search, NOT a shared one.** `searchResults`
+returns the session's *previous* search results unless the search form is reset, so
+reusing one session across different courses leaks course A's sections into course B's
+query (verified: querying MATH after CSC returned CSC's CRNs). A shared session also
+races under concurrency (the form state is per-session, server-side). A fresh
+handshake per search (steps 1-2 above are two quick calls) sidesteps both; the result
+cache, not the session, is what keeps it cheap. (Resetting via
+`POST /classSearch/resetDataForm` + re-selecting the term before each search also
+works, but doesn't fix the concurrency race on a shared session.)
 
 ### Base + example (copy-paste smoke test)
 
@@ -234,9 +240,9 @@ static artifacts; cache does NOT belong there.
 
 Use **in-process memory, TTL-keyed:**
 
-1. **Session** (`JSESSIONID` + bound term): module-level `requests.Session`,
-   reused across questions. Re-handshake only on expiry. This is the expensive
-   part (the 3-request handshake) — cache it hardest.
+1. **Do NOT cache/share the session** — see the boldfaced warning under "Request
+   flow". Each search handshakes its own throwaway session (cheap: 2 calls). What you
+   cache instead is the *result* (below), which is what actually shields Banner.
 2. **`searchResults` payloads**, keyed by `(term, subject, courseNumber)`,
    **short TTL 60–300s**. Long enough to absorb a follow-up burst and shield
    Banner from repeat hits; short enough that seat counts stay honest.

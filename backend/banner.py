@@ -59,13 +59,12 @@ _SEASON_MM = {"spring": "01", "summer": "05", "fall": "09"}
 _MM_SEASON = {"01": "Spring", "05": "Summer", "09": "Fall"}
 
 # ---------------------------------------------------------------------------
-# Module-level state: one shared session + TTL caches, guarded by a lock.
-# The FastAPI SSE generator is a sync def run in a threadpool, so concurrent
-# requests can hit this module at once; `requests.Session` isn't thread-safe.
+# Module-level state: TTL caches guarded by a lock. Sessions are NOT shared —
+# each search uses its own dedicated session (see `_handshake_session`), so the
+# lock only guards the cache dicts. The FastAPI SSE generator is a sync def run
+# in a threadpool, so concurrent requests can hit these caches at once.
 # ---------------------------------------------------------------------------
 _lock = threading.Lock()
-_session: requests.Session | None = None
-_session_term: str | None = None                       # term currently bound to _session
 _sections_cache: dict[tuple, tuple[float, list]] = {}  # (term,subject,number) -> (t, sections)
 _faculty_cache: dict[tuple, tuple[float, list]] = {}   # (term, crn) -> (t, faculty)
 _instructor_cache: dict[tuple, tuple[float, dict]] = {}  # (term, name) -> (t, result)
@@ -101,21 +100,20 @@ def _new_session() -> requests.Session:
     return s
 
 
-def _ensure_session(term: str) -> requests.Session:
-    """Return a session with `term` bound into it, (re)handshaking if needed.
+def _handshake_session(term: str) -> requests.Session:
+    """A fresh session with `term` bound into it (JSESSIONID + term selected — both
+    required before `searchResults` returns anything; see BANNER_API.md).
 
-    Banner requires a JSESSIONID cookie AND a term selected into the session before
-    `searchResults` returns anything (per BANNER_API.md). We keep one session and only
-    re-handshake when it's missing or bound to a different term. Caller holds `_lock`.
-    """
-    global _session, _session_term
-    if _session is not None and _session_term == term:
-        return _session
+    Deliberately a NEW session per call rather than a shared module-level one. Banner's
+    `searchResults` returns the *session's previous* search unless the search form is
+    reset, so a shared session leaks one course's results into the next query (and
+    concurrent requests would race on that per-session form state). A dedicated session
+    per search gives each its own isolated form state — no stale bleed, no lock held
+    across the network. Cheap: two quick calls, and results are cached (see callers)."""
     s = _new_session()
     s.get(f"{BASE}/registration", timeout=HTTP_TIMEOUT)                       # sets JSESSIONID
     s.post(f"{BASE}/term/search?mode=search", data={"term": term},           # binds the term
            timeout=HTTP_TIMEOUT)
-    _session, _session_term = s, term
     return s
 
 
@@ -218,7 +216,11 @@ def _fetch_faculty(session: requests.Session, term: str, crn: str) -> list[dict]
 
 
 def _meeting_from_section(raw: dict) -> dict | None:
-    """Pull the inline schedule (no extra call) from `meetingsFaculty[].meetingTime`."""
+    """Pull the inline schedule (no extra call) from `meetingsFaculty[].meetingTime`.
+
+    Only days/times are kept: UVic's feed never populates `room` (always "None
+    specified") and its `building` is an unlabeled numeric code, so neither is surfaced.
+    """
     mf = raw.get("meetingsFaculty") or []
     if not mf:
         return None
@@ -230,8 +232,6 @@ def _meeting_from_section(raw: dict) -> dict | None:
         "days": days,                       # e.g. ["Mo", "We", "Th"]
         "begin": mt.get("beginTime"),       # "1430" (24h HHMM)
         "end": mt.get("endTime"),           # "1520"
-        "building": mt.get("buildingDescription") or mt.get("building"),
-        "room": mt.get("room"),
         "start_date": mt.get("startDate"),
         "end_date": mt.get("endDate"),
     }
@@ -247,8 +247,7 @@ def search_sections(subject: str, number: str, term: str) -> list[dict]:
         if hit and (time.monotonic() - hit[0] < SECTIONS_TTL):
             return hit[1]
 
-    with _lock:
-        session = _ensure_session(term)
+    session = _handshake_session(term)   # dedicated session — no cross-course bleed
     resp = session.get(
         f"{BASE}/searchResults/searchResults",
         params={"txt_subject": subject, "txt_courseNumber": number, "txt_term": term,
@@ -330,21 +329,17 @@ def search_by_instructor(name: str, term: str) -> dict:
         (caller asks the user to disambiguate).
       - none matched -> all empty.
 
-    Uses a DEDICATED short-lived session for the whole handshake -> get_instructor ->
-    txt_instructor search sequence. The instructor `code` is session-ephemeral, so the
-    three calls must share one session; using a throwaway session (rather than the
-    module-shared one) keeps that fragile state off the shared session and out of the
-    lock — instructor lookups are rare and the RESULT is cached, so the extra handshake
-    is cheap. Cached 120s by (term, name)."""
+    Uses a DEDICATED session (like every search here) for the whole get_instructor ->
+    txt_instructor sequence. The instructor `code` is session-ephemeral, so the two
+    calls must share one session; a throwaway session keeps that fragile state isolated.
+    Cached 120s by (term, name)."""
     key = (term, name.strip().lower())
     with _lock:
         hit = _instructor_cache.get(key)
         if hit and (time.monotonic() - hit[0] < SECTIONS_TTL):
             return hit[1]
 
-    session = _new_session()
-    session.get(f"{BASE}/registration", timeout=HTTP_TIMEOUT)
-    session.post(f"{BASE}/term/search?mode=search", data={"term": term}, timeout=HTTP_TIMEOUT)
+    session = _handshake_session(term)
 
     matches = _get_instructor_matches(session, term, name)
     # Fall back to the surname alone if a full "First Last" query found nothing.
@@ -474,8 +469,6 @@ def _print_section(s: dict, show_course: bool = False) -> None:
     if sched:
         days = "".join(sched["days"])
         when = f"  {days} {_fmt_time(sched['begin'])}-{_fmt_time(sched['end'])}"
-        if sched.get("room") and sched["room"] != "None specified":
-            when += f"  {sched.get('building') or ''} {sched['room']}"
     prof = ", ".join(i["name"] for i in s["instructors"]) or "TBA"
     wl = f"  WL {s['wait_count']}/{s['wait_capacity']}" if s.get("wait_capacity") else ""
     full = "" if s["open"] else "  [FULL]"
