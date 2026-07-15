@@ -111,22 +111,34 @@ interface StreamHandlers {
   onToken: (text: string) => void
   onDone: () => void
   onError: (message: string) => void
+  // Extended-thinking only: the orchestrator needs more info (e.g. program/term
+  // for course planning, or which situation type) and asks a question instead
+  // of answering. Terminal for this turn — the user's reply comes back as an
+  // ordinary next question carrying prior history.
+  onClarify?: (text: string) => void
 }
 
 // POST + manually parsed SSE — EventSource doesn't support POST bodies, so we
 // read the fetch response stream directly and split on the "event:\ndata:\n\n"
 // frame format the backend (/api/chat/stream) emits. Events: status (pre-answer
-// phase text), sources, token, done, error.
+// phase text), sources, token, done, error, and — in extended-thinking mode —
+// clarify.
 export async function askGeorgeStream(
   question: string,
   priorMessages: Message[],
   audience: Audience,
   handlers: StreamHandlers,
+  extendedThinking = false,
 ): Promise<void> {
   const res = await fetch(`${API_BASE}/api/chat/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, history: toHistory(priorMessages), audience }),
+    body: JSON.stringify({
+      question,
+      history: toHistory(priorMessages),
+      audience,
+      extended_thinking: extendedThinking,
+    }),
   })
   if (!res.ok || !res.body) {
     handlers.onError(`API error ${res.status}`)
@@ -161,6 +173,8 @@ export async function askGeorgeStream(
           handlers.onSources((data as ApiSource[]).map(mapSource))
         } else if (event === 'token') {
           handlers.onToken(data as string)
+        } else if (event === 'clarify') {
+          handlers.onClarify?.(data as string)
         } else if (event === 'done') {
           handlers.onDone()
         } else if (event === 'error') {

@@ -955,10 +955,16 @@ class GeorgeBot:
         "- Be concise and direct. Use plain text (no LaTeX)."
     )
 
-    def _system_prompt_with_context(self, context: str) -> str:
+    def _system_prompt_with_context(self, context: str, base_prompt: str | None = None) -> str:
         """Build the system message: instructions + the retrieved reference
         material, framed as system-supplied (NOT part of the user turn) so the
-        model doesn't treat it as something the user typed or attached."""
+        model doesn't treat it as something the user typed or attached.
+
+        `base_prompt` overrides the default `SYSTEM_PROMPT` — used by the
+        extended-thinking modes (thinking.py) to supply a mode-specific
+        behavioral contract (e.g. the situational tone/no-case-assessment
+        rules) while reusing the same reference-material framing below."""
+        base = base_prompt if base_prompt is not None else self.SYSTEM_PROMPT
         context = (context or "").strip()
         if context:
             ref = (
@@ -977,7 +983,7 @@ class GeorgeBot:
                 "knowledge as a knowledgeable UVic assistant.\n"
                 "=== END SYSTEM-SUPPLIED REFERENCE MATERIAL ==="
             )
-        return self.SYSTEM_PROMPT + ref
+        return base + ref
 
     def _answer_messages(self, question: str, history: list[dict]) -> list[dict]:
         """Conversation turns + the user's question only — the reference
@@ -991,15 +997,21 @@ class GeorgeBot:
         messages.append({"role": "user", "content": question})
         return messages
 
-    def answer(self, question: str, context: str, history: list[dict]) -> str:
+    def answer(self, question: str, context: str, history: list[dict],
+               system_prompt: str | None = None) -> str:
         """MiniMax-M3, thinking disabled — reference material is supplied via the
-        system prompt (`_system_prompt_with_context`), not the user turn."""
+        system prompt (`_system_prompt_with_context`), not the user turn.
+
+        `system_prompt` overrides the default behavioral contract (used by the
+        extended-thinking modes for a mode-specific answer prompt)."""
         messages = self._answer_messages(question, history)
-        text = self._call_llm(messages, system=self._system_prompt_with_context(context),
+        text = self._call_llm(messages,
+                               system=self._system_prompt_with_context(context, system_prompt),
                                max_tokens=ANSWER_MAX_TOKENS, thinking="disabled")
         return text or "Sorry, I couldn't generate an answer right now — please try again."
 
-    def answer_stream(self, question: str, context: str, history: list[dict]):
+    def answer_stream(self, question: str, context: str, history: list[dict],
+                      system_prompt: str | None = None):
         """Streamed MiniMax-M3 answer, thinking disabled — yielded token-by-token.
 
         The reference material rides in the system prompt (not the user turn),
@@ -1013,7 +1025,8 @@ class GeorgeBot:
         """
         messages = self._answer_messages(question, history)
         full_messages = (
-            [{"role": "system", "content": self._system_prompt_with_context(context)}] + messages
+            [{"role": "system",
+              "content": self._system_prompt_with_context(context, system_prompt)}] + messages
         )
         stream = self.llm.chat.completions.create(
             model=MINIMAX_MODEL,

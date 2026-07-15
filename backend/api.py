@@ -31,6 +31,7 @@ from pydantic import BaseModel
 
 from banner import banner_instructor_retrieve, banner_retrieve
 from chatbot import DEFAULT_AUDIENCE, VALID_AUDIENCES, GeorgeBot
+from thinking import ExtendedThinking
 
 
 class ChatRequest(BaseModel):
@@ -40,6 +41,10 @@ class ChatRequest(BaseModel):
     # the user via the frontend toggle; anything unrecognized falls back to the
     # default rather than erroring.
     audience: str = DEFAULT_AUDIENCE
+    # Extended-thinking toggle (frontend). When true, the streaming endpoint
+    # routes into the multi-mode orchestrator (thinking.ExtendedThinking) instead
+    # of the single-shot retrieve->answer path. Only the SSE endpoint honors it.
+    extended_thinking: bool = False
 
 
 def _clean_audience(value: str | None) -> str:
@@ -82,6 +87,7 @@ def _route_status(route: dict) -> str:
 
 def create_app(bot: GeorgeBot) -> FastAPI:
     app = FastAPI(title="GeorgeBot")
+    thinker = ExtendedThinking(bot)
 
     # CORS allow-list. Prod origins come from CORS_ALLOW_ORIGINS (comma-
     # separated, e.g. "https://georgebot.ca,https://www.georgebot.ca"); local
@@ -125,6 +131,28 @@ def create_app(bot: GeorgeBot) -> FastAPI:
             return {"error": "missing 'question'"}
 
         audience = _clean_audience(req.audience)
+
+        # Extended-thinking path: the orchestrator classifies the query into one
+        # of three modes and yields event dicts we map straight to SSE frames
+        # (including a `clarify` event that terminates the turn without an answer
+        # when it needs more info from the user). See thinking.ExtendedThinking.
+        if req.extended_thinking:
+            def generate_thinking():
+                try:
+                    for ev in thinker.run(question, req.history, audience):
+                        etype = ev.get("type")
+                        data = ev.get("data", {})
+                        yield f"event: {etype}\ndata: {json.dumps(data)}\n\n"
+                    # thinker.run always ends with a done/clarify/error event; a
+                    # trailing done is harmless if the client already saw clarify.
+                except Exception as e:
+                    yield f"event: error\ndata: {json.dumps(str(e))}\n\n"
+
+            return StreamingResponse(
+                generate_thinking(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
 
         def generate():
             try:

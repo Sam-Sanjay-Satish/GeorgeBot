@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { MessageBubble } from './components/MessageBubble'
 import { ChatInput } from './components/ChatInput'
 import { AudienceToggle } from './components/AudienceToggle'
+import { ExtendedThinkingToggle } from './components/ExtendedThinkingToggle'
 import { ThemeToggle } from './components/ThemeToggle'
 import { LoginPage } from './components/LoginPage'
 import { AccountMenu } from './components/AccountMenu'
@@ -22,6 +23,7 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)
   const [audience, setAudience] = useState<Audience>('undergrad')
+  const [extendedThinking, setExtendedThinking] = useState(false)
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = localStorage.getItem('theme')
     if (saved === 'light' || saved === 'dark') return saved
@@ -156,6 +158,18 @@ export default function App() {
           pending += token
           startFlushing()
         },
+        onClarify: (text) => {
+          // Extended-thinking asked the user a question instead of answering.
+          // Clear the status line and reveal the clarify text through the same
+          // typewriter path as a normal answer, then finish (no sources, no
+          // further tokens — the stream ends after clarify).
+          setMessages((prev) =>
+            prev.map((m) => (m.id === loadingId ? { ...m, status: undefined } : m))
+          )
+          pending += text
+          streamEnded = true
+          startFlushing()
+        },
         onDone: () => {
           streamEnded = true
           if (pending.length === 0) finish()
@@ -183,7 +197,7 @@ export default function App() {
             setLoading(false)
           }
         },
-      })
+      }, extendedThinking)
     } catch (err) {
       setMessages((prev) =>
         prev.map((m) =>
@@ -246,8 +260,13 @@ export default function App() {
       {/* Input */}
       <div className="border-t border-border px-4 py-4 shrink-0">
         <div className="max-w-2xl mx-auto">
-          <div className="mb-4 flex justify-center">
+          <div className="mb-4 flex flex-wrap items-center justify-center gap-2">
             <AudienceToggle value={audience} onChange={setAudience} disabled={loading} />
+            <ExtendedThinkingToggle
+              value={extendedThinking}
+              onChange={setExtendedThinking}
+              disabled={loading}
+            />
           </div>
           <ChatInput onSend={handleSend} disabled={loading} />
           <p className="text-xs text-center text-muted-foreground mt-2">
