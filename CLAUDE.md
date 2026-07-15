@@ -29,6 +29,7 @@ user question + chat history + audience (undergrad | faculty | both)
    ├─ rewrite_and_route(…, audience)  → MiniMax-M3 (official API, thinking DISABLED)
    │                          (ONE call: standalone search query +
    │                          course_codes[] + program_query + wants_outline
+   │                          + wants_availability + term_season/term_year
    │                          + topic_families[] + department; the topic_family
    │                          vocabulary offered depends on audience)
    │
@@ -36,6 +37,12 @@ user question + chat history + audience (undergrad | faculty | both)
    │     └─ GraphStore (course_graph.pkl + program_graph.pkl + HEAT outlines)
    │        → prereqs, credits, cross-listings, descriptions, program
    │          requirements, outline text. No vector search. Audience-independent.
+   │
+   ├─ banner_retrieve()  (only if course_codes AND wants_availability — LIVE data)
+   │     └─ banner.py — UVic Banner 9 registration JSON (banner.uvic.ca), NOT the
+   │        static index: live seats/waitlist, per-section schedule/room, instructor,
+   │        delivery/campus, for the resolved term. In-process TTL cache. Best-effort
+   │        (returns {} on any failure). Audience-independent. See BANNER_API.md.
    │
    ├─ vector_retrieve(query, audience)
    │     └─ Voyage query embedding (ONE) → queried against the selected
@@ -45,7 +52,7 @@ user question + chat history + audience (undergrad | faculty | both)
    │          up to N_CONTEXT=4 distinct chunks (full text)
    │
    └─ answer()  → MiniMax-M3 (official API, thinking DISABLED)
-                  → answer from graph facts + vector chunks (supplied via the
+                  → answer from graph + banner + vector blocks (supplied via the
                     SYSTEM prompt, numbered together) + format_sources()
 ```
 
@@ -143,6 +150,7 @@ reading this first:
 ├── CLAUDE.md
 └── backend/
 │   ├── chatbot.py             # GeorgeBot engine — routing + retrieval + LLM pipeline (tune here)
+│   ├── banner.py              # live class availability (UVic Banner 9 JSON): session + TTL cache + term resolution (BANNER_API.md)
 │   ├── graph_queries.py       # GraphStore — copy of georgebot-pipeline's course-graph/graph_queries.py
 │   ├── api.py                 # FastAPI server (thin wrapper over GeorgeBot); Railway PORT/HOST-aware
 │   ├── Dockerfile             # backend container build (Railway); multi-stage python:3.14-slim, CMD python api.py
@@ -343,18 +351,24 @@ curl -s -X POST http://127.0.0.1:5001/api/chat -H 'Content-Type: application/jso
 ### 1. Query rewrite + route — `MiniMax-M3` (thinking disabled)
 `rewrite_and_route(question, history, audience)` is **one** call that returns
 JSON: `search_query`, `course_codes` (normalized, no space — `"CSC 225"` →
-`"CSC225"`), `program_query`, `wants_outline`, `completed_courses`,
-`topic_families` (0-3, copied verbatim from the taxonomy), `department`
-(copied verbatim, or null). `course_codes`/`program_query` are only meant
-to be populated for **structured catalog facts** (prereqs, credits,
-cross-listings, descriptions, program requirements, outline content) — a
-course code mentioned in passing should leave both empty. The `topic_families`
+`"CSC225"`), `program_query`, `wants_outline`, `wants_availability`,
+`term_season` (`spring|summer|fall|null`), `term_year` (int|null),
+`completed_courses`, `topic_families` (0-3, copied verbatim from the taxonomy),
+`department` (copied verbatim, or null). `course_codes` is populated for
+**structured catalog facts** (prereqs, credits, cross-listings, descriptions,
+program requirements, outline content) **OR live availability** (when
+`wants_availability` — seats/sections/schedule/instructor); `program_query` is
+program-requirements only. A course mentioned merely in passing leaves both
+empty. `term_season`/`term_year` carry a user-named term to `banner_retrieve`
+(today's date is injected so relative phrases like "next spring" resolve). The
+`topic_families`
 list shown in the prompt is **audience-dependent** (undergrad list, faculty
 list, or the union for `both`); `department` is one shared list. Both must
 match `vector_taxonomy.json` exactly (passed into the prompt in full) —
 anything not in the valid set for that audience is dropped on parse. On any
 failure (bad JSON, API error), falls back to vector-only with everything
-else empty/null/False. Note: MiniMax-M3 is **not fully deterministic even
+else empty/null/False (including `wants_availability=False`, so a router failure
+also disables the Banner path). Note: MiniMax-M3 is **not fully deterministic even
 at temperature 0** — the exact rewritten `search_query` text varies run to
 run, which can shift retrieval results slightly between identical-looking
 requests.
@@ -382,6 +396,35 @@ Only runs when `course_codes` or `program_query` is non-empty.
   already called here) — wiring either in would duplicate facts already shown.
 - `_graph_context_text()` renders this into numbered `[n]` blocks tagged
   `source=kuali`, same numbering scheme as vector chunks.
+
+### 2b. Live availability — `banner.py` (UVic Banner 9, no LLM, no vector search)
+Gated live-data step, parallel to graph retrieval. Fires **only when
+`course_codes` is non-empty AND the router set `wants_availability`** (asked
+about seats/openings/waitlist/"is X full"/section times/where-it-meets/who-
+teaches-it). This is why the router prompt populates `course_codes` for
+availability questions too — not just catalog facts — or the gate would never
+open. See `BANNER_API.md` for the endpoint research.
+- **Source of truth vs. the static index.** Chroma/graph are a static snapshot
+  from a Railway Volume; Banner is *current, per-section, real-time* enrollment
+  from `banner.uvic.ca` registration self-service (no auth for class search).
+  Banner owns **only** live seats/waitlist, section schedule/room, instructor,
+  delivery/campus — prereqs/credits/program requirements stay with the graph.
+- **`banner_retrieve(course_codes, season, year)`** resolves the term (default:
+  nearest current/upcoming non-"View Only" term; router-named term via
+  `term_season`/`term_year` wins — today's date is injected into the router
+  prompt so "next spring" resolves), then per course: `searchResults` (all
+  sections) + one `getFacultyMeetingTimes` per CRN (instructor; `searchResults`
+  returns `faculty: []`). Best-effort — returns `{}` on any failure so the answer
+  never breaks.
+- **Caching is in-process + ephemeral (NOT the Volume)** — freshness is the point.
+  Module-level `requests.Session` (3-step handshake, reused, `threading.Lock`-
+  guarded since the SSE generator runs in a threadpool), 120s TTL on section
+  payloads (seat counts must stay honest), hours-long TTL on the term list and
+  per-section instructor. See `BANNER_API.md` "Caching".
+- `_banner_context_text()` (in `chatbot.py`) renders this into numbered `[n]`
+  blocks tagged `source=banner`, inserted **graph → banner → vector** so all three
+  share one continuous `[n]` sequence. `_assemble_context()` owns that ordering
+  (used by both `ask()` and api.py's stream path).
 
 ### 3. Vector retrieval — Voyage + Chroma (reverse-HyDE), with distance cutoff
 - **Model:** `voyage-4-large`. Queries embed with `input_type="query"`; the
@@ -497,6 +540,11 @@ after new corpus content lands.
   instructors/schedules as current.
 - `source=kuali` chunks are the authoritative, current catalog — trust
   them over web pages for prereqs/credits/program requirements.
+- `source=banner` blocks are **live** registration data for the term named in
+  the block (seats, waitlist, section times/rooms, instructor) — use them for
+  "is it full / seats left / when does it meet / who teaches it". Always name the
+  term, cite section codes (A01), flag full/waitlist-only sections, and present
+  counts as current-as-of-now (they change constantly), not a guarantee.
 - If a program search returned multiple candidates, ask the user to
   clarify rather than guessing.
 - Concise, plain text (no LaTeX).
@@ -606,8 +654,9 @@ Every Chroma entry (one per question) carries, in `metadata`:
 uses the right one per audience.
 
 `format_sources()` returns `source` values `webpage | document | kuali |
-heat` (plus occasional `calendar`). UI badge enum: `webpage → uvic_html`,
-`document → uvic_docs`, `heat → heat`, `kuali → kuali`.
+heat | banner` (plus occasional `calendar`). UI badge enum: `webpage → uvic_html`,
+`document → uvic_docs`, `heat → heat`, `kuali → kuali`, `banner → banner`
+(rendered as a rose "Live" badge in `SourceBadge.tsx`).
 
 ---
 

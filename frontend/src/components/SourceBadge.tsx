@@ -6,6 +6,7 @@ const SOURCE_LABELS: Record<Source['source'], string> = {
   heat: 'HEAT',
   kuali: 'Catalog',
   uvic_docs: 'Document',
+  banner: 'Live',
 }
 
 const SOURCE_COLORS: Record<Source['source'], string> = {
@@ -13,6 +14,7 @@ const SOURCE_COLORS: Record<Source['source'], string> = {
   heat: 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200',
   kuali: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
   uvic_docs: 'bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200',
+  banner: 'bg-rose-100 text-rose-800 dark:bg-rose-900 dark:text-rose-200',
 }
 
 interface Props {

@@ -7,6 +7,7 @@ openai           # MiniMax-M3 (official API, OpenAI-compatible) — route/rewrit
 voyageai         # voyage-4-large query embeddings
 chromadb         # local vector DB (read-only at serve time)
 networkx         # course/program graph (graph_queries.GraphStore)
+requests         # UVic Banner live class-availability calls (banner.py)
 fastapi          # HTTP API
 uvicorn          # ASGI server
 python-dotenv    # loads .env (MINIMAX_SUB_KEY, VOYAGE_API_KEY)

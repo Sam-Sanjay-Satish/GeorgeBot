@@ -29,6 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from banner import banner_retrieve
 from chatbot import DEFAULT_AUDIENCE, VALID_AUDIENCES, GeorgeBot
 
 
@@ -59,6 +60,10 @@ def _route_status(route: dict) -> str:
     Templated from known state (no LLM call, no latency). Falls back to a
     plain "Searching…" when nothing more specific is known."""
     codes = route.get("course_codes") or []
+    if codes and route.get("wants_availability"):
+        if len(codes) == 1:
+            return f"Looking up current {_course_label(codes[0])} availability…"
+        return "Looking up current class availability…"
     if codes:
         if len(codes) == 1:
             return f"Looking up {_course_label(codes[0])}…"
@@ -129,24 +134,28 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                         route["course_codes"], route["program_query"],
                         route["wants_outline"], route["completed_courses"],
                     )
+                # Gated live-data step — same firing condition as chatbot.retrieve().
+                banner_facts = {}
+                if route["course_codes"] and route["wants_availability"]:
+                    banner_facts = banner_retrieve(
+                        route["course_codes"], route["term_season"], route["term_year"],
+                    )
                 chunks = bot.vector_retrieve(
                     route["search_query"], audience=audience,
                     topic_families=route["topic_families"],
                     department=route["department"],
                 )
 
-                graph_text = bot._graph_context_text(graph_facts) if graph_facts else ""
-                n_graph_blocks = len(graph_facts.get("courses", [])) + (1 if graph_facts.get("program") else 0)
-                context = bot._build_context(chunks, graph_text, n_graph_blocks)
+                context, n_prefix_blocks = bot._assemble_context(chunks, graph_facts, banner_facts)
 
                 # Second status covers the answer-generation wait (the biggest
                 # gap). If nothing was retrieved, "Reading sources…" would be
                 # misleading, so fall back to a neutral "Thinking…".
-                has_context = bool(chunks) or n_graph_blocks > 0
+                has_context = bool(chunks) or n_prefix_blocks > 0
                 yield f"event: status\ndata: {json.dumps('Reading through sources…' if has_context else 'Thinking…')}\n\n"
 
                 # Emit sources first so the UI can render them immediately.
-                sources = bot.format_sources(chunks, graph_facts)
+                sources = bot.format_sources(chunks, graph_facts, banner_facts)
                 yield f"event: sources\ndata: {json.dumps(sources)}\n\n"
                 for text in bot.answer_stream(question, context, req.history):
                     yield f"event: token\ndata: {json.dumps(text)}\n\n"

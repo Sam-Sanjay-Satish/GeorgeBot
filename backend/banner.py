@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""
+Banner — live UVic class availability (seats / waitlist / schedule / instructor).
+
+A self-contained live-data source for GeorgeBot, structured like `graph_queries.py`:
+pure data-fetching + caching, NO rendering (the caller — `chatbot.py` — renders the
+fact blocks, keeping the numbered-`[n]` scheme consistent across graph/banner/vector).
+
+Unlike the Chroma / graph artifacts (a static snapshot served from a Railway Volume),
+Banner is *current, per-section, real-time* enrollment straight from UVic's Ellucian
+Banner 9 registration self-service at `banner.uvic.ca`. Read-only class search needs
+no auth — just a `JSESSIONID` cookie with a term bound into the session (3-step
+handshake below). See `BANNER_API.md` for the full endpoint/field research.
+
+This module owns ONLY what the static index can't give:
+  - live seats / waitlist counts        (the headline)
+  - per-section schedule (days/time/room)
+  - instructor (name + email) for the term
+  - delivery mode & campus per section
+Prereqs / credits / program requirements stay owned by the graph path.
+
+Caching is deliberately **in-process and ephemeral** (module-level dicts, TTL-keyed) —
+freshness is the whole point, so a survives-restart cache (Railway Volume) would be
+exactly wrong. Seat counts get a short 120s TTL; the term list and per-section
+instructor get an hours-long TTL (they barely move).
+
+CLI smoke test (no LLM):
+  python3 backend/banner.py --course CSC225
+  python3 backend/banner.py --course CSC225 --term 202609
+"""
+
+from __future__ import annotations
+
+import argparse
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
+
+BASE = "https://banner.uvic.ca/StudentRegistrationSsb/ssb"
+# Undocumented internal endpoints — present as a real browser, don't look like a bare
+# script (per BANNER_API.md "Cautions").
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+HTTP_TIMEOUT = 15  # seconds per request
+
+SECTIONS_TTL = 120       # seat counts move minute-to-minute during registration
+FACULTY_TTL = 6 * 3600   # instructor for a section barely changes
+TERMS_TTL = 6 * 3600     # valid-term list barely changes
+
+# Season -> the MM half of a YYYYMM Banner term code.
+#   01 = Second Term  (Jan-Apr, "Spring")
+#   05 = Summer Session (May-Aug)
+#   09 = First Term   (Sep-Dec, "Fall")
+_SEASON_MM = {"spring": "01", "summer": "05", "fall": "09"}
+_MM_SEASON = {"01": "Spring", "05": "Summer", "09": "Fall"}
+
+# ---------------------------------------------------------------------------
+# Module-level state: one shared session + TTL caches, guarded by a lock.
+# The FastAPI SSE generator is a sync def run in a threadpool, so concurrent
+# requests can hit this module at once; `requests.Session` isn't thread-safe.
+# ---------------------------------------------------------------------------
+_lock = threading.Lock()
+_session: requests.Session | None = None
+_session_term: str | None = None                       # term currently bound to _session
+_sections_cache: dict[tuple, tuple[float, list]] = {}  # (term,subject,number) -> (t, sections)
+_faculty_cache: dict[tuple, tuple[float, list]] = {}   # (term, crn) -> (t, faculty)
+_terms_cache: tuple[float, list] | None = None         # (t, [{code, description}])
+
+
+def split_course_code(code: str) -> tuple[str, str]:
+    """"CSC225" -> ("CSC", "225"). Splits at the first digit. Also the basis for
+    the display form used in api.py's `_course_label`."""
+    code = (code or "").replace(" ", "").upper()
+    for i, ch in enumerate(code):
+        if ch.isdigit():
+            return code[:i], code[i:]
+    return code, ""
+
+
+def term_label(code: str) -> str:
+    """"202609" -> "Fall 2026". Falls back to the raw code if unparseable."""
+    if code and len(code) == 6 and code.isdigit():
+        season = _MM_SEASON.get(code[4:])
+        if season:
+            return f"{season} {code[:4]}"
+    return code
+
+
+# ---------------------------------------------------------------------------
+# Session handshake + low-level fetch
+# ---------------------------------------------------------------------------
+
+def _new_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": USER_AGENT})
+    return s
+
+
+def _ensure_session(term: str) -> requests.Session:
+    """Return a session with `term` bound into it, (re)handshaking if needed.
+
+    Banner requires a JSESSIONID cookie AND a term selected into the session before
+    `searchResults` returns anything (per BANNER_API.md). We keep one session and only
+    re-handshake when it's missing or bound to a different term. Caller holds `_lock`.
+    """
+    global _session, _session_term
+    if _session is not None and _session_term == term:
+        return _session
+    s = _new_session()
+    s.get(f"{BASE}/registration", timeout=HTTP_TIMEOUT)                       # sets JSESSIONID
+    s.post(f"{BASE}/term/search?mode=search", data={"term": term},           # binds the term
+           timeout=HTTP_TIMEOUT)
+    _session, _session_term = s, term
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Term list + resolution
+# ---------------------------------------------------------------------------
+
+def get_terms() -> list[dict]:
+    """`[{code, description}]` newest-first. Past terms are marked "(View Only)" in
+    the description. No session needed. Cached for hours."""
+    global _terms_cache
+    with _lock:
+        if _terms_cache and (time.monotonic() - _terms_cache[0] < TERMS_TTL):
+            return _terms_cache[1]
+        s = _new_session()
+        resp = s.get(f"{BASE}/classSearch/getTerms",
+                     params={"searchTerm": "", "offset": 1, "max": 20},
+                     timeout=HTTP_TIMEOUT)
+        terms = resp.json() or []
+        _terms_cache = (time.monotonic(), terms)
+        return terms
+
+
+def _is_registerable(t: dict) -> bool:
+    return "(View Only)" not in (t.get("description") or "")
+
+
+def resolve_term(season: str | None = None, year: int | None = None) -> str | None:
+    """Resolve a Banner term code from an optional season/year hint.
+
+    - No hint          -> the current/upcoming registerable term (the smallest,
+                          i.e. earliest still-open, non-"View Only" code). UVic marks
+                          past terms "View Only", so the non-View-Only set is exactly
+                          {current + upcoming}.
+    - season (+ year)  -> build YYYYMM from the hint and confirm it exists in the term
+                          list; season-only picks the nearest registerable term of that
+                          season.
+    Returns None only if Banner returned no terms at all.
+    """
+    terms = get_terms()
+    if not terms:
+        return None
+    registerable = sorted((t["code"] for t in terms if _is_registerable(t)))
+    all_codes = {t["code"] for t in terms}
+
+    season = (season or "").strip().lower() or None
+    mm = _SEASON_MM.get(season) if season else None
+
+    if mm and year:
+        code = f"{year}{mm}"
+        if code in all_codes:
+            return code
+        # Named a term Banner doesn't list — fall through to the default.
+    elif mm:
+        # Season only: nearest registerable term of that season (else any listed one).
+        matches = [c for c in registerable if c.endswith(mm)]
+        if not matches:
+            matches = sorted(c for c in all_codes if c.endswith(mm))
+        if matches:
+            return matches[0]
+
+    if registerable:
+        return registerable[0]
+    return sorted(all_codes)[0] if all_codes else None
+
+
+# ---------------------------------------------------------------------------
+# Section search + instructor
+# ---------------------------------------------------------------------------
+
+def _fetch_faculty(session: requests.Session, term: str, crn: str) -> list[dict]:
+    """Instructor(s) for a CRN — `searchResults` returns `faculty: []`, so this
+    separate call is the only way to get the prof. Cached for hours."""
+    key = (term, crn)
+    with _lock:
+        hit = _faculty_cache.get(key)
+        if hit and (time.monotonic() - hit[0] < FACULTY_TTL):
+            return hit[1]
+    resp = session.get(f"{BASE}/searchResults/getFacultyMeetingTimes",
+                       params={"term": term, "courseReferenceNumber": crn},
+                       timeout=HTTP_TIMEOUT)
+    fmt = (resp.json() or {}).get("fmt") or []
+    faculty: list[dict] = []
+    for entry in fmt:
+        for f in entry.get("faculty") or []:
+            faculty.append({
+                "name": f.get("displayName"),
+                "email": f.get("emailAddress"),
+                "primary": bool(f.get("primaryIndicator")),
+            })
+    # Dedup by name (a prof can appear once per meeting-time entry).
+    seen, uniq = set(), []
+    for f in faculty:
+        if f["name"] and f["name"] not in seen:
+            seen.add(f["name"])
+            uniq.append(f)
+    with _lock:
+        _faculty_cache[key] = (time.monotonic(), uniq)
+    return uniq
+
+
+def _meeting_from_section(raw: dict) -> dict | None:
+    """Pull the inline schedule (no extra call) from `meetingsFaculty[].meetingTime`."""
+    mf = raw.get("meetingsFaculty") or []
+    if not mf:
+        return None
+    mt = mf[0].get("meetingTime") or {}
+    days = [d[:2].capitalize() for d in
+            ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+            if mt.get(d)]
+    return {
+        "days": days,                       # e.g. ["Mo", "We", "Th"]
+        "begin": mt.get("beginTime"),       # "1430" (24h HHMM)
+        "end": mt.get("endTime"),           # "1520"
+        "building": mt.get("buildingDescription") or mt.get("building"),
+        "room": mt.get("room"),
+        "start_date": mt.get("startDate"),
+        "end_date": mt.get("endDate"),
+    }
+
+
+def search_sections(subject: str, number: str, term: str) -> list[dict]:
+    """All sections (A01, A02, B01, …) for a course in a term, normalized to the
+    fields we serve. Cached 120s per (term, subject, number). Instructor is fetched
+    per section (cached longer)."""
+    key = (term, subject, number)
+    with _lock:
+        hit = _sections_cache.get(key)
+        if hit and (time.monotonic() - hit[0] < SECTIONS_TTL):
+            return hit[1]
+
+    with _lock:
+        session = _ensure_session(term)
+    resp = session.get(
+        f"{BASE}/searchResults/searchResults",
+        params={"txt_subject": subject, "txt_courseNumber": number, "txt_term": term,
+                "pageOffset": 0, "pageMaxSize": 50,
+                "sortColumn": "subjectDescription", "sortDirection": "asc"},
+        timeout=HTTP_TIMEOUT,
+    )
+    data = (resp.json() or {}).get("data") or []
+
+    # Instructor needs a separate call per section (searchResults returns
+    # faculty: []). These are independent round-trips, so fan them out over a small
+    # thread pool — a course with N sections goes from N sequential GETs to ~1 wall-
+    # clock GET on a cold cache. The cache is _lock-guarded and a requests.Session's
+    # GETs share urllib3's thread-safe connection pool, so concurrent use is fine.
+    crns = [str(raw.get("courseReferenceNumber") or "") for raw in data]
+    unique_crns = [c for c in dict.fromkeys(crns) if c]
+    faculty_by_crn: dict[str, list] = {}
+    if unique_crns:
+        with ThreadPoolExecutor(max_workers=min(8, len(unique_crns))) as pool:
+            faculty_by_crn = dict(zip(
+                unique_crns,
+                pool.map(lambda c: _fetch_faculty(session, term, c), unique_crns),
+            ))
+
+    sections: list[dict] = []
+    for raw, crn in zip(data, crns):
+        meeting = _meeting_from_section(raw)
+        instructors = faculty_by_crn.get(crn, [])
+        sections.append({
+            "crn": crn,
+            "section": raw.get("sequenceNumber"),          # "A01"
+            "title": raw.get("courseTitle"),
+            "schedule_type": raw.get("scheduleTypeDescription"),   # Lecture / Lab / Tutorial
+            "seats_available": raw.get("seatsAvailable"),
+            "max_enrollment": raw.get("maximumEnrollment"),
+            "enrollment": raw.get("enrollment"),
+            "open": bool(raw.get("openSection")),
+            "wait_available": raw.get("waitAvailable"),
+            "wait_count": raw.get("waitCount"),
+            "wait_capacity": raw.get("waitCapacity"),
+            "delivery": raw.get("instructionalMethodDescription"),  # Face-to-face / Online
+            "campus": raw.get("campusDescription"),
+            "credits": raw.get("creditHours"),
+            "meeting": meeting,
+            "instructors": instructors,
+        })
+
+    with _lock:
+        _sections_cache[key] = (time.monotonic(), sections)
+    return sections
+
+
+# ---------------------------------------------------------------------------
+# Top-level entry — gated call from chatbot.py
+# ---------------------------------------------------------------------------
+
+def banner_retrieve(course_codes: list[str], season: str | None = None,
+                    year: int | None = None) -> dict:
+    """Live section data for the given normalized course codes.
+
+    Best-effort: any failure (network, session, bad JSON, term resolution) returns an
+    empty dict so the answer pipeline degrades to no-Banner rather than erroring —
+    same spirit as the router's vector-only fallback. Returns:
+
+        {"term": "202609", "term_label": "Fall 2026",
+         "courses": [{"code": "CSC225", "sections": [ ... ]}]}
+
+    Courses with no sections found in the resolved term are dropped.
+    """
+    try:
+        term = resolve_term(season, year)
+        if not term:
+            return {}
+        courses = []
+        for code in course_codes:
+            subject, num = split_course_code(code)
+            if not subject or not num:
+                continue
+            sections = search_sections(subject, num, term)
+            if sections:
+                courses.append({"code": code, "sections": sections})
+        if not courses:
+            return {}
+        return {"term": term, "term_label": term_label(term), "courses": courses}
+    except Exception as e:  # noqa: BLE001 — best-effort, never break the answer
+        import sys
+        print(f"  [banner_retrieve] failed, skipping live availability: {e}",
+              file=sys.stderr)
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# CLI smoke test (no LLM) — see module docstring
+# ---------------------------------------------------------------------------
+
+def _fmt_time(hhmm: str | None) -> str:
+    if not hhmm or len(hhmm) != 4:
+        return "?"
+    return f"{hhmm[:2]}:{hhmm[2:]}"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Banner live class availability — smoke test")
+    parser.add_argument("--course", required=True, help="normalized course code, e.g. CSC225")
+    parser.add_argument("--term", default=None, help="explicit YYYYMM term (default: current/upcoming)")
+    parser.add_argument("--season", default=None, choices=list(_SEASON_MM),
+                        help="season hint if no explicit --term")
+    parser.add_argument("--year", type=int, default=None, help="year hint if no explicit --term")
+    args = parser.parse_args()
+
+    if args.term:
+        term = args.term
+    else:
+        term = resolve_term(args.season, args.year)
+    print(f"Resolved term: {term} ({term_label(term or '')})\n")
+
+    subject, num = split_course_code(args.course)
+    sections = search_sections(subject, num, term)
+    if not sections:
+        print("No sections found.")
+        return
+    for s in sections:
+        sched = s.get("meeting")
+        when = ""
+        if sched:
+            days = "".join(sched["days"])
+            when = f"  {days} {_fmt_time(sched['begin'])}-{_fmt_time(sched['end'])}"
+            if sched.get("room") and sched["room"] != "None specified":
+                when += f"  {sched.get('building') or ''} {sched['room']}"
+        prof = ", ".join(i["name"] for i in s["instructors"]) or "TBA"
+        wl = (f"  WL {s['wait_count']}/{s['wait_capacity']}"
+              if s.get("wait_capacity") else "")
+        full = "" if s["open"] else "  [FULL]"
+        print(f"{s['section']:<4} {s['schedule_type']:<8} "
+              f"seats {s['seats_available']}/{s['max_enrollment']} "
+              f"({s['enrollment']} enrolled){wl}{full}{when}  — {prof}")
+
+
+if __name__ == "__main__":
+    main()

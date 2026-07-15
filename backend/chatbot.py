@@ -44,6 +44,8 @@ import sys
 import time
 from pathlib import Path
 
+from banner import banner_retrieve   # live class availability (session + TTL cache)
+
 BASE_DIR = Path(__file__).parent          # backend/
 
 # Serving-artifact locations. Default to BASE_DIR-relative paths (local dev,
@@ -536,6 +538,53 @@ class GeorgeBot:
                 )
         return "\n\n".join(blocks)
 
+    @staticmethod
+    def _banner_context_text(banner_facts: dict, offset: int) -> tuple[str, int]:
+        """Render live Banner section data into numbered `[n]` blocks tagged
+        source=banner, one block per course, starting at `[offset+1]`. Returns
+        (text, n_blocks). Mirrors `_graph_context_text`'s numbering scheme so graph,
+        banner, and vector blocks share one continuous `[n]` sequence."""
+        def _hhmm(t: str | None) -> str:
+            return f"{t[:2]}:{t[2:]}" if t and len(t) == 4 else "?"
+
+        term_label = banner_facts.get("term_label", "")
+        blocks = []
+        i = offset
+        for course in banner_facts.get("courses", []):
+            i += 1
+            code = course["code"]
+            lines = [
+                f"[{i}] source=banner course={code} term={term_label}",
+                f"LIVE class availability for {code} ({term_label}) — current seat "
+                f"counts pulled from UVic registration, subject to change:",
+            ]
+            for s in course.get("sections", []):
+                seat = (f"{s['seats_available']} of {s['max_enrollment']} seats open "
+                        f"({s['enrollment']} enrolled)")
+                status = "OPEN" if s.get("open") else "FULL"
+                parts = [f"  {s['section']} ({s.get('schedule_type', '')}): {seat} — {status}."]
+                if s.get("wait_capacity"):
+                    parts.append(f"Waitlist {s.get('wait_count', '?')}/{s['wait_capacity']} "
+                                 f"({s.get('wait_available', '?')} open).")
+                m = s.get("meeting")
+                if m and (m.get("days") or m.get("begin")):
+                    when = " ".join(m.get("days") or []) or "days TBA"
+                    loc = ""
+                    room = m.get("room")
+                    if room and room != "None specified":
+                        loc = f", {m.get('building') or ''} {room}".rstrip()
+                    parts.append(f"Meets {when} {_hhmm(m.get('begin'))}-{_hhmm(m.get('end'))}{loc}.")
+                profs = ", ".join(f"{p['name']}"
+                                  + (f" ({p['email']})" if p.get("email") else "")
+                                  for p in s.get("instructors", []) if p.get("name"))
+                parts.append(f"Instructor: {profs or 'TBA'}.")
+                extra = " ".join(x for x in [s.get("delivery"), s.get("campus")] if x)
+                if extra:
+                    parts.append(extra + ".")
+                lines.append(" ".join(parts))
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks), i - offset
+
     # -- LLM steps ----------------------------------------------------------
 
     def _call_llm(self, messages: list[dict], system: str | None = None,
@@ -597,7 +646,8 @@ class GeorgeBot:
             convo = "Conversation so far:\n" + "\n".join(lines) + "\n\n"
 
         prompt = (
-            f"{convo}You are the query router for a University of Victoria (UVic) "
+            f"{convo}Today's date is {time.strftime('%Y-%m-%d')}.\n"
+            f"You are the query router for a University of Victoria (UVic) "
             f"chatbot. Given the latest user question, produce a JSON object (and "
             f"nothing else) with these fields:\n\n"
             f'  "search_query": a single standalone search query for a document '
@@ -612,6 +662,16 @@ class GeorgeBot:
             f'  "wants_outline": true if the user is asking about a specific '
             f"past/current course's syllabus, grading scheme, schedule, or "
             f"instructor for a term (course outline content), else false.\n"
+            f'  "wants_availability": true if the user is asking about LIVE class '
+            f"availability for a specific course — open seats, whether a course/"
+            f"section is full, waitlist space, section meeting times/days/room, or "
+            f"who is teaching it this term. Else false.\n"
+            f'  "term_season": if the question names or implies a specific academic '
+            f'term, one of "spring" (Jan-Apr), "summer" (May-Aug), or "fall" '
+            f"(Sep-Dec); otherwise null. Resolve relative references like \"next "
+            f'spring\" using today\'s date above.\n'
+            f'  "term_year": the 4-digit year of that term (e.g. 2026) when '
+            f"determinable, otherwise null.\n"
             f'  "completed_courses": array of UVic course codes the user has '
             f"stated (anywhere in the conversation, not just the latest message) "
             f"that they have already taken/completed/passed, normalized the same "
@@ -628,12 +688,15 @@ class GeorgeBot:
             f"process) — null if the question is general/cross-departmental or "
             f"you're not confident which department applies:\n"
             f"{json.dumps(self.departments)}\n\n"
-            f"Use course_codes/program_query (graph route) only for structured "
-            f"catalog facts: prerequisites, credits, cross-listings, course "
-            f"descriptions, degree/program requirements, or outline content. For "
-            f"anything else (services, policies, deadlines, general info) leave "
+            f"Populate course_codes whenever the question is actually ABOUT a "
+            f"specific course — either its structured catalog facts (prerequisites, "
+            f"credits, cross-listings, description, degree/program requirements, "
+            f"outline content) OR its live availability/sections (seats, waitlist, "
+            f"meeting times, instructor — i.e. whenever wants_availability is true). "
+            f"program_query is for degree/program requirements only. For questions "
+            f"about services, policies, deadlines, or general info, leave "
             f"course_codes empty and program_query null even if a course code is "
-            f"mentioned in passing. completed_courses should be populated whenever "
+            f"mentioned only in passing. completed_courses should be populated whenever "
             f"the user has mentioned finished coursework, even on a general-info "
             f"question, so downstream prerequisite/requirement checks can use it.\n\n"
             f"Latest question: {question}"
@@ -647,19 +710,30 @@ class GeorgeBot:
             dept = data.get("department") or None
             if dept not in self.departments:
                 dept = None
+            season = (data.get("term_season") or "").strip().lower() or None
+            if season not in ("spring", "summer", "fall"):
+                season = None
+            try:
+                year = int(data["term_year"]) if data.get("term_year") else None
+            except (TypeError, ValueError):
+                year = None
             return {
                 "search_query": data.get("search_query") or question,
                 "completed_courses": [c.replace(" ", "").upper() for c in (data.get("completed_courses") or [])],
                 "course_codes": [c.replace(" ", "").upper() for c in (data.get("course_codes") or [])],
                 "program_query": data.get("program_query") or None,
                 "wants_outline": bool(data.get("wants_outline")),
+                "wants_availability": bool(data.get("wants_availability")),
+                "term_season": season,
+                "term_year": year,
                 "topic_families": [f for f in (data.get("topic_families") or []) if f in valid_families],
                 "department": dept,
             }
         except Exception as e:
             print(f"  [rewrite_and_route] failed, falling back to vector-only: {e}", file=sys.stderr)
             return {"search_query": question, "course_codes": [], "program_query": None,
-                    "wants_outline": False, "completed_courses": [], "topic_families": [], "department": None}
+                    "wants_outline": False, "wants_availability": False, "term_season": None,
+                    "term_year": None, "completed_courses": [], "topic_families": [], "department": None}
 
     @staticmethod
     def _build_context(chunks: list[dict], graph_text: str, offset: int) -> str:
@@ -723,6 +797,14 @@ class GeorgeBot:
         "- Material tagged source=kuali is the official course/program catalog — "
         "treat it as the authoritative, current source for prerequisites, "
         "credits, and program requirements.\n"
+        "- Material tagged source=banner is LIVE registration data for a specific "
+        "term (named in the block) — current seat counts, waitlist space, section "
+        "meeting times/rooms, and instructors. Use it for 'is it full / how many "
+        "seats / when does it meet / who teaches it' questions. Always name the "
+        "term, cite section codes (e.g. A01), and call out when a section is full "
+        "or waitlist-only. These numbers change constantly, so present them as "
+        "current-as-of-now, not a guarantee. (Contrast: source=kuali is the static "
+        "catalog; HISTORICAL outlines are past terms.)\n"
         "- Course outlines tagged HISTORICAL are past-term snapshots only. When "
         "you rely on one, always name the specific term, and never present "
         "historical grading weights, instructors, or schedules as current — for "
@@ -829,8 +911,11 @@ class GeorgeBot:
     # -- source formatting --------------------------------------------------
 
     @staticmethod
-    def format_sources(chunks: list[dict], graph_facts: dict | None) -> list[dict]:
-        """Deduplicate retrieved chunks + graph facts into a clean source list (by URL)."""
+    def format_sources(chunks: list[dict], graph_facts: dict | None,
+                       banner_facts: dict | None = None) -> list[dict]:
+        """Deduplicate retrieved chunks + graph facts + live Banner facts into a clean
+        source list. Order matches the context numbering: graph, then banner, then
+        vector chunks."""
         seen: set[str] = set()
         sources = []
         n = 0
@@ -882,6 +967,23 @@ class GeorgeBot:
                         "historical": False,
                     })
 
+        if banner_facts:
+            term_label = banner_facts.get("term_label", "")
+            for course in banner_facts.get("courses", []):
+                n += 1
+                code = course["code"]
+                sources.append({
+                    "n": n,
+                    # Banner's class-search UI (no stable per-course deep link); the
+                    # data itself is served inline, this is just a "look it up" pointer.
+                    "url": "https://banner.uvic.ca/StudentRegistrationSsb/ssb/classSearch/classSearch",
+                    "source": "banner",
+                    "title": f"{code} — live availability",
+                    "course_code": code,
+                    "term": term_label or None,
+                    "historical": False,
+                })
+
         for ch in chunks:
             n += 1
             meta = ch.get("metadata", {})
@@ -904,13 +1006,19 @@ class GeorgeBot:
     # -- orchestration ------------------------------------------------------
 
     def retrieve(self, question: str, history: list[dict],
-                 audience: str = DEFAULT_AUDIENCE) -> tuple[dict, list[dict], dict]:
-        """Route the question, run retrieval, and return (route, chunks, graph_facts).
+                 audience: str = DEFAULT_AUDIENCE) -> tuple[dict, list[dict], dict, dict]:
+        """Route the question, run retrieval, and return
+        (route, chunks, graph_facts, banner_facts).
 
         `audience` (undergrad / faculty / both) selects which collection(s) the
         vector path searches and which topic-family vocabulary the router uses.
         Graph facts are corpus-independent (the course/program graph is shared),
         so audience doesn't affect them.
+
+        Banner (live availability) is a gated live-data step: it fires only when the
+        router named a course AND flagged an availability/section question — parallel
+        to how graph retrieval fires on a course code. It's best-effort (returns {} on
+        any failure), so audience/vector answers are never blocked by Banner being down.
         """
         route = self.rewrite_and_route(question, history, audience)
         graph_facts = {}
@@ -919,25 +1027,45 @@ class GeorgeBot:
                 route["course_codes"], route["program_query"], route["wants_outline"],
                 route["completed_courses"],
             )
+        banner_facts = {}
+        if route["course_codes"] and route["wants_availability"]:
+            banner_facts = banner_retrieve(
+                route["course_codes"], route["term_season"], route["term_year"],
+            )
         chunks = self.vector_retrieve(
             route["search_query"], audience=audience,
             topic_families=route["topic_families"], department=route["department"],
         )
-        return route, chunks, graph_facts
+        return route, chunks, graph_facts, banner_facts
+
+    @staticmethod
+    def _n_graph_blocks(graph_facts: dict) -> int:
+        return len(graph_facts.get("courses", [])) + (1 if graph_facts.get("program") else 0)
+
+    def _assemble_context(self, chunks: list[dict], graph_facts: dict,
+                          banner_facts: dict) -> tuple[str, int]:
+        """Build the full numbered context (graph -> banner -> vector) and return
+        (context, n_non_vector_blocks). Shared by `ask()` and api.py's stream path."""
+        graph_text = self._graph_context_text(graph_facts) if graph_facts else ""
+        n_graph = self._n_graph_blocks(graph_facts)
+        banner_text, n_banner = ("", 0)
+        if banner_facts:
+            banner_text, n_banner = self._banner_context_text(banner_facts, n_graph)
+        prefix = "\n\n".join(t for t in (graph_text, banner_text) if t)
+        context = self._build_context(chunks, prefix, n_graph + n_banner)
+        return context, n_graph + n_banner
 
     def ask(self, question: str, history: list[dict] | None = None,
             audience: str = DEFAULT_AUDIENCE) -> dict:
         history = history or []
-        route, chunks, graph_facts = self.retrieve(question, history, audience)
-        graph_text = self._graph_context_text(graph_facts) if graph_facts else ""
-        n_graph_blocks = len(graph_facts.get("courses", [])) + (1 if graph_facts.get("program") else 0)
-        context = self._build_context(chunks, graph_text, n_graph_blocks)
+        route, chunks, graph_facts, banner_facts = self.retrieve(question, history, audience)
+        context, n_prefix_blocks = self._assemble_context(chunks, graph_facts, banner_facts)
         answer = self.answer(question, context, history)
         return {
             "answer": answer,
-            "sources": self.format_sources(chunks, graph_facts),
+            "sources": self.format_sources(chunks, graph_facts, banner_facts),
             "search_query": route["search_query"],
-            "n_chunks": len(chunks) + n_graph_blocks,
+            "n_chunks": len(chunks) + n_prefix_blocks,
         }
 
 

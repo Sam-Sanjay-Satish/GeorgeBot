@@ -29,6 +29,7 @@ const SOURCE_MAP: Record<string, Source['source']> = {
   document: 'uvic_docs',
   heat: 'heat',
   kuali: 'kuali',
+  banner: 'banner',
 }
 
 function titleFromUrl(url: string): string {
