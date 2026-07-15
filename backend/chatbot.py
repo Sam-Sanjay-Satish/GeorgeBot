@@ -45,6 +45,7 @@ import time
 from pathlib import Path
 
 from banner import banner_instructor_retrieve, banner_retrieve   # live class availability
+from rmp import rmp_retrieve   # RateMyProfessors ratings/reviews (student opinion)
 
 BASE_DIR = Path(__file__).parent          # backend/
 
@@ -617,6 +618,67 @@ class GeorgeBot:
             blocks.append("\n".join(lines))
         return "\n\n".join(blocks), i - offset
 
+    @staticmethod
+    def _rmp_context_text(rmp_facts: dict, offset: int) -> tuple[str, int]:
+        """Render RateMyProfessors data into numbered `[n]` blocks tagged source=rmp,
+        starting at `[offset+1]`. Returns (text, n_blocks). One block per professor,
+        continuing the same `[n]` sequence as graph/banner/vector.
+
+        Each block is subjective student opinion (rating/difficulty/would-take-again
+        + a few recent reviews), an ambiguous-name note (ask the user to pick), or a
+        no-match note (say there's nothing on RMP — don't invent ratings)."""
+        blocks = []
+        i = offset
+        for p in rmp_facts.get("professors", []):
+            i += 1
+            query = p.get("query", "")
+            if not p.get("matched"):
+                name_for_header = query
+                if p.get("candidates"):
+                    body = (f"Multiple professors on RateMyProfessors match "
+                            f"\"{query}\": {'; '.join(p['candidates'])}. Ask the user "
+                            f"which one they mean before giving a rating.")
+                else:
+                    body = (f"No RateMyProfessors listing found for a professor "
+                            f"matching \"{query}\". Tell the user there's no RMP data "
+                            f"for them (suggest checking the spelling) — do not invent "
+                            f"a rating.")
+            elif not p.get("num_ratings"):
+                name_for_header = p.get("name") or query
+                body = (f"{name_for_header} is on RateMyProfessors but has no ratings "
+                        f"yet, so there's no student feedback to summarize.")
+            else:
+                name_for_header = p.get("name") or query
+                wta = (f"{p['would_take_again']}% would take again"
+                       if p.get("would_take_again") is not None else "would-take-again n/a")
+                lines = [
+                    f"STUDENT OPINION (RateMyProfessors, self-selected reviews — NOT "
+                    f"official UVic data): {name_for_header}"
+                    + (f", {p['department']}" if p.get("department") else ""),
+                    f"Overall rating {p['rating']}/5, difficulty {p['difficulty']}/5, "
+                    f"{wta}, based on {p['num_ratings']} student ratings.",
+                ]
+                if p.get("reviews"):
+                    lines.append("Recent reviews:")
+                    for r in p["reviews"]:
+                        meta = []
+                        if r.get("course"):
+                            meta.append(r["course"])
+                        if r.get("date"):
+                            meta.append(r["date"])
+                        if r.get("quality") is not None:
+                            meta.append(f"quality {r['quality']}/5")
+                        if r.get("difficulty") is not None:
+                            meta.append(f"difficulty {r['difficulty']}/5")
+                        tag = f" [{', '.join(r['tags'])}]" if r.get("tags") else ""
+                        head = f" - ({', '.join(meta)}){tag}" if meta or tag else " -"
+                        comment = (r.get("comment") or "").strip()
+                        lines.append(f"{head} {comment}".rstrip())
+                body = "\n".join(lines)
+            header = f"[{i}] source=rmp instructor=\"{name_for_header}\""
+            blocks.append(f"{header}\n{body}")
+        return "\n\n".join(blocks), i - offset
+
     # -- LLM steps ----------------------------------------------------------
 
     def _call_llm(self, messages: list[dict], system: str | None = None,
@@ -709,6 +771,20 @@ class GeorgeBot:
             f"about one named course), the instructor's name as written (e.g. "
             f'"Yong", "Quinton Yong"); otherwise null. Leave course_codes empty when '
             f"this is set — the lookup is by instructor, not course.\n"
+            f'  "professor_query": if the user is asking whether a specific named '
+            f"professor is any GOOD — their teaching quality, rating, reviews, how "
+            f"hard/easy they are, whether to take them — that professor's name as "
+            f'written (e.g. "Yong", "Quinton Yong"); otherwise null. This is about '
+            f"opinion/quality of a named person, distinct from instructor_query "
+            f"(which courses they teach) and from wants_availability (who teaches a "
+            f"section). Leave null if no specific professor is named.\n"
+            f'  "wants_rating": true if the user wants teaching-quality/rating/review '
+            f"information about whoever is involved — e.g. \"is X a good prof\", "
+            f'"are they good", "who teaches CSC 225 and are they any good", "should I '
+            f'take this section". This is the signal to consult RateMyProfessors; set '
+            f"it true whenever professor_query is set, and ALSO when the quality "
+            f"question is about a course's instructor(s) rather than a named person. "
+            f"Else false.\n"
             f'  "completed_courses": array of UVic course codes the user has '
             f"stated (anywhere in the conversation, not just the latest message) "
             f"that they have already taken/completed/passed, normalized the same "
@@ -762,6 +838,8 @@ class GeorgeBot:
                 "wants_outline": bool(data.get("wants_outline")),
                 "wants_availability": bool(data.get("wants_availability")),
                 "instructor_query": (data.get("instructor_query") or None),
+                "professor_query": (data.get("professor_query") or None),
+                "wants_rating": bool(data.get("wants_rating")),
                 "term_season": season,
                 "term_year": year,
                 "topic_families": [f for f in (data.get("topic_families") or []) if f in valid_families],
@@ -771,6 +849,7 @@ class GeorgeBot:
             print(f"  [rewrite_and_route] failed, falling back to vector-only: {e}", file=sys.stderr)
             return {"search_query": question, "course_codes": [], "program_query": None,
                     "wants_outline": False, "wants_availability": False, "instructor_query": None,
+                    "professor_query": None, "wants_rating": False,
                     "term_season": None, "term_year": None, "completed_courses": [],
                     "topic_families": [], "department": None}
 
@@ -848,6 +927,17 @@ class GeorgeBot:
         "instead list everything a named instructor teaches that term, or say the "
         "name was ambiguous (ask the user which person they mean) or matched no "
         "classes (tell them so — don't invent courses).\n"
+        "- Material tagged source=rmp is third-party STUDENT OPINION from "
+        "RateMyProfessors — subjective, self-selected reviews, NOT official UVic "
+        "data and not a measure of fact. Use it only for 'is this professor any "
+        "good / what are they like / are they hard' questions. Attribute it "
+        "explicitly (e.g. 'students on RateMyProfessors rate…'), always give the "
+        "overall rating together with how many ratings it's based on (a score from "
+        "very few reviews is weak evidence — say so), and present it as opinion, "
+        "never as an official or guaranteed judgement. You may summarize the "
+        "themes of the written reviews, but don't present one student's take as "
+        "the consensus. If a name was ambiguous, ask which professor they mean; if "
+        "there's no RMP listing, say so plainly and never fabricate a rating.\n"
         "- Course outlines tagged HISTORICAL are past-term snapshots only. When "
         "you rely on one, always name the specific term, and never present "
         "historical grading weights, instructors, or schedules as current — for "
@@ -955,10 +1045,11 @@ class GeorgeBot:
 
     @staticmethod
     def format_sources(chunks: list[dict], graph_facts: dict | None,
-                       banner_facts: dict | None = None) -> list[dict]:
-        """Deduplicate retrieved chunks + graph facts + live Banner facts into a clean
-        source list. Order matches the context numbering: graph, then banner, then
-        vector chunks."""
+                       banner_facts: dict | None = None,
+                       rmp_facts: dict | None = None) -> list[dict]:
+        """Deduplicate retrieved chunks + graph facts + live Banner facts + RMP
+        ratings into a clean source list. Order matches the context numbering:
+        graph, then banner, then rmp, then vector chunks."""
         seen: set[str] = set()
         sources = []
         n = 0
@@ -1028,6 +1119,25 @@ class GeorgeBot:
                     "historical": False,
                 })
 
+        if rmp_facts:
+            for p in rmp_facts.get("professors", []):
+                # Only matched professors get a clickable source; ambiguous/no-match
+                # blocks are prompts to the model, not citable pages.
+                if not p.get("matched"):
+                    continue
+                n += 1
+                legacy = p.get("legacy_id")
+                url = f"https://www.ratemyprofessors.com/professor/{legacy}" if legacy else ""
+                sources.append({
+                    "n": n,
+                    "url": url,
+                    "source": "rmp",
+                    "title": f"{p.get('name', '')} — RateMyProfessors",
+                    "course_code": None,
+                    "term": None,
+                    "historical": False,
+                })
+
         for ch in chunks:
             n += 1
             meta = ch.get("metadata", {})
@@ -1050,9 +1160,9 @@ class GeorgeBot:
     # -- orchestration ------------------------------------------------------
 
     def retrieve(self, question: str, history: list[dict],
-                 audience: str = DEFAULT_AUDIENCE) -> tuple[dict, list[dict], dict, dict]:
+                 audience: str = DEFAULT_AUDIENCE) -> tuple[dict, list[dict], dict, dict, dict]:
         """Route the question, run retrieval, and return
-        (route, chunks, graph_facts, banner_facts).
+        (route, chunks, graph_facts, banner_facts, rmp_facts).
 
         `audience` (undergrad / faculty / both) selects which collection(s) the
         vector path searches and which topic-family vocabulary the router uses.
@@ -1063,6 +1173,11 @@ class GeorgeBot:
         router named a course AND flagged an availability/section question — parallel
         to how graph retrieval fires on a course code. It's best-effort (returns {} on
         any failure), so audience/vector answers are never blocked by Banner being down.
+
+        RMP (RateMyProfessors ratings) is a second gated live step that runs AFTER
+        Banner so it can reuse Banner's instructor names: it fires on an explicit
+        professor_query, or on a course-quality question (wants_rating) once Banner
+        has resolved who teaches the course. Also best-effort.
         """
         route = self.rewrite_and_route(question, history, audience)
         graph_facts = {}
@@ -1080,38 +1195,75 @@ class GeorgeBot:
             banner_facts = banner_instructor_retrieve(
                 route["instructor_query"], route["term_season"], route["term_year"],
             )
+        rmp_facts = self._rmp_retrieve_for(route, banner_facts)
         chunks = self.vector_retrieve(
             route["search_query"], audience=audience,
             topic_families=route["topic_families"], department=route["department"],
         )
-        return route, chunks, graph_facts, banner_facts
+        return route, chunks, graph_facts, banner_facts, rmp_facts
+
+    @staticmethod
+    def _instructor_names_from_banner(banner_facts: dict) -> list[str]:
+        """Distinct instructor names Banner resolved, in first-seen order — the
+        input to the course-case RMP chain. Covers both Banner shapes."""
+        names: list[str] = []
+        seen: set[str] = set()
+        def _add(name: str | None) -> None:
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        _add(banner_facts.get("instructor"))       # instructor-lookup shape
+        for course in banner_facts.get("courses", []):
+            for section in course.get("sections", []):
+                for instr in section.get("instructors", []):
+                    _add(instr.get("name"))
+        return names
+
+    @classmethod
+    def _rmp_retrieve_for(cls, route: dict, banner_facts: dict) -> dict:
+        """Decide the RMP names and fetch. Explicit professor_query wins; otherwise a
+        course-quality question (wants_rating) uses whoever Banner just resolved."""
+        if route.get("professor_query"):
+            names = [route["professor_query"]]
+        elif route.get("wants_rating") and banner_facts:
+            names = cls._instructor_names_from_banner(banner_facts)
+        else:
+            names = []
+        return rmp_retrieve(names) if names else {}
 
     @staticmethod
     def _n_graph_blocks(graph_facts: dict) -> int:
         return len(graph_facts.get("courses", [])) + (1 if graph_facts.get("program") else 0)
 
     def _assemble_context(self, chunks: list[dict], graph_facts: dict,
-                          banner_facts: dict) -> tuple[str, int]:
-        """Build the full numbered context (graph -> banner -> vector) and return
-        (context, n_non_vector_blocks). Shared by `ask()` and api.py's stream path."""
+                          banner_facts: dict, rmp_facts: dict | None = None) -> tuple[str, int]:
+        """Build the full numbered context (graph -> banner -> rmp -> vector) and
+        return (context, n_non_vector_blocks). Shared by `ask()` and api.py's
+        stream path."""
         graph_text = self._graph_context_text(graph_facts) if graph_facts else ""
         n_graph = self._n_graph_blocks(graph_facts)
         banner_text, n_banner = ("", 0)
         if banner_facts:
             banner_text, n_banner = self._banner_context_text(banner_facts, n_graph)
-        prefix = "\n\n".join(t for t in (graph_text, banner_text) if t)
-        context = self._build_context(chunks, prefix, n_graph + n_banner)
-        return context, n_graph + n_banner
+        rmp_text, n_rmp = ("", 0)
+        if rmp_facts:
+            rmp_text, n_rmp = self._rmp_context_text(rmp_facts, n_graph + n_banner)
+        n_prefix = n_graph + n_banner + n_rmp
+        prefix = "\n\n".join(t for t in (graph_text, banner_text, rmp_text) if t)
+        context = self._build_context(chunks, prefix, n_prefix)
+        return context, n_prefix
 
     def ask(self, question: str, history: list[dict] | None = None,
             audience: str = DEFAULT_AUDIENCE) -> dict:
         history = history or []
-        route, chunks, graph_facts, banner_facts = self.retrieve(question, history, audience)
-        context, n_prefix_blocks = self._assemble_context(chunks, graph_facts, banner_facts)
+        route, chunks, graph_facts, banner_facts, rmp_facts = self.retrieve(
+            question, history, audience)
+        context, n_prefix_blocks = self._assemble_context(
+            chunks, graph_facts, banner_facts, rmp_facts)
         answer = self.answer(question, context, history)
         return {
             "answer": answer,
-            "sources": self.format_sources(chunks, graph_facts, banner_facts),
+            "sources": self.format_sources(chunks, graph_facts, banner_facts, rmp_facts),
             "search_query": route["search_query"],
             "n_chunks": len(chunks) + n_prefix_blocks,
         }

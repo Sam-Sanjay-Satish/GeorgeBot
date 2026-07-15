@@ -47,6 +47,14 @@ user question + chat history + audience (undergrad | faculty | both)
    │        everything a named prof teaches that term (or an ambiguity/no-match note).
    │        In-process TTL cache. Best-effort ({} on failure). See BANNER_API.md.
    │
+   ├─ rmp_retrieve(names)  (RateMyProfessors ratings, gated, runs AFTER banner)
+   │     └─ rmp.py — RMP internal GraphQL (unofficial, public token), scoped to
+   │        UVic. Fires on professor_query (a named prof's quality/rating) OR on a
+   │        course-quality question (wants_rating) using the instructor names Banner
+   │        just resolved. Returns avg rating/difficulty/would-take-again + up to 20
+   │        recent reviews (or ambiguity/no-match note). Subjective STUDENT OPINION,
+   │        not official data. In-process TTL cache. Best-effort ({} on failure).
+   │
    ├─ vector_retrieve(query, audience)
    │     └─ Voyage query embedding (ONE) → queried against the selected
    │        collection(s) — georgebot_v22_undergrad and/or _faculty — top-40
@@ -55,8 +63,8 @@ user question + chat history + audience (undergrad | faculty | both)
    │          up to N_CONTEXT=4 distinct chunks (full text)
    │
    └─ answer()  → MiniMax-M3 (official API, thinking DISABLED)
-                  → answer from graph + banner + vector blocks (supplied via the
-                    SYSTEM prompt, numbered together) + format_sources()
+                  → answer from graph + banner + rmp + vector blocks (supplied via
+                    the SYSTEM prompt, numbered together) + format_sources()
 ```
 
 **Audience (v2.2).** The corpus is split into two Chroma collections —
@@ -154,6 +162,8 @@ reading this first:
 └── backend/
 │   ├── chatbot.py             # GeorgeBot engine — routing + retrieval + LLM pipeline (tune here)
 │   ├── banner.py              # live class availability (UVic Banner 9 JSON): session + TTL cache + term resolution (BANNER_API.md)
+│   ├── rmp.py                 # RateMyProfessors ratings/reviews (unofficial GraphQL, UVic-scoped): TTL cache, best-effort. Student opinion, not official data
+│   ├── RMP_API.md             # RMP endpoint/auth/school-id/query research + the best-effort caveat
 │   ├── graph_queries.py       # GraphStore — copy of georgebot-pipeline's course-graph/graph_queries.py
 │   ├── api.py                 # FastAPI server (thin wrapper over GeorgeBot); Railway PORT/HOST-aware
 │   ├── Dockerfile             # backend container build (Railway); multi-stage python:3.14-slim, CMD python api.py
@@ -438,9 +448,38 @@ gate would never open. See `BANNER_API.md` for the endpoint research.
   120s TTL on section payloads (seat counts must stay honest), hours-long TTL on the
   term list and per-section instructor. See `BANNER_API.md` "Request flow"/"Caching".
 - `_banner_context_text()` (in `chatbot.py`) renders this into numbered `[n]`
-  blocks tagged `source=banner`, inserted **graph → banner → vector** so all three
+  blocks tagged `source=banner`, inserted **graph → banner → rmp → vector** so all
   share one continuous `[n]` sequence. `_assemble_context()` owns that ordering
   (used by both `ask()` and api.py's stream path).
+
+### 2c. Professor ratings — `rmp.py` (RateMyProfessors, no LLM, no vector search)
+Second gated live-data step, runs **after** Banner so it can reuse Banner's
+resolved instructor names. RMP has **no official API** — `rmp.py` posts to the
+internal GraphQL endpoint (`www.ratemyprofessors.com/graphql`) with a hardcoded
+public Basic-auth token (base64 `test:test`, no key to provision), scoped to
+UVic's base64 school id (`RMP_SCHOOL_ID`, "School-1488"). Unofficial, so
+best-effort ({} on failure), like Banner. See `RMP_API.md`.
+- **What it owns:** subjective *student opinion* only — avg quality/difficulty
+  rating, would-take-again %, rating count, and up to `REVIEWS_N=20` recent
+  written reviews. NOT official UVic data; the prompt frames it as opinion and
+  requires attribution + the sample size. Who-teaches-what / seats / prereqs
+  stay with Banner / graph.
+- **Two firing conditions**, decided by `_rmp_retrieve_for(route, banner_facts)`:
+  (a) router set `professor_query` (a named prof's quality/rating/reviews) →
+  look that name up directly; (b) router set `wants_rating` on a *course*-quality
+  question → chain on the instructor names Banner just resolved
+  (`_instructor_names_from_banner`, both Banner shapes). Neither → no call.
+  `professor_query` wins if both are present.
+- **One GraphQL search call** returns the summary fields on the teacher node
+  directly; a **second call** pulls the 20 reviews only for a single clean match.
+  Name resolution mirrors Banner's instructor semantics: exactly one distinct
+  match → summary + reviews; several (common surname) → `candidates` for the
+  model to disambiguate; none → a no-match note (never fabricate a rating).
+- **In-process TTL cache** keyed by queried name, `RMP_TTL=6h` (ratings barely
+  move). Unlike Banner there's no per-session form-state leak, so a single shared
+  `requests.Session` is used, not a dedicated-per-call one.
+- `_rmp_context_text()` renders numbered `[n]` blocks tagged `source=rmp` (see
+  the ordering note above). `_route_status` (api.py) has matching status lines.
 
 ### 3. Vector retrieval — Voyage + Chroma (reverse-HyDE), with distance cutoff
 - **Model:** `voyage-4-large`. Queries embed with `input_type="query"`; the
@@ -561,6 +600,13 @@ after new corpus content lands.
   "is it full / seats left / when does it meet / who teaches it". Always name the
   term, cite section codes (A01), flag full/waitlist-only sections, and present
   counts as current-as-of-now (they change constantly), not a guarantee.
+- `source=rmp` blocks are third-party **student opinion** from RateMyProfessors
+  (rating/difficulty/would-take-again + recent reviews) — subjective and
+  self-selected, NOT official UVic data. Use only for "is this prof any good /
+  what are they like" questions; attribute explicitly, always give the rating
+  *with* its sample size (few ratings = weak evidence), present it as opinion,
+  and never fabricate a rating (say so if there's no listing; disambiguate a
+  common surname). The prompt owns this contract on `thinking: "disabled"`.
 - If a program search returned multiple candidates, ask the user to
   clarify rather than guessing.
 - Concise, plain text (no LaTeX).
@@ -670,9 +716,12 @@ Every Chroma entry (one per question) carries, in `metadata`:
 uses the right one per audience.
 
 `format_sources()` returns `source` values `webpage | document | kuali |
-heat | banner` (plus occasional `calendar`). UI badge enum: `webpage → uvic_html`,
-`document → uvic_docs`, `heat → heat`, `kuali → kuali`, `banner → banner`
-(rendered as a rose "Live" badge in `SourceBadge.tsx`).
+heat | banner | rmp` (plus occasional `calendar`). UI badge enum: `webpage →
+uvic_html`, `document → uvic_docs`, `heat → heat`, `kuali → kuali`, `banner →
+banner` (rose "Live" badge), `rmp → rmp` (orange "Rating" badge) — in
+`SourceBadge.tsx`. Only *matched* RMP professors become a citable source (the
+professor's RMP page); ambiguous/no-match RMP blocks are model prompts, not
+sources.
 
 ---
 

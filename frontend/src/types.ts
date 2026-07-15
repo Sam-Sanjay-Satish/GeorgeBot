@@ -8,7 +8,7 @@ export type Theme = 'light' | 'dark'
 export interface Source {
   url: string
   title: string
-  source: 'uvic_html' | 'heat' | 'kuali' | 'uvic_docs' | 'banner'
+  source: 'uvic_html' | 'heat' | 'kuali' | 'uvic_docs' | 'banner' | 'rmp'
   course?: string
   term?: string
   historical?: boolean

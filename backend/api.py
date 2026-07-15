@@ -59,6 +59,8 @@ def _route_status(route: dict) -> str:
 
     Templated from known state (no LLM call, no latency). Falls back to a
     plain "Searching…" when nothing more specific is known."""
+    if route.get("professor_query"):
+        return f"Checking student ratings for {route['professor_query']}…"
     instr = route.get("instructor_query")
     if instr:
         return f"Looking up what {instr} is teaching…"
@@ -71,6 +73,8 @@ def _route_status(route: dict) -> str:
         if len(codes) == 1:
             return f"Looking up {_course_label(codes[0])}…"
         return "Looking up courses…"
+    if route.get("wants_rating"):
+        return "Checking student ratings…"
     if route.get("program_query"):
         return "Checking program requirements…"
     return "Finding relevant UVic documents…"
@@ -147,13 +151,17 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                     banner_facts = banner_instructor_retrieve(
                         route["instructor_query"], route["term_season"], route["term_year"],
                     )
+                # RMP ratings — runs after Banner so it can reuse its instructor
+                # names (same logic as chatbot.retrieve()). Best-effort.
+                rmp_facts = bot._rmp_retrieve_for(route, banner_facts)
                 chunks = bot.vector_retrieve(
                     route["search_query"], audience=audience,
                     topic_families=route["topic_families"],
                     department=route["department"],
                 )
 
-                context, n_prefix_blocks = bot._assemble_context(chunks, graph_facts, banner_facts)
+                context, n_prefix_blocks = bot._assemble_context(
+                    chunks, graph_facts, banner_facts, rmp_facts)
 
                 # Second status covers the answer-generation wait (the biggest
                 # gap). If nothing was retrieved, "Reading sources…" would be
@@ -162,7 +170,7 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                 yield f"event: status\ndata: {json.dumps('Reading through sources…' if has_context else 'Thinking…')}\n\n"
 
                 # Emit sources first so the UI can render them immediately.
-                sources = bot.format_sources(chunks, graph_facts, banner_facts)
+                sources = bot.format_sources(chunks, graph_facts, banner_facts, rmp_facts)
                 yield f"event: sources\ndata: {json.dumps(sources)}\n\n"
                 for text in bot.answer_stream(question, context, req.history):
                     yield f"event: token\ndata: {json.dumps(text)}\n\n"

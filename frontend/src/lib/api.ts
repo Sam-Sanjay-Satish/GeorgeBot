@@ -30,6 +30,7 @@ const SOURCE_MAP: Record<string, Source['source']> = {
   heat: 'heat',
   kuali: 'kuali',
   banner: 'banner',
+  rmp: 'rmp',
 }
 
 function titleFromUrl(url: string): string {
