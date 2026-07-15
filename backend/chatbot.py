@@ -391,19 +391,65 @@ class GeorgeBot:
             facts["prereq_satisfied"] = self.gs.prereq_satisfied(code, completed)
         return facts
 
+    @staticmethod
+    def _rank_program_matches(query: str, matches: list[dict]) -> list[dict]:
+        """Rank candidate programs by how specifically `query` points at each.
+
+        `search_programs` already guarantees every candidate contains all of
+        the query's tokens, so the differentiator isn't *whether* the query
+        matches but how much *extra* each candidate carries beyond what the
+        user actually typed: the candidate with the fewest surplus tokens is
+        the closest fit to the user's words. e.g. for "computer science
+        honours", the standalone "Computer Science / Bachelor of Science -
+        Honours" adds only {bachelor, of}, while "Computer Science and
+        Mathematics / Combined Honours" also drags in {and, mathematics,
+        combined} — so the standalone program ranks first.
+
+        Returns `matches` sorted best-first, each annotated with `_extra`
+        (surplus-token count; lower = closer) and `_size` (tie-break: prefer
+        the more specific / smaller candidate).
+        """
+        def toks(s: str) -> set:
+            return set(re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).split())
+        qt = toks(query)
+        ranked = []
+        for m in matches:
+            ct = toks(f"{m['title']} {m['code']} {m.get('credential') or ''}")
+            ranked.append({**m, "_extra": len(ct - qt), "_size": len(ct)})
+        ranked.sort(key=lambda m: (m["_extra"], m["_size"]))
+        return ranked
+
     def _program_facts(self, query: str, completed: list[str]) -> dict:
         matches = self.gs.search_programs(query)
         if not matches:
             return {"query": query, "matches": []}
+        auto_alternatives = None
         if len(matches) > 1:
-            return {"query": query, "matches": matches, "ambiguous": True}
-        m = matches[0]
+            ranked = self._rank_program_matches(query, matches)
+            best, runner_up = ranked[0], ranked[1]
+            # Auto-pick only when the query clearly favours one program. A
+            # genuine tie — e.g. a bare "computer science", where Major /
+            # Honours / Minor are equally close — still asks the user rather
+            # than silently guessing a wrong-but-plausible requirements list.
+            if (best["_extra"], best["_size"]) == (runner_up["_extra"], runner_up["_size"]):
+                return {"query": query, "matches": matches, "ambiguous": True}
+            m = best
+            # Surface the close-but-not-chosen options so the model can say
+            # "assuming you mean X" and let the user correct course.
+            auto_alternatives = [
+                {"title": r["title"], "code": r["code"], "credential": r.get("credential")}
+                for r in ranked[1:]
+            ]
+        else:
+            m = matches[0]
         prog = self.gs.get_program(m["pid"])
         groups = self.gs.program_requirement_groups(m["pid"])
         specs = self.gs.program_specializations(m["pid"])
         result = {
             "query": query,
             "matches": matches,
+            "auto_selected": auto_alternatives is not None,
+            "alternatives": auto_alternatives or [],
             "program": {
                 "code": prog.get("code"),
                 "title": prog.get("title"),
@@ -513,6 +559,15 @@ class GeorgeBot:
                     f"{p.get('title', '')} — {p.get('credential', '')} ({p.get('total_units', '?')} units)",
                     f"Description: {p.get('description', '')}",
                 ]
+                if program.get("auto_selected"):
+                    alts = "; ".join(f"{a['title']} ({a.get('credential', '')})"
+                                      for a in program.get("alternatives", []))
+                    lines.append(
+                        f"NOTE: the user's request \"{program['query']}\" matched several "
+                        f"programs; this is the closest one and was auto-selected. Briefly "
+                        f"state which program you're assuming, and mention they can ask about "
+                        f"another if this isn't it. Other close matches: {alts}"
+                    )
                 if program.get("requirements_remaining") is not None:
                     lines.append(f"Given completed courses [{', '.join(program['completed_given'])}], "
                                   f"outstanding requirements by group:")

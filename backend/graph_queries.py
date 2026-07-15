@@ -26,6 +26,7 @@ import json
 import os
 import pathlib
 import pickle
+import re
 
 import networkx as nx
 
@@ -465,7 +466,14 @@ class GraphStore:
         Returns a list of {"pid", "code", "title", "credential"} dicts, sorted by
         title then code. Empty list if nothing matches or `query` is blank.
         """
-        tokens = (query or "").strip().lower().split()
+        # Normalize punctuation to spaces on both sides so tokens don't get
+        # glued to parens/hyphens: a query like "Computer Science (Bachelor of
+        # Science - Honours)" (exactly what this method's own callers display
+        # back to the user) would otherwise produce tokens "(bachelor" and
+        # "honours)" that never substring-match the un-parenthesized haystack.
+        def _norm(s: str) -> str:
+            return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+        tokens = _norm(query).split()
         if not tokens:
             return []
         matches = []
@@ -475,7 +483,7 @@ class GraphStore:
             title = d.get("title") or ""
             code = d.get("code") or ""
             credential = d.get("credential") or ""
-            haystack = f"{title} {code} {credential}".lower()
+            haystack = _norm(f"{title} {code} {credential}")
             if all(tok in haystack for tok in tokens):
                 matches.append({
                     "pid": pid,
