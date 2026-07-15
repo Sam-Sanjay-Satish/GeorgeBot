@@ -147,6 +147,25 @@ def _wta_percent(node: dict) -> int | None:
     return round(pct)
 
 
+def _matched_entry(name: str, node: dict) -> dict:
+    """Build a matched (matched=True) professor entry — summary + reviews — from a
+    single resolved teacher node."""
+    num = node.get("numRatings") or 0
+    return {
+        "query": name,
+        "name": _full_name(node),
+        "matched": True,
+        "candidates": [],
+        "rating": node.get("avgRating") if num else None,
+        "difficulty": node.get("avgDifficulty") if num else None,
+        "would_take_again": _wta_percent(node) if num else None,
+        "num_ratings": num,
+        "department": node.get("department"),
+        "legacy_id": node.get("legacyId"),
+        "reviews": _fetch_reviews(node["id"]) if num else [],
+    }
+
+
 def _professor_entry(name: str) -> dict:
     """Resolve one queried name to a professor entry (cached by name).
 
@@ -154,6 +173,13 @@ def _professor_entry(name: str) -> dict:
       - exactly one distinct teacher matched -> full summary + reviews (matched=True)
       - several matched (common surname)      -> candidates listed, no reviews
       - none matched                          -> matched=False, empty candidates
+
+    Exact-name short-circuit: RMP's teacher search is fuzzy on *every* name token,
+    so a full-name query like "Anthony Estey" also drags back every other "Anthony"
+    at the school, which would otherwise trip the >1-candidate ambiguity path even
+    though the queried person is unambiguously in the results. If exactly one
+    candidate's full name equals the query (case-insensitive), resolve to that
+    person instead of asking to disambiguate.
     """
     key = name.strip().lower()
     with _lock:
@@ -167,28 +193,19 @@ def _professor_entry(name: str) -> dict:
     for node in nodes:
         by_name.setdefault(_full_name(node), node)
 
+    # Prefer an exact full-name hit before falling back to the ambiguity heuristic.
+    exact = [nd for nm, nd in by_name.items() if nm.lower() == key]
+
     if not by_name:
         entry = {"query": name, "name": None, "matched": False, "candidates": []}
+    elif len(exact) == 1:
+        entry = _matched_entry(name, exact[0])
     elif len(by_name) > 1:
         candidates = [f"{nm} ({nd.get('department') or 'Unknown dept'})"
                       for nm, nd in by_name.items()]
         entry = {"query": name, "name": None, "matched": False, "candidates": candidates}
     else:
-        node = next(iter(by_name.values()))
-        num = node.get("numRatings") or 0
-        entry = {
-            "query": name,
-            "name": _full_name(node),
-            "matched": True,
-            "candidates": [],
-            "rating": node.get("avgRating") if num else None,
-            "difficulty": node.get("avgDifficulty") if num else None,
-            "would_take_again": _wta_percent(node) if num else None,
-            "num_ratings": num,
-            "department": node.get("department"),
-            "legacy_id": node.get("legacyId"),
-            "reviews": _fetch_reviews(node["id"]) if num else [],
-        }
+        entry = _matched_entry(name, next(iter(by_name.values())))
 
     with _lock:
         _rmp_cache[key] = (time.monotonic(), entry)
