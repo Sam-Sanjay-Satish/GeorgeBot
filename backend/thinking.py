@@ -525,7 +525,11 @@ class ExtendedThinking:
             "conversation whether the student has said something indicating "
             "they meet it, said something indicating they do NOT meet it, or "
             "never addressed it at all. Only count an explicit statement — "
-            "don't guess or assume.\n\n"
+            "don't guess or assume. A requirement phrased with \"OR\" is a "
+            "single requirement satisfied by meeting ANY ONE of its listed "
+            "alternatives — mark it satisfied if the student's statements "
+            "cover at least one alternative, even if the others were never "
+            "addressed.\n\n"
             + "\n".join(f'- "{r}"' for r in req_list) +
             '\n\nReturn ONLY JSON: {"results":[{"requirement":"<exact text '
             'above>","status":"satisfied|not_satisfied|unknown"}]}',

@@ -92,6 +92,26 @@ def _describe_non_course(node: dict) -> dict:
     return {"type": t, "raw": node}
 
 
+def _group_or_options(branch_lists: list[list[dict]]) -> dict | None:
+    """Given the non-course-requirement lists produced by each branch of an
+    `any` (OR) node, return one grouped "any_of" requirement describing them
+    as alternatives — but only when every branch reduces cleanly to exactly
+    one requirement (the common "Declared X" OR "Declared Y" shape, e.g.
+    CSC499's "declared Honours in CS" OR "declared Combined Honours...").
+
+    Returns None when branches don't reduce this cleanly (a branch mixes
+    multiple non-course requirements, or there's only one branch) — callers
+    fall back to their pre-existing flattening behavior in that case, same
+    as before this function existed. That fallback is still imprecise for
+    those messier trees, but no worse than it was previously.
+    """
+    if len(branch_lists) < 2 or not all(len(b) == 1 for b in branch_lists):
+        return None
+    options = [b[0] for b in branch_lists]
+    desc = " OR ".join(o.get("description") or o.get("type") or "requirement" for o in options)
+    return {"type": "any_of", "description": desc, "options": options}
+
+
 def _tree_course_titles(node: dict, out: dict) -> None:
     """Collect {code: title} for every course node in a requirement tree."""
     if not isinstance(node, dict):
@@ -194,18 +214,22 @@ def _eval_prereq_tree(node: dict, completed: set, titles: dict) -> tuple:
         n = node.get("n", 1)
         sat_count = 0
         unsat_codes: list = []   # flat leaf codes from all unsatisfied branches
-        unsat_unknowns: list = []
+        unsat_unknowns: list = []   # unknowns from branches that ALSO have a missing course
+        pure_non_course_branches: list[list[dict]] = []  # branches with unknowns and NO course leaf
         for item in items:
             m, u = _eval_prereq_tree(item, completed, titles)
             if not m and not u:
                 sat_count += 1
-            else:
-                # Flatten: collect all leaf codes from this unsatisfied branch
-                branch_codes: set = set()
-                _collect_course_codes_from_tree(item, branch_codes)
-                for code in sorted(branch_codes - completed):
+                continue
+            branch_codes: set = set()
+            _collect_course_codes_from_tree(item, branch_codes)
+            missing_codes = sorted(branch_codes - completed)
+            if missing_codes:
+                for code in missing_codes:
                     unsat_codes.append({"code": code, "title": titles.get(code, "")})
                 unsat_unknowns.extend(u)
+            elif u:
+                pure_non_course_branches.append(u)
         if sat_count >= n:
             return [], []
         still_need = n - sat_count
@@ -213,7 +237,16 @@ def _eval_prereq_tree(node: dict, completed: set, titles: dict) -> tuple:
             if still_need == 1 and len(unsat_codes) == 1:
                 return unsat_codes, []
             return [{"one_of": still_need, "options": unsat_codes}], []
-        return [], unsat_unknowns
+        # No course-leaf alternative anywhere in this OR-group — if there are
+        # 2+ purely-non-course branches, they're alternatives (e.g. "declared
+        # Honours in CS" OR "declared Combined Honours...") and must be
+        # represented as ONE satisfy-any-one-of requirement, not flattened
+        # into an implied AND (real incident: CSC499 was wrongly treated as
+        # requiring BOTH declarations simultaneously).
+        grouped = _group_or_options(pure_non_course_branches)
+        if grouped:
+            return [], [grouped]
+        return [], [opt for branch in pure_non_course_branches for opt in branch]
 
     return [], [{"type": t, "raw": node}]
 
@@ -233,6 +266,24 @@ def _collect_non_course_reqs(node: dict, out: list) -> None:
     if t == "gpa_grade":
         codes = [i.get("code", "") for i in (node.get("items") or []) if i.get("type") == "course"]
         out.append({"type": "gpa_grade", "description": f"Min GPA {node.get('min_gpa')} in one of: {', '.join(codes)}"})
+        return
+    if t == "any":
+        # An OR-group: recurse per branch so alternative non-course
+        # requirements (e.g. "declared Honours" OR "declared Combined
+        # Honours") can be grouped instead of silently flattened into an
+        # implied AND — same bug/fix as _eval_prereq_tree's "any" handling.
+        branch_lists: list[list[dict]] = []
+        for item in (node.get("items") or []):
+            branch_out: list = []
+            _collect_non_course_reqs(item, branch_out)
+            if branch_out:
+                branch_lists.append(branch_out)
+        grouped = _group_or_options(branch_lists)
+        if grouped:
+            out.append(grouped)
+        else:
+            for b in branch_lists:
+                out.extend(b)
         return
     for item in (node.get("items") or []):
         _collect_non_course_reqs(item, out)
