@@ -29,4 +29,9 @@ export interface Message {
   // Transient pre-answer phase text (e.g. "Looking up CSC 225…"), shown only
   // while `loading` and cleared once answer tokens begin.
   status?: string
+  // Which extended-thinking plan produced this answer (e.g. "Course Planner",
+  // "Deep Research", "Guidance") — set from the "mode" SSE event, arrives
+  // before any tokens, and persists on the finished message. Undefined for
+  // ordinary single-pass ("quick"/simple) answers.
+  mode?: string
 }

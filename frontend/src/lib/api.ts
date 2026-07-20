@@ -116,13 +116,17 @@ interface StreamHandlers {
   // of answering. Terminal for this turn — the user's reply comes back as an
   // ordinary next question carrying prior history.
   onClarify?: (text: string) => void
+  // "default" mode only: fires once, before any status/token, when the
+  // planner dispatched into an extended-thinking plan — the plan's display
+  // label (e.g. "Course Planner"). Absent entirely for ordinary answers.
+  onMode?: (label: string) => void
 }
 
 // POST + manually parsed SSE — EventSource doesn't support POST bodies, so we
 // read the fetch response stream directly and split on the "event:\ndata:\n\n"
 // frame format the backend (/api/chat/stream) emits. Events: status (pre-answer
-// phase text), sources, token, done, error, and — in "default" mode's
-// course-planning/situational plans — clarify.
+// phase text), sources, token, done, error, and — in "default" mode's three
+// extended-thinking plans — mode (plan label, fires first) and clarify.
 export async function askGeorgeStream(
   question: string,
   priorMessages: Message[],
@@ -167,7 +171,9 @@ export async function askGeorgeStream(
 
       try {
         const data = JSON.parse(rawData)
-        if (event === 'status') {
+        if (event === 'mode') {
+          handlers.onMode?.(data as string)
+        } else if (event === 'status') {
           handlers.onStatus(data as string)
         } else if (event === 'sources') {
           handlers.onSources((data as ApiSource[]).map(mapSource))

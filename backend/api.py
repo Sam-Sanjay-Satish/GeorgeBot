@@ -13,9 +13,12 @@ HTTP API:
   GET  /health
   POST /api/chat          {question, history?}  -> {answer, sources, ...}  (JSON)
   POST /api/chat/stream   {question, history?}  -> text/event-stream (SSE)
-                          SSE events: status, sources, token, done, error
+                          SSE events: mode, status, sources, token, done, error
                           ("status" fires before tokens with a short, templated
-                          phase message, e.g. "Looking up CSC 225…")
+                          phase message, e.g. "Looking up CSC 225…"; "mode"
+                          fires first, only in mode="default" when an
+                          extended-thinking plan is dispatched — see
+                          thinking.PLAN_LABELS)
 
 Env (.env): MINIMAX_SUB_KEY, VOYAGE_API_KEY
 """
@@ -34,7 +37,7 @@ from chatbot import DEFAULT_AUDIENCE, MAX_VERIFY_ROUNDS, VALID_AUDIENCES, George
 from thinking import ExtendedThinking
 
 VALID_MODES = ("quick", "default")
-DEFAULT_MODE = "quick"
+DEFAULT_MODE = "default"
 
 
 class ChatRequest(BaseModel):
@@ -103,6 +106,7 @@ def _drain_events(events) -> dict:
     answer_parts: list[str] = []
     sources: list[dict] = []
     needs_clarification = False
+    mode_label = None
     error = None
     for ev in events:
         etype, data = ev.get("type"), ev.get("data")
@@ -113,6 +117,8 @@ def _drain_events(events) -> dict:
         elif etype == "clarify":
             answer_parts = [data]
             needs_clarification = True
+        elif etype == "mode":
+            mode_label = data
         elif etype == "error":
             error = data
     if error is not None:
@@ -121,6 +127,8 @@ def _drain_events(events) -> dict:
               "n_chunks": len(sources)}
     if needs_clarification:
         result["needs_clarification"] = True
+    if mode_label:
+        result["mode_label"] = mode_label
     return result
 
 

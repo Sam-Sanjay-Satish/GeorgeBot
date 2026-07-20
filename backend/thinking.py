@@ -32,6 +32,7 @@ differentiated only by prompt. Retrieval reuses `bot.vector_retrieve` /
 `bot.answer_stream(..., system_prompt=<mode prompt>)`.
 
 `run()` yields event dicts the API layer maps straight to SSE frames:
+    {"type": "mode",    "data": "<plan label, e.g. 'Course Planner'>"}  # first event, always
     {"type": "status",  "data": "<phase text>"}
     {"type": "clarify", "data": "<question to the user>"}   # terminal — no answer
     {"type": "sources", "data": [<source dict>, ...]}
@@ -62,6 +63,14 @@ SCATTERED_QUERY_N = 4          # chunks pulled per sub-query (matches N_CONTEXT)
 # course_planning: cap how many eligible courses we throw at Banner in one batch
 # (a huge remaining-requirements list would be a slow, pointless fan-out).
 PLANNING_MAX_ELIGIBLE = 18
+
+# Short, user-facing labels for each plan — emitted as a "mode" event so the
+# frontend can tag which pipeline produced an answer.
+PLAN_LABELS: dict[str, str] = {
+    "scattered_info": "Deep Research",
+    "course_planning": "Course Planner",
+    "situational": "Guidance",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +170,12 @@ def _planning_system_prompt(base: str) -> str:
     return base + (
         "\n\nYou are helping a student plan their courses. The reference material "
         "includes computed schedule options (conflict-free combinations of live "
-        "sections) and live Banner availability. When you present options:\n"
+        "sections) and live Banner availability, or — when no schedule could be "
+        "computed — the program's actual remaining requirement groups. Only name "
+        "requirement group labels, courses, or program structure that literally "
+        "appear in the reference material; if it doesn't cover something (e.g. "
+        "why a course isn't eligible yet), say that plainly instead of guessing "
+        "at program structure. When you present options:\n"
         "- Show 2-3 concrete schedule options with course codes, section codes "
         "(e.g. A01), and meeting days/times; name the term.\n"
         "- These are LECTURE sections — remind the student to add any required "
@@ -265,6 +279,7 @@ class ExtendedThinking:
                 plan = DEFAULT_PLAN
 
             log.update(mode_classified=plan, router_confidence=confidence)
+            yield {"type": "mode", "data": PLAN_LABELS[plan]}
 
             if plan == "course_planning":
                 yield from self._run_planning(question, history, audience, log)
@@ -472,6 +487,70 @@ class ExtendedThinking:
             },
         }
 
+    def _resolve_non_course_requirements(
+        self, blocked: dict[str, list[dict]], history: list[dict],
+    ) -> tuple[list[str], list[str], dict[str, str]]:
+        """Resolve non-course requirements (year standing, declared program,
+        GPA, permission, AWR, units-from-list, ...) that `prereq_satisfied`
+        can't evaluate itself, by inferring from the conversation whether the
+        student has said something indicating they meet each one.
+
+        `blocked` — {course_code: [unknown_requirement, ...]} for candidate
+        courses whose only remaining gap is non-course (course prereqs already
+        satisfied).
+
+        Returns:
+          resolved   — course codes where every non-course requirement was
+                      inferred satisfied from history -> eligible.
+          unresolved — distinct requirement descriptions never addressed in
+                      the conversation -> the caller should ask the user.
+          notes      — {course_code: reason} for courses where history
+                      indicates a requirement is NOT met -> excluded, but
+                      surfaced with an explanation rather than silently
+                      dropped.
+        """
+        by_key: dict[tuple, str] = {}
+        for reqs in blocked.values():
+            for r in reqs:
+                desc = r.get("description") or r.get("type") or "requirement"
+                by_key[(r.get("type"), desc)] = desc
+        if not by_key:
+            return list(blocked.keys()), [], {}
+
+        req_list = list(by_key.values())
+        verdict = self._json_llm(
+            f"{self._history_text(history)}"
+            "A UVic student is asking about course eligibility. For EACH of the "
+            "following program/course requirements, decide from the "
+            "conversation whether the student has said something indicating "
+            "they meet it, said something indicating they do NOT meet it, or "
+            "never addressed it at all. Only count an explicit statement — "
+            "don't guess or assume.\n\n"
+            + "\n".join(f'- "{r}"' for r in req_list) +
+            '\n\nReturn ONLY JSON: {"results":[{"requirement":"<exact text '
+            'above>","status":"satisfied|not_satisfied|unknown"}]}',
+            thinking="disabled", max_tokens=1000,
+        ) or {}
+        status_by_desc = {v.get("requirement"): v.get("status")
+                          for v in (verdict.get("results") or [])}
+
+        resolved: list[str] = []
+        unresolved: set[str] = set()
+        notes: dict[str, str] = {}
+        for code, reqs in blocked.items():
+            descs = [r.get("description") or r.get("type") or "requirement" for r in reqs]
+            statuses = [status_by_desc.get(d, "unknown") for d in descs]
+            if all(s == "satisfied" for s in statuses):
+                resolved.append(code)
+            elif any(s == "not_satisfied" for s in statuses):
+                failed = [d for d, s in zip(descs, statuses) if s == "not_satisfied"]
+                notes[code] = "requires " + "; ".join(failed) + ", which you don't meet"
+            else:
+                for d, s in zip(descs, statuses):
+                    if s != "satisfied":
+                        unresolved.add(d)
+        return resolved, sorted(unresolved), notes
+
     def _run_planning(self, question: str, history: list[dict], audience: str,
                       log: dict):
         yield {"type": "status", "data": "Working out your course options…"}
@@ -533,24 +612,53 @@ class ExtendedThinking:
                 if code not in seen:
                     seen.add(code)
                     candidate_codes.append(code)
-        # Keep only courses whose prerequisites are satisfied by what's completed.
+        # Keep courses whose COURSE prerequisites are satisfied by `completed`.
+        # Non-course requirements (year standing, declared program, GPA,
+        # permission, ...) are NOT auto-excluded here — they can't be read off
+        # the completed-courses list, so they're resolved separately below by
+        # inferring from the conversation, or asking, rather than silently
+        # dropping the course.
         eligible: list[str] = []
+        non_course_blocked: dict[str, list[dict]] = {}
         for code in candidate_codes:
             try:
-                if self.bot.gs.prereq_satisfied(code, completed).get("satisfied"):
-                    eligible.append(code)
+                result = self.bot.gs.prereq_satisfied(code, completed)
             except Exception:
                 continue
+            if result.get("missing"):
+                continue  # real course prereqs unmet -> not eligible, unambiguous
+            unknowns = result.get("unknown_requirements") or []
+            if unknowns:
+                non_course_blocked[code] = unknowns
+            else:
+                eligible.append(code)
+
+        non_course_notes: dict[str, str] = {}
+        if non_course_blocked:
+            resolved_codes, unresolved_reqs, non_course_notes = \
+                self._resolve_non_course_requirements(non_course_blocked, history)
+            eligible.extend(resolved_codes)
+            if unresolved_reqs:
+                log["termination_reason"] = "clarify_pending"
+                log["unresolved_non_course_reqs"] = unresolved_reqs
+                yield {"type": "clarify",
+                       "data": ("A few of your remaining courses depend on things "
+                                "I can't tell from our conversation — do you meet "
+                                "these: " + "; ".join(unresolved_reqs) + "?")}
+                return
+
         eligible = eligible[:PLANNING_MAX_ELIGIBLE]
         log["n_remaining_groups"] = len(remaining_groups)
         log["n_eligible"] = len(eligible)
+        log["n_non_course_resolved"] = len(non_course_blocked) - len(non_course_notes)
+        log["n_non_course_contradicted"] = len(non_course_notes)
 
         if not eligible:
             log["termination_reason"] = "enumeration_complete"
-            context = ("No outstanding courses with satisfied prerequisites were "
-                       "found for this program given the completed courses. The "
-                       "student may have finished the enumerable requirements, or "
-                       "the remaining ones are non-course requirements.")
+            blocked = {c: "prerequisites not yet met with your completed courses"
+                      for c in candidate_codes if c not in eligible and c not in non_course_notes}
+            blocked.update(non_course_notes)
+            context = _render_remaining_groups(remaining_groups, blocked)
             sources = self.bot.format_sources([], {}, {}, {})
             yield from self._stream_answer(
                 question, context, history, sources,
@@ -618,6 +726,10 @@ class ExtendedThinking:
                         "requirements (year standing / GPA / permission) that a "
                         "course list can't verify: " + "; ".join(g or "(unlabeled)"
                                                                  for g in non_course) + ".")
+        if non_course_notes:
+            gaps.append("Not included in the schedule options because you haven't "
+                        "confirmed you meet their requirements: " + "; ".join(
+                            f"{c} ({note})" for c, note in non_course_notes.items()) + ".")
         gap_text = ("\n\nPLANNING NOTES:\n- " + "\n- ".join(gaps)) if gaps else ""
         context = f"{sched_text}{gap_text}\n\n{banner_context}".strip()
 
@@ -715,6 +827,41 @@ def _coerce_year(value) -> int | None:
 
 def _hhmm(t: str | None) -> str:
     return f"{t[:2]}:{t[2:]}" if t and len(t) == 4 else "?"
+
+
+def _render_remaining_groups(remaining_groups: list[dict],
+                             blocked: dict[str, str] | None = None) -> str:
+    """Render `GraphStore.requirements_remaining` output into a plain-text
+    block for the answer model. Used on the no-eligible-courses path, where
+    there is no solver output to narrate — without this, the model was left
+    with only a one-line status sentence and no grounded requirement detail,
+    and would fabricate plausible-looking group labels/courses to fill the
+    gap (real incident: invented "Year 4 (CSC)" / "Honours project" style
+    groups for a program whose actual remaining groups were never shown to
+    it). This is the actual program structure, so it's the only thing the
+    model should describe.
+    """
+    if not remaining_groups:
+        return ("PROGRAM REQUIREMENTS: No outstanding requirement groups were "
+                "found for this program given the completed courses — the "
+                "student may have finished the enumerable requirements.")
+    lines = ["PROGRAM REQUIREMENTS REMAINING (from the official program "
+             "structure — this is the ONLY source of group/requirement "
+             "detail; do not invent, rename, or assume any group, label, or "
+             "course beyond what's listed here):"]
+    for grp in remaining_groups:
+        label = grp.get("label") or "(unlabeled group)"
+        remaining = grp.get("remaining") or []
+        lines.append(f"\n{label}:")
+        if remaining:
+            for code in remaining:
+                note = f" — {blocked[code]}" if blocked and code in blocked else ""
+                lines.append(f"  - {code}{note}")
+        if grp.get("has_non_course_reqs"):
+            lines.append("  - (plus non-course requirements in this group: year "
+                         "standing / GPA / permission / units-from-list — not "
+                         "verifiable from a course list)")
+    return "\n".join(lines)
 
 
 def _render_schedules(schedules: list[dict], term_label: str) -> str:

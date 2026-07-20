@@ -23,7 +23,7 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)
   const [audience, setAudience] = useState<Audience>('undergrad')
-  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>('quick')
+  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>('default')
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = localStorage.getItem('theme')
     if (saved === 'light' || saved === 'dark') return saved
@@ -136,6 +136,13 @@ export default function App() {
 
     try {
       await askGeorgeStream(text, priorMessages, audience, {
+        onMode: (mode) => {
+          // Fires once, before status/tokens — persists on the message
+          // (subsequent updates below all spread `...m`, so it survives).
+          setMessages((prev) =>
+            prev.map((m) => (m.id === loadingId ? { ...m, mode } : m))
+          )
+        },
         onStatus: (status) => {
           // Transient pre-answer phase line; overwritten by later status events
           // and cleared once the first token arrives (see onToken).
