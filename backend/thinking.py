@@ -494,7 +494,12 @@ class ExtendedThinking:
                             + "; ".join(missing) + ".")}
             return
 
-        # Resolve program.
+        # Resolve program. Mirror chatbot.py's _program_facts: rank by surplus
+        # tokens and auto-pick a clear winner instead of asking on any raw
+        # multi-match — search_programs only guarantees token-subset
+        # containment, so e.g. "computer science honours" legitimately
+        # matches the standalone Honours program AND both combined-honours
+        # programs; ranking is what tells them apart.
         matches = self.bot.gs.search_programs(slots["program"])
         if not matches:
             log["termination_reason"] = "clarify_pending"
@@ -504,13 +509,17 @@ class ExtendedThinking:
                             f"the exact program/degree name?")}
             return
         if len(matches) > 1:
-            names = "; ".join(f"{m['title']} ({m.get('credential', '')})"
-                              for m in matches[:6])
-            log["termination_reason"] = "clarify_pending"
-            yield {"type": "clarify",
-                   "data": (f"A few programs match \"{slots['program']}\": {names}. "
-                            f"Which one?")}
-            return
+            ranked = self.bot._rank_program_matches(slots["program"], matches)
+            best, runner_up = ranked[0], ranked[1]
+            if (best["_extra"], best["_size"]) == (runner_up["_extra"], runner_up["_size"]):
+                names = "; ".join(f"{m['title']} ({m.get('credential', '')})"
+                                  for m in matches[:6])
+                log["termination_reason"] = "clarify_pending"
+                yield {"type": "clarify",
+                       "data": (f"A few programs match \"{slots['program']}\": {names}. "
+                                f"Which one?")}
+                return
+            matches = ranked
         pid = matches[0]["pid"]
         completed = slots["completed_courses"]
 

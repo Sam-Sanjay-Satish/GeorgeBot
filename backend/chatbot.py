@@ -161,6 +161,19 @@ MAX_CHUNK_DISTANCE = 0.75  # cosine distance cutoff (voyage-4-large) — chunks
                             # that class of case)
 MAX_HISTORY_TURNS = 6   # trailing conversation turns kept for context
 
+# Campus nickname glossary for the router's search_query rewrite. Interim
+# mitigation for ambiguous/colloquial place names whose reverse-HyDE question
+# set doesn't anchor on the bare nickname (e.g. corpus questions for the Cove
+# dining hall are phrased around "dining hall"/"Cheko'nien House", not "the
+# Cove" alone) — the router has no way to disambiguate a bare nickname
+# otherwise and guesses. Real fix is broader reverse-HyDE question coverage
+# in georgebot-pipeline; this only patches names we've actually seen fail.
+CAMPUS_TERM_GLOSSARY = {
+    "the cove": "The Cove dining hall, UVic's campus dining facility in "
+                 "Cheko'nien House (Student Housing and Dining) — not the "
+                 "UVic Cove child care centre.",
+}
+
 # Planner (rewrite_and_route, mode="default") mode-selection tuning.
 VALID_PLANS = ("scattered_info", "course_planning", "situational")
 DEFAULT_PLAN = "scattered_info"
@@ -841,11 +854,26 @@ class GeorgeBot:
                 f"true).\n"
             )
 
+        glossary_hits = {
+            term: meaning for term, meaning in CAMPUS_TERM_GLOSSARY.items()
+            if term in question.lower()
+        }
+        glossary_block = ""
+        if glossary_hits:
+            glossary_lines = "\n".join(f'  - "{t}": {m}' for t, m in glossary_hits.items())
+            glossary_block = (
+                f"\nCampus term glossary (use this to resolve ambiguous/"
+                f"colloquial names mentioned in the question — incorporate the "
+                f"real meaning into search_query instead of guessing):\n"
+                f"{glossary_lines}\n"
+            )
+
         prompt = (
             f"{convo}Today's date is {time.strftime('%Y-%m-%d')}.\n"
             f"You are the query router for a University of Victoria (UVic) "
             f"chatbot. Given the latest user question, produce a JSON object (and "
-            f"nothing else) with these fields:\n\n"
+            f"nothing else) with these fields:\n"
+            f"{glossary_block}\n"
             f'  "search_query": a single standalone search query for a document '
             f"knowledge base — resolve pronouns/references using the conversation, "
             f"keep course codes/program names/proper nouns.\n"
