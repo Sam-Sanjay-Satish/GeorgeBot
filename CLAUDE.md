@@ -181,15 +181,20 @@ reading this first:
 ```
 
 `backend/graph_queries.py` is a **copy**, not a symlink, of
-`georgebot-pipeline`'s `course_graph/graph_queries.py`, patched two ways:
+`georgebot-pipeline`'s `course_graph/graph_queries.py`, patched three ways:
 (1) paths use this repo's env-var scheme (`GRAPH_DATA_DIR`/`DATA_DIR`/
 `./graph_data`) instead of the pipeline's `config.*`; (2) the outline loader
 reads v2.2's **`heat_outlines.json`** — a flat `{code: {course, term, url,
 text}}` dict, HEAT-only (eng/CS courses; others have no outline) — instead of
-the old list-shaped `course_outlines_final.json`. The **accessor API is
-identical** to the pipeline's (all 19 `GraphStore` methods). If the pipeline
-version changes, re-copy and re-apply those two patches (diff first — they
-drift if edited independently). The outline record shape is also read directly
+the old list-shaped `course_outlines_final.json`; (3) `search_programs()`
+normalizes punctuation to spaces before token-matching (see the program-query
+section below) — without it, a query carrying parens/hyphens (e.g. the exact
+credential string the disambiguation flow displays back) matches nothing. The
+**accessor API is identical** to the pipeline's (all 19 `GraphStore` methods).
+This patch (3) lives **only here** — it was deliberately not back-ported to the
+pipeline (that repo is dormant for now); if the pipeline is ever revived and
+re-copied, re-apply all three patches (diff first — they drift if edited
+independently). The outline record shape is also read directly
 in `chatbot.py` (`_graph_context_text`, `format_sources`) — `term`/`text`/
 `url`, no nested `metadata`.
 
@@ -396,11 +401,28 @@ Only runs when `course_codes` or `program_query` is non-empty.
   deps beyond the direct prereqs), and — if `wants_outline` — `get_outline()`
   (truncated to 4000 chars, tagged HISTORICAL with its term).
 - **Program query:** `_program_facts()` calls `search_programs()` (fuzzy,
-  token-based, can return multiple candidates). If ambiguous, the context
-  block lists all candidates and the system prompt tells the model to ask
-  the user to disambiguate. If exactly one match, pulls `get_program()` +
-  `program_requirement_groups()` + `program_specializations()` +
-  `program_courses()` (flat list of every course the program references,
+  token-based, can return multiple candidates). `search_programs()` normalizes
+  punctuation to spaces on both the query and the candidate "title code
+  credential" haystack before token-matching, so parens/hyphens don't glue
+  onto tokens — without this, the exact credential string the disambiguation
+  flow itself displays (`"Computer Science (Bachelor of Science - Honours)"`)
+  tokenizes to `(bachelor` / `honours)` and matches **nothing**, which is what
+  used to trap users in a disambiguation loop. **On multiple matches,
+  `_program_facts` auto-selects the closest** via `_rank_program_matches()`
+  rather than always asking: since every candidate already contains all the
+  query's tokens, it ranks by *surplus* tokens (the candidate adding the least
+  beyond what the user typed is the closest fit — e.g. "computer science
+  honours" → standalone Honours, which adds only `{bachelor, of}`, beats
+  Combined Honours, which also drags in `{and, mathematics, combined}`), tie-
+  breaking on candidate size. It only auto-picks a **clear** winner; a genuine
+  tie (bare `"computer science"`, where Major/Honours/Minor/General are equally
+  close) still falls back to `ambiguous: True` and asks — silently guessing
+  there would emit a real-but-wrong requirements list. When it does auto-pick,
+  the rendered block sets `auto_selected` + `alternatives`, and instructs the
+  answer model to state which program it assumed and note the user can ask
+  about another. If exactly one match (or a clear auto-pick), pulls
+  `get_program()` + `program_requirement_groups()` + `program_specializations()`
+  + `program_courses()` (flat list of every course the program references,
   capped at 60 in the rendered block).
 - These accessors run as a deterministic **bulk fetch** — the router names a
   course/program, the code pulls the full fact set; the LLM does not pick
