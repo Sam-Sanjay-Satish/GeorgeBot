@@ -2,13 +2,17 @@
 """
 Extended-thinking orchestrator for GeorgeBot.
 
-A second query path, parallel to the single-shot `GeorgeBot.ask()`/stream. When
-the user flips the "extended thinking" toggle, `api.py` calls
-`ExtendedThinking.run(...)` instead of the flat retrieve→answer pipeline.
+A second query path, parallel to the single-shot `GeorgeBot.ask()`/stream and
+to default mode's "simple" verify-then-answer path (see `chatbot.py`'s
+`answer_verified_stream`). `GeorgeBot.rewrite_and_route(..., mode="default")`
+(the "planner") decides per-query whether a question is simple or needs one
+of the three plans below; `api.py` calls `ExtendedThinking.run(...)` with that
+precomputed route/plan/confidence only for the not-simple case — no manual
+toggle. `run()` no longer classifies the query itself (that used to be this
+module's own `classify_mode`, now folded into the planner call).
 
-This is **not** one generic loop — it is a router that classifies the query into
-exactly one of three modes, each with its own plan structure, tool access, and
-termination logic (see the design doc):
+This is **not** one generic loop — each of the three plans below has its own
+structure, tool access, and termination logic (see the design doc):
 
   - scattered_info  — fuzzy, evaluator-driven multi-round retrieval (the only
                       mode that iterates). Decompose → multi-phrasing fan-out →
@@ -48,15 +52,8 @@ import sys
 import time
 
 from banner import banner_retrieve
+from chatbot import DEFAULT_PLAN, VALID_PLANS
 from scheduler import solve_schedule
-
-VALID_MODES = ("scattered_info", "course_planning", "situational")
-DEFAULT_MODE = "scattered_info"
-
-# Router confidence below this and the runner-up isn't obviously supported by
-# present slots → fall back to scattered_info (the most general mode). Tune
-# against the golden set (design §8).
-CONFIDENCE_THRESHOLD = 0.6
 
 # scattered_info fuzzy loop: initial round + up to (cap-1) gap-filling rounds.
 SCATTERED_MAX_ITERATIONS = 3
@@ -248,72 +245,33 @@ class ExtendedThinking:
             lines.append(f"{role}: {turn.get('content', '')}")
         return "Conversation so far:\n" + "\n".join(lines) + "\n\n"
 
-    # -- Stage R: mode router -------------------------------------------------
-
-    def classify_mode(self, question: str, history: list[dict]) -> dict:
-        """Pick one of the three modes. Cheap, thinking disabled. Defensive
-        fallback to scattered_info on any failure (design §1)."""
-        prompt = (
-            f"{self._history_text(history)}"
-            f"Today's date is {time.strftime('%Y-%m-%d')}.\n"
-            "You are the mode classifier for GeorgeBot's extended-thinking "
-            "pipeline. The user requested a deeper, multi-step answer. Classify "
-            "the latest question into EXACTLY ONE mode.\n\n"
-            "MODES:\n"
-            "- scattered_info: the answer needs information gathered across many "
-            "topics/documents, or several differently-worded searches to surface "
-            "content one phrasing would miss. Research-style, broad, or "
-            "compare/summarize-across-X questions. This is the DEFAULT when "
-            "unsure.\n"
-            "- course_planning: the student wants help choosing what courses to "
-            "take (next term or to finish their degree), based on completed "
-            "courses, program, and preferences. Involves eligibility + live "
-            "section timing.\n"
-            "- situational: the student is in a specific procedural/policy "
-            "situation (academic-integrity allegation, financial hold, medical/"
-            "compassionate withdrawal, academic standing/probation, grade appeal, "
-            "admission/registration issue) and needs to know what it means and "
-            "what to do.\n\n"
-            f"Latest question: {question}\n\n"
-            'Return ONLY JSON: {"mode": "scattered_info"|"course_planning"|'
-            '"situational", "confidence": 0.0-1.0, "rationale": "<one sentence>"}'
-        )
-        data = self._json_llm(prompt, thinking="disabled", max_tokens=400) or {}
-        mode = data.get("mode")
-        if mode not in VALID_MODES:
-            mode = DEFAULT_MODE
-        try:
-            confidence = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
-        except (TypeError, ValueError):
-            confidence = 0.0
-        return {"mode": mode, "confidence": confidence,
-                "rationale": str(data.get("rationale", ""))[:300]}
-
     # -- Public entry ---------------------------------------------------------
 
-    def run(self, question: str, history: list[dict], audience: str):
-        """Classify + dispatch. Yields event dicts (see module docstring)."""
+    def run(self, question: str, history: list[dict], audience: str,
+            route: dict, plan: str, confidence: float):
+        """Dispatch into one of the three plans. Yields event dicts (see module
+        docstring). `route`/`plan`/`confidence` come from
+        `GeorgeBot.rewrite_and_route(..., mode="default")` — the planner
+        already classified the query and applied the confidence downgrade, so
+        this no longer classifies anything itself (that used to be this
+        module's own `classify_mode`)."""
         log: dict = {"question": question, "audience": audience,
                      "t_start": time.monotonic()}
         try:
-            routed = self.classify_mode(question, history)
-            mode, confidence = routed["mode"], routed["confidence"]
+            # Defensive guard in case an invalid plan value ever reaches here
+            # (e.g. a future caller bypassing the planner) — mirrors the
+            # planner's own fallback.
+            if plan not in VALID_PLANS:
+                plan = DEFAULT_PLAN
 
-            # Low-confidence handling (design §1, option A + nuance): default to
-            # scattered_info unless a planning/situational read is confident.
-            if confidence < CONFIDENCE_THRESHOLD and mode != DEFAULT_MODE:
-                log["router_downgraded_from"] = mode
-                mode = DEFAULT_MODE
+            log.update(mode_classified=plan, router_confidence=confidence)
 
-            log.update(mode_classified=mode, router_confidence=confidence,
-                       router_rationale=routed["rationale"])
-
-            if mode == "course_planning":
+            if plan == "course_planning":
                 yield from self._run_planning(question, history, audience, log)
-            elif mode == "situational":
+            elif plan == "situational":
                 yield from self._run_situational(question, history, audience, log)
             else:
-                yield from self._run_scattered(question, history, audience, log)
+                yield from self._run_scattered(question, history, audience, log, route)
         except Exception as e:  # never let the extended path hard-fail the request
             print(f"  [thinking.run] error: {e}", file=sys.stderr)
             yield {"type": "error", "data": str(e)}
@@ -340,12 +298,12 @@ class ExtendedThinking:
     # ------------------------------------------------------------------
 
     def _run_scattered(self, question: str, history: list[dict], audience: str,
-                       log: dict):
+                       log: dict, route: dict):
         yield {"type": "status", "data": "Breaking the question into parts…"}
 
-        # Seed the graph arm + filters from the existing router (course codes,
-        # program, topic families, department).
-        route = self.bot.rewrite_and_route(question, history, audience)
+        # `route` (course codes, program, topic families, department) is the
+        # planner's own rewrite/route output — computed once by the caller,
+        # not re-derived here.
 
         # Planner: decompose into info-needs, each with 1+ (multi-phrased) queries.
         plan = self._json_llm(

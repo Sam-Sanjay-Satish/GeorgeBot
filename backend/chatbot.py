@@ -37,6 +37,7 @@ Env (.env): MINIMAX_SUB_KEY, VOYAGE_API_KEY
 """
 
 import argparse
+import itertools
 import json
 import os
 import re
@@ -159,6 +160,17 @@ MAX_CHUNK_DISTANCE = 0.75  # cosine distance cutoff (voyage-4-large) — chunks
                             # the threshold — this narrows but doesn't eliminate
                             # that class of case)
 MAX_HISTORY_TURNS = 6   # trailing conversation turns kept for context
+
+# Planner (rewrite_and_route, mode="default") mode-selection tuning.
+VALID_PLANS = ("scattered_info", "course_planning", "situational")
+DEFAULT_PLAN = "scattered_info"
+# Router confidence below this on a non-default plan pick -> fall back to
+# scattered_info (the most general plan) rather than trust a shaky read.
+CONFIDENCE_THRESHOLD = 0.6
+
+# Default-mode "simple" path: combined verify-then-answer call, thinking
+# adaptive. Capped gated rounds before forcing a plain (no-verify) answer.
+MAX_VERIFY_ROUNDS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +780,7 @@ class GeorgeBot:
         return None
 
     def rewrite_and_route(self, question: str, history: list[dict],
-                          audience: str = DEFAULT_AUDIENCE) -> dict:
+                          audience: str = DEFAULT_AUDIENCE, mode: str = "quick") -> dict:
         """
         One minimax-m3 call: rewrite the question into a standalone search query
         AND classify whether it needs structured course/program facts (graph
@@ -777,6 +789,13 @@ class GeorgeBot:
         `audience` selects which topic-family vocabulary the router chooses from
         (undergrad / faculty / both) — it must match the collection(s) that
         vector_retrieve will search, or the predicted families won't filter.
+
+        `mode="default"` additionally asks the same call to decide whether the
+        question is simple (answerable in one pass) or needs one of the three
+        extended-thinking plans (scattered_info / course_planning / situational)
+        — this subsumes what used to be a separate `thinking.classify_mode`
+        call. `mode="quick"` (default) skips that extra prompt content
+        entirely, since quick mode never dispatches into a plan.
         """
         # Topic-family vocabulary the router may choose from for this audience.
         if audience == "both":
@@ -793,6 +812,34 @@ class GeorgeBot:
                 role = "User" if turn.get("role") == "user" else "Assistant"
                 lines.append(f"{role}: {turn.get('content', '')}")
             convo = "Conversation so far:\n" + "\n".join(lines) + "\n\n"
+
+        mode_fields = ""
+        if mode == "default":
+            mode_fields = (
+                f'  "is_simple": true if this question can be answered directly '
+                f"from one retrieval pass (a single lookup or fact, even if it "
+                f"needs graph/vector/live-data retrieval), false if it needs "
+                f"deeper multi-step handling. This is the DEFAULT (true) when "
+                f"unsure — only say false for a clear case below.\n"
+                f'  "plan": required (and must be one of the three values below) '
+                f'when is_simple is false, else null. Exactly one of:\n'
+                f"    - \"scattered_info\": the answer needs information gathered "
+                f"across many topics/documents, or several differently-worded "
+                f"searches to surface content one phrasing would miss. Research-"
+                f"style, broad, or compare/summarize-across-X questions.\n"
+                f"    - \"course_planning\": the student wants help choosing what "
+                f"courses to take (next term or to finish their degree), based on "
+                f"completed courses, program, and preferences. Involves "
+                f"eligibility + live section timing.\n"
+                f"    - \"situational\": the student is in a specific procedural/"
+                f"policy situation (academic-integrity allegation, financial "
+                f"hold, medical/compassionate withdrawal, academic standing/"
+                f"probation, grade appeal, admission/registration issue) and "
+                f"needs to know what it means and what to do.\n"
+                f'  "confidence": 0.0-1.0, how confident you are in the "plan" '
+                f"pick (0.0 and null is_simple=true is fine when is_simple is "
+                f"true).\n"
+            )
 
         prompt = (
             f"{convo}Today's date is {time.strftime('%Y-%m-%d')}.\n"
@@ -855,7 +902,8 @@ class GeorgeBot:
             f"named a program, or asked something specific to one department's "
             f"process) — null if the question is general/cross-departmental or "
             f"you're not confident which department applies:\n"
-            f"{json.dumps(self.departments)}\n\n"
+            f"{json.dumps(self.departments)}\n"
+            f"{mode_fields}\n"
             f"Populate course_codes whenever the question is actually ABOUT a "
             f"specific course — either its structured catalog facts (prerequisites, "
             f"credits, cross-listings, description, degree/program requirements, "
@@ -885,6 +933,23 @@ class GeorgeBot:
                 year = int(data["term_year"]) if data.get("term_year") else None
             except (TypeError, ValueError):
                 year = None
+            # Mode-selection fields — only asked for (and only meaningful) when
+            # mode="default"; quick mode gets the harmless defaults below.
+            is_simple, plan, confidence = True, None, 0.0
+            if mode == "default":
+                is_simple = bool(data.get("is_simple", True))
+                if not is_simple:
+                    plan = data.get("plan")
+                    if plan not in VALID_PLANS:
+                        plan = DEFAULT_PLAN
+                    try:
+                        confidence = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
+                    except (TypeError, ValueError):
+                        confidence = 0.0
+                    # Low-confidence non-default pick -> fall back to the most
+                    # general plan rather than trust a shaky read.
+                    if confidence < CONFIDENCE_THRESHOLD and plan != DEFAULT_PLAN:
+                        plan = DEFAULT_PLAN
             return {
                 "search_query": data.get("search_query") or question,
                 "completed_courses": [c.replace(" ", "").upper() for c in (data.get("completed_courses") or [])],
@@ -899,6 +964,9 @@ class GeorgeBot:
                 "term_year": year,
                 "topic_families": [f for f in (data.get("topic_families") or []) if f in valid_families],
                 "department": dept,
+                "is_simple": is_simple,
+                "plan": plan,
+                "confidence": confidence,
             }
         except Exception as e:
             print(f"  [rewrite_and_route] failed, falling back to vector-only: {e}", file=sys.stderr)
@@ -906,7 +974,8 @@ class GeorgeBot:
                     "wants_outline": False, "wants_availability": False, "instructor_query": None,
                     "professor_query": None, "wants_rating": False,
                     "term_season": None, "term_year": None, "completed_courses": [],
-                    "topic_families": [], "department": None}
+                    "topic_families": [], "department": None,
+                    "is_simple": True, "plan": None, "confidence": 0.0}
 
     @staticmethod
     def _build_context(chunks: list[dict], graph_text: str, offset: int) -> str:
@@ -1010,6 +1079,59 @@ class GeorgeBot:
         "- Be concise and direct. Use plain text (no LaTeX)."
     )
 
+    # Appended to SYSTEM_PROMPT for the default-mode "simple" path's combined
+    # verify-then-answer call (see `answer_verified_stream`). Kept narrow by
+    # design — NEED_MORE should be rare, since a broad/multi-part question
+    # should already have been routed to scattered_info by the planner
+    # instead of down this path at all.
+    VERIFY_ANSWER_ADDENDUM = (
+        "\n\nRESPONSE FORMAT\n"
+        "This call has one extra requirement on top of everything above. "
+        "Before writing anything else, decide whether the reference material "
+        "above is enough to answer the question well:\n"
+        "- If it is — the common case, including when the material is "
+        "irrelevant and you should answer from your own knowledge per the "
+        "rules above — start your response with exactly the line "
+        "`<<SUFFICIENT>>` followed by a newline, then write the answer "
+        "normally.\n"
+        "- ONLY if there is a concrete, identifiable gap that better "
+        "retrieval could plausibly fix — the question names a specific "
+        "term/date you have no data for, or the search query clearly "
+        "doesn't match what was actually asked — start your response with "
+        "exactly the line `<<NEED_MORE>>` followed by a newline, then a "
+        "single JSON object and nothing else: {\"reason\": \"<one short "
+        "sentence>\", \"search_query\": \"<a better search query>\" or "
+        "null, \"term_season\": \"spring\"|\"summer\"|\"fall\" or null, "
+        "\"term_year\": <4-digit year> or null}. Only set search_query if a "
+        "different phrasing would plausibly find better material; only set "
+        "term_season/term_year if the question needs a specific term you "
+        "don't have data for.\n"
+        "- Do NOT use NEED_MORE just because the material could be more "
+        "thorough, more detailed, or cover more related topics — that is "
+        "not what this is for, and it should be rare. Reserve it strictly "
+        "for a clear, nameable retrieval miss, never for general "
+        "thoroughness."
+    )
+
+    def _quick_mode_system_prompt(self) -> str:
+        """SYSTEM_PROMPT + a sparing, at-most-once nudge to try quick mode
+        off when there's a genuine, identifiable gap. Quick mode has no
+        verification step (that's what `answer_verified_stream` is for in
+        default mode), so this is the only signal the user gets that
+        something might be missing."""
+        return self.SYSTEM_PROMPT + (
+            "\n\nQUICK MODE\n"
+            "This is a fast, single-pass answer with no verification step. "
+            "If, and only if, you notice a concrete, identifiable gap in "
+            "what you were able to answer — the question needs live/current "
+            "data you weren't given, or names something the reference "
+            "material clearly doesn't cover — you may add ONE brief closing "
+            "sentence noting that and suggesting the user try again with "
+            "quick mode off for a more thorough answer. Do this sparingly: "
+            "never as a routine hedge, never more than once, and never when "
+            "you were able to answer fully."
+        )
+
     def _system_prompt_with_context(self, context: str, base_prompt: str | None = None) -> str:
         """Build the system message: instructions + the retrieved reference
         material, framed as system-supplied (NOT part of the user turn) so the
@@ -1065,29 +1187,21 @@ class GeorgeBot:
                                max_tokens=ANSWER_MAX_TOKENS, thinking="disabled")
         return text or "Sorry, I couldn't generate an answer right now — please try again."
 
-    def answer_stream(self, question: str, context: str, history: list[dict],
-                      system_prompt: str | None = None):
-        """Streamed MiniMax-M3 answer, thinking disabled — yielded token-by-token.
-
-        The reference material rides in the system prompt (not the user turn),
-        so the model treats it as system-supplied. Raw `content` deltas are
-        still piped through `_iter_visible_deltas` as a safety net, which drops
-        any `<think>...</think>` span even when a tag straddles chunk boundaries
-        (`reasoning_split` isn't 100% reliable — see `_call_llm`). This lets the
-        answer stream to the client incrementally instead of landing as one
-        buffered chunk. Leading whitespace on the first visible piece is trimmed
-        to match the non-streaming `answer()` behavior.
-        """
-        messages = self._answer_messages(question, history)
-        full_messages = (
-            [{"role": "system",
-              "content": self._system_prompt_with_context(context, system_prompt)}] + messages
-        )
+    def _stream_answer_raw(self, messages: list[dict], system: str, thinking: str):
+        """Low-level streamed MiniMax-M3 call, shared by `answer_stream` and
+        `answer_verified_stream`. Builds the full message list, streams, and
+        pipes raw `content` deltas through `_iter_visible_deltas`, which drops
+        any `<think>...</think>` span even when a tag straddles chunk
+        boundaries — regardless of `thinking`, since `reasoning_split` isn't
+        100% reliable (see `_call_llm`). Yields raw visible text deltas with
+        no leading-whitespace trimming or empty-stream fallback; callers own
+        that."""
+        full_messages = [{"role": "system", "content": system}] + messages
         stream = self.llm.chat.completions.create(
             model=MINIMAX_MODEL,
             max_tokens=ANSWER_MAX_TOKENS,
             messages=full_messages,
-            extra_body={"reasoning_split": True, "thinking": {"type": "disabled"}},
+            extra_body={"reasoning_split": True, "thinking": {"type": thinking}},
             stream=True,
         )
 
@@ -1098,8 +1212,22 @@ class GeorgeBot:
                 if text:
                     yield text
 
+        yield from _iter_visible_deltas(_content_deltas())
+
+    def answer_stream(self, question: str, context: str, history: list[dict],
+                      system_prompt: str | None = None):
+        """Streamed MiniMax-M3 answer, thinking disabled — yielded token-by-token.
+
+        The reference material rides in the system prompt (not the user turn),
+        so the model treats it as system-supplied. This lets the answer stream
+        to the client incrementally instead of landing as one buffered chunk.
+        Leading whitespace on the first visible piece is trimmed to match the
+        non-streaming `answer()` behavior.
+        """
+        messages = self._answer_messages(question, history)
+        system = self._system_prompt_with_context(context, system_prompt)
         emitted = False
-        for piece in _iter_visible_deltas(_content_deltas()):
+        for piece in self._stream_answer_raw(messages, system, thinking="disabled"):
             if not emitted:
                 piece = piece.lstrip()
                 if not piece:
@@ -1108,6 +1236,81 @@ class GeorgeBot:
             yield piece
         if not emitted:
             yield "Sorry, I couldn't generate an answer right now — please try again."
+
+    def answer_verified_stream(self, question: str, context: str, history: list[dict]):
+        """Combined verify-then-answer call for default mode's "simple" path.
+
+        Streamed, `thinking: "adaptive"` (the one other place this repo uses
+        adaptive thinking is `thinking.py`'s scattered_info coverage
+        evaluator). The model prefixes its response with `<<SUFFICIENT>>` or
+        `<<NEED_MORE>>` (see `VERIFY_ANSWER_ADDENDUM`) before writing the
+        answer or a correction request, so one call serves as both judge and
+        answerer in the common case. The header is peeled off by buffering up
+        to the first newline — the same buffer-then-decide idiom
+        `_iter_visible_deltas` already uses for `<think>` tags.
+
+        Yields:
+          ("token", text)   -- repeatedly, for a SUFFICIENT verdict; caller
+                                forwards these live as the answer.
+          ("need_more", {"reason", "search_query", "term_season", "term_year"})
+                                -- once, for a NEED_MORE verdict. The stream is
+                                fully drained here to parse the JSON — nothing
+                                else is yielded, so nothing reaches the user.
+        """
+        messages = self._answer_messages(question, history)
+        system = self._system_prompt_with_context(
+            context, self.SYSTEM_PROMPT + self.VERIFY_ANSWER_ADDENDUM)
+        raw = self._stream_answer_raw(messages, system, thinking="adaptive")
+
+        header, rest, found_newline = "", "", False
+        for piece in raw:
+            header += piece
+            if "\n" in header:
+                header, _, rest = header.partition("\n")
+                found_newline = True
+                break
+        header = header.strip()
+
+        if found_newline and header == "<<NEED_MORE>>":
+            body = rest + "".join(raw)
+            body = body.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            try:
+                data = json.loads(body)
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+            try:
+                term_year = int(data["term_year"]) if data.get("term_year") else None
+            except (TypeError, ValueError):
+                term_year = None
+            yield ("need_more", {
+                "reason": data.get("reason") or "",
+                "search_query": data.get("search_query") or None,
+                "term_season": (data.get("term_season") or "").strip().lower() or None,
+                "term_year": term_year,
+            })
+            return
+
+        # SUFFICIENT, or an unrecognized/missing header -- fail open and
+        # answer with everything buffered so far rather than losing a real
+        # response over a malformed marker.
+        if found_newline and header == "<<SUFFICIENT>>":
+            first = rest
+        elif found_newline:
+            first = header + ("\n" + rest if rest else "")
+        else:
+            first = header
+        emitted = False
+        for piece in itertools.chain([first], raw):
+            if not piece:
+                continue
+            if not emitted:
+                piece = piece.lstrip()
+                if not piece:
+                    continue
+            emitted = True
+            yield ("token", piece)
+        if not emitted:
+            yield ("token", "Sorry, I couldn't generate an answer right now — please try again.")
 
     # -- source formatting --------------------------------------------------
 
@@ -1227,15 +1430,18 @@ class GeorgeBot:
 
     # -- orchestration ------------------------------------------------------
 
-    def retrieve(self, question: str, history: list[dict],
-                 audience: str = DEFAULT_AUDIENCE) -> tuple[dict, list[dict], dict, dict, dict]:
-        """Route the question, run retrieval, and return
-        (route, chunks, graph_facts, banner_facts, rmp_facts).
+    def retrieve_with_route(self, route: dict,
+                            audience: str = DEFAULT_AUDIENCE) -> tuple[list[dict], dict, dict, dict]:
+        """Run graph/banner/rmp/vector retrieval for an already-computed route.
+        Returns (chunks, graph_facts, banner_facts, rmp_facts).
+
+        Split out of `retrieve()` so callers that already have a route (the
+        planner call was made separately, e.g. to emit a status event first)
+        don't need to re-run it or re-implement this gating inline.
 
         `audience` (undergrad / faculty / both) selects which collection(s) the
-        vector path searches and which topic-family vocabulary the router uses.
-        Graph facts are corpus-independent (the course/program graph is shared),
-        so audience doesn't affect them.
+        vector path searches. Graph facts are corpus-independent (the course/
+        program graph is shared), so audience doesn't affect them.
 
         Banner (live availability) is a gated live-data step: it fires only when the
         router named a course AND flagged an availability/section question — parallel
@@ -1247,7 +1453,6 @@ class GeorgeBot:
         professor_query, or on a course-quality question (wants_rating) once Banner
         has resolved who teaches the course. Also best-effort.
         """
-        route = self.rewrite_and_route(question, history, audience)
         graph_facts = {}
         if route["course_codes"] or route["program_query"]:
             graph_facts = self.graph_retrieve(
@@ -1268,6 +1473,14 @@ class GeorgeBot:
             route["search_query"], audience=audience,
             topic_families=route["topic_families"], department=route["department"],
         )
+        return chunks, graph_facts, banner_facts, rmp_facts
+
+    def retrieve(self, question: str, history: list[dict],
+                 audience: str = DEFAULT_AUDIENCE) -> tuple[dict, list[dict], dict, dict, dict]:
+        """Route the question, run retrieval, and return
+        (route, chunks, graph_facts, banner_facts, rmp_facts)."""
+        route = self.rewrite_and_route(question, history, audience)
+        chunks, graph_facts, banner_facts, rmp_facts = self.retrieve_with_route(route, audience)
         return route, chunks, graph_facts, banner_facts, rmp_facts
 
     @staticmethod
@@ -1346,20 +1559,44 @@ def main() -> None:
     parser.add_argument("--ask", required=True, help="one-shot CLI question")
     parser.add_argument("--audience", default=DEFAULT_AUDIENCE, choices=VALID_AUDIENCES,
                          help=f"corpus to search (default {DEFAULT_AUDIENCE})")
+    parser.add_argument("--mode", default="quick", choices=("quick", "default"),
+                         help="quick (default): flat retrieve->answer, 2 calls. "
+                              "default: the planner also picks simple vs. one of the "
+                              "course_planning/situational/scattered_info plans.")
     args = parser.parse_args()
 
     bot = GeorgeBot()
-    result = bot.ask(args.ask, audience=args.audience)
-    print(f"\nSearch query: {result['search_query']}")
-    print(f"Chunks used:  {result['n_chunks']}\n")
+    if args.mode == "quick":
+        result = bot.ask(args.ask, audience=args.audience)
+    else:
+        # Mirrors /api/chat's non-streaming "default" dispatch (api.py) —
+        # imported lazily so plain `--mode quick` runs never need fastapi.
+        from api import _default_simple_events, _drain_events
+        from thinking import ExtendedThinking
+
+        route = bot.rewrite_and_route(args.ask, [], args.audience, mode="default")
+        print(f"[cli] is_simple={route['is_simple']} plan={route['plan']} "
+              f"confidence={route['confidence']}", file=sys.stderr)
+        if route["is_simple"]:
+            events = _default_simple_events(bot, args.ask, [], args.audience, route)
+        else:
+            events = ExtendedThinking(bot).run(
+                args.ask, [], args.audience, route, route["plan"], route["confidence"])
+        result = _drain_events(events)
+        result.setdefault("search_query", route["search_query"])
+
+    print(f"\nSearch query: {result.get('search_query', '')}")
+    print(f"Chunks used:  {result.get('n_chunks', len(result.get('sources', [])))}\n")
     print("Answer:")
-    print(result["answer"])
+    print(result.get("answer") or result.get("error", "(no answer)"))
+    if result.get("needs_clarification"):
+        print("\n(needs_clarification: the plan asked a question instead of answering)")
     print("\nSources:")
-    for s in result["sources"]:
+    for s in result.get("sources", []):
         tags = " ".join(t for t in [s.get("source", ""), s.get("course_code") or "",
                                      s.get("term") or "",
                                      "HISTORICAL" if s.get("historical") else ""] if t)
-        print(f"  [{s['n']}] {s['url']}  ({tags})")
+        print(f"  [{s.get('n', '?')}] {s.get('url', '')}  ({tags})")
 
 
 if __name__ == "__main__":

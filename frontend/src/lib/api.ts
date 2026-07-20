@@ -1,4 +1,4 @@
-import type { Audience, Message, Source } from '@/types'
+import type { Audience, Message, Source, ThinkingMode } from '@/types'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:5001'
 
@@ -111,8 +111,8 @@ interface StreamHandlers {
   onToken: (text: string) => void
   onDone: () => void
   onError: (message: string) => void
-  // Extended-thinking only: the orchestrator needs more info (e.g. program/term
-  // for course planning, or which situation type) and asks a question instead
+  // "default" mode only: the course-planning/situational plan needs more info
+  // (e.g. program/term, or which situation type) and asks a question instead
   // of answering. Terminal for this turn — the user's reply comes back as an
   // ordinary next question carrying prior history.
   onClarify?: (text: string) => void
@@ -121,14 +121,14 @@ interface StreamHandlers {
 // POST + manually parsed SSE — EventSource doesn't support POST bodies, so we
 // read the fetch response stream directly and split on the "event:\ndata:\n\n"
 // frame format the backend (/api/chat/stream) emits. Events: status (pre-answer
-// phase text), sources, token, done, error, and — in extended-thinking mode —
-// clarify.
+// phase text), sources, token, done, error, and — in "default" mode's
+// course-planning/situational plans — clarify.
 export async function askGeorgeStream(
   question: string,
   priorMessages: Message[],
   audience: Audience,
   handlers: StreamHandlers,
-  extendedThinking = false,
+  mode: ThinkingMode = 'quick',
 ): Promise<void> {
   const res = await fetch(`${API_BASE}/api/chat/stream`, {
     method: 'POST',
@@ -137,7 +137,7 @@ export async function askGeorgeStream(
       question,
       history: toHistory(priorMessages),
       audience,
-      extended_thinking: extendedThinking,
+      mode,
     }),
   })
   if (!res.ok || !res.body) {

@@ -637,6 +637,18 @@ after new corpus content lands.
 
 ## Known issues / open items
 
+- **This doc is stale on the planner/extended-thinking split (2026-07-20 in
+  progress).** `rewrite_and_route` now takes a `mode` param ("quick" | the
+  planner's "default", which also decides `is_simple`/`plan`/`confidence` in
+  the same call — `thinking.py`'s old standalone `classify_mode` is gone).
+  The frontend's boolean extended-thinking toggle is now a quick/default
+  `ThinkingMode` segmented control (`ExtendedThinkingToggle.tsx`), and
+  `api.py`'s request body field is `mode`, not `extended_thinking`. The
+  "Retrieval Pipeline — Full Detail" section's step-1 description of
+  `rewrite_and_route`, the frontend section's `ExtendedThinkingToggle`
+  description, and any other mention of the old boolean toggle need a full
+  rewrite to match — not done as part of this change, flagging so it doesn't
+  go stale silently.
 - **MiniMax account-level Token Plan rate limit (429)**: opaque,
   token-throughput-based (not a flat request cap). Hit reliably under
   back-to-back calls (e.g. batch testing) — surfaces as `rate_limit_error

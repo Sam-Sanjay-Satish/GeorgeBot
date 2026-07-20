@@ -7,7 +7,7 @@ import { ThemeToggle } from './components/ThemeToggle'
 import { LoginPage } from './components/LoginPage'
 import { AccountMenu } from './components/AccountMenu'
 import { askGeorgeStream } from './lib/api'
-import type { Audience, Message, Source, Theme } from './types'
+import type { Audience, Message, Source, Theme, ThinkingMode } from './types'
 
 // Tokens arrive from the backend in bursts (network + generation timing, not
 // a steady per-character rate), which reads as jittery/too-fast on screen.
@@ -23,7 +23,7 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)
   const [audience, setAudience] = useState<Audience>('undergrad')
-  const [extendedThinking, setExtendedThinking] = useState(false)
+  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>('quick')
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = localStorage.getItem('theme')
     if (saved === 'light' || saved === 'dark') return saved
@@ -197,7 +197,7 @@ export default function App() {
             setLoading(false)
           }
         },
-      }, extendedThinking)
+      }, thinkingMode)
     } catch (err) {
       setMessages((prev) =>
         prev.map((m) =>
@@ -263,8 +263,8 @@ export default function App() {
           <div className="mb-4 flex flex-wrap items-center justify-center gap-2">
             <AudienceToggle value={audience} onChange={setAudience} disabled={loading} />
             <ExtendedThinkingToggle
-              value={extendedThinking}
-              onChange={setExtendedThinking}
+              value={thinkingMode}
+              onChange={setThinkingMode}
               disabled={loading}
             />
           </div>

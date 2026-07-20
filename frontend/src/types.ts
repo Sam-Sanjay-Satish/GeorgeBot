@@ -3,6 +3,12 @@ export type MessageRole = 'user' | 'assistant'
 // Which v2.2 corpus the backend should search for a question.
 export type Audience = 'undergrad' | 'faculty' | 'both'
 
+// "quick" -- today's flat retrieve->answer pipeline. "default" -- a planner
+// call also decides simple vs. one of three extended-thinking plans
+// (deep research, course planning, situational guidance) and auto-dispatches
+// with no further user input. Replaces the old boolean extended-thinking toggle.
+export type ThinkingMode = 'quick' | 'default'
+
 export type Theme = 'light' | 'dark'
 
 export interface Source {
