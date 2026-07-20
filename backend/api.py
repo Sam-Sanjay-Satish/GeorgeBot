@@ -13,12 +13,16 @@ HTTP API:
   GET  /health
   POST /api/chat          {question, history?}  -> {answer, sources, ...}  (JSON)
   POST /api/chat/stream   {question, history?}  -> text/event-stream (SSE)
-                          SSE events: mode, status, sources, token, done, error
+                          SSE events: mode, status, planning_state, clarify,
+                          sources, token, done, error
                           ("status" fires before tokens with a short, templated
                           phase message, e.g. "Looking up CSC 225…"; "mode"
                           fires first, only in mode="default" when an
                           extended-thinking plan is dispatched — see
-                          thinking.PLAN_LABELS)
+                          thinking.PLAN_LABELS; "planning_state" fires only for
+                          the course_planning plan and MUST be echoed back in
+                          the next request's `planning_state` field — see
+                          thinking.py's module docstring)
 
 Env (.env): MINIMAX_SUB_KEY, VOYAGE_API_KEY
 """
@@ -52,6 +56,11 @@ class ChatRequest(BaseModel):
     # plans -- see chatbot.rewrite_and_route(mode=...) and thinking.py).
     # Replaces the old boolean `extended_thinking` toggle.
     mode: str = DEFAULT_MODE
+    # Course-planning slots the client is echoing back from the previous turn's
+    # `planning_state` event (see thinking.py's module docstring). Optional and
+    # untrusted — thinking.py sanitizes it, and None/malformed simply means
+    # "derive everything from history", the pre-persistence behavior.
+    planning_state: dict | None = None
 
 
 def _clean_audience(value: str | None) -> str:
@@ -107,6 +116,7 @@ def _drain_events(events) -> dict:
     sources: list[dict] = []
     needs_clarification = False
     mode_label = None
+    planning_state = None
     error = None
     for ev in events:
         etype, data = ev.get("type"), ev.get("data")
@@ -119,6 +129,8 @@ def _drain_events(events) -> dict:
             needs_clarification = True
         elif etype == "mode":
             mode_label = data
+        elif etype == "planning_state":
+            planning_state = data
         elif etype == "error":
             error = data
     if error is not None:
@@ -129,6 +141,10 @@ def _drain_events(events) -> dict:
         result["needs_clarification"] = True
     if mode_label:
         result["mode_label"] = mode_label
+    if planning_state is not None:
+        # Course-planning only: the caller must echo this back on the next turn
+        # (see thinking.py's module docstring) or slots re-derive from scratch.
+        result["planning_state"] = planning_state
     return result
 
 
@@ -242,7 +258,8 @@ def create_app(bot: GeorgeBot) -> FastAPI:
             events = _default_simple_events(bot, question, req.history, audience, route)
         else:
             events = thinker.run(question, req.history, audience,
-                                 route, route["plan"], route["confidence"])
+                                 route, route["plan"], route["confidence"],
+                                 req.planning_state)
         result = _drain_events(events)
         result.setdefault("search_query", route["search_query"])
         return result
@@ -271,7 +288,8 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                     # The planner already classified + downgraded low-
                     # confidence picks, so this no longer re-classifies.
                     events = thinker.run(question, req.history, audience,
-                                         route, route["plan"], route["confidence"])
+                                         route, route["plan"], route["confidence"],
+                                         req.planning_state)
                 elif mode == "default":  # is_simple
                     events = _default_simple_events(bot, question, req.history, audience, route)
                 else:  # mode == "quick"

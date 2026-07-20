@@ -181,7 +181,7 @@ reading this first:
 ```
 
 `backend/graph_queries.py` is a **copy**, not a symlink, of
-`georgebot-pipeline`'s `course_graph/graph_queries.py`, patched three ways:
+`georgebot-pipeline`'s `course_graph/graph_queries.py`, patched four ways:
 (1) paths use this repo's env-var scheme (`GRAPH_DATA_DIR`/`DATA_DIR`/
 `./graph_data`) instead of the pipeline's `config.*`; (2) the outline loader
 reads v2.2's **`heat_outlines.json`** — a flat `{code: {course, term, url,
@@ -189,11 +189,26 @@ text}}` dict, HEAT-only (eng/CS courses; others have no outline) — instead of
 the old list-shaped `course_outlines_final.json`; (3) `search_programs()`
 normalizes punctuation to spaces before token-matching (see the program-query
 section below) — without it, a query carrying parens/hyphens (e.g. the exact
-credential string the disambiguation flow displays back) matches nothing. The
+credential string the disambiguation flow displays back) matches nothing;
+(4) `search_programs()` matches each query token against **whole words**
+(prefix for title/credential, exact for `code`) instead of as a bare substring
+of one flattened haystack string. Substring matching let a short token match
+across word interiors, so `"CS"` returned **65** unrelated programs (`cs` is
+inside "Economi*cs*", "Ethi*cs*", "Physi*cs*") and `"econ"` pulled in
+"S*econ*dary"; prefix-matching the opaque `code` field then still surfaced
+Canadian Studies (`DIPL-CSIS`) / Coastal Studies (`MNR-CSS`) while *missing*
+Computer Science, hence exact-token for codes. Verified against ~26 realistic
+queries: every legitimate result is unchanged (`math`→Mathematics and
+`eng`→Engineering still work via prefix; `BA-ECAH`-style code search still
+works), only the noise collapses. Note this is prefix matching, **not
+abbreviation expansion** — `"CS"` and `"stats"` now legitimately return zero
+matches (they always did for `stats`), and callers fall back to asking for the
+exact program name. An alias/abbreviation map would be a taxonomy concern, so
+it belongs in the pipeline repo, not here. The
 **accessor API is identical** to the pipeline's (all 19 `GraphStore` methods).
-This patch (3) lives **only here** — it was deliberately not back-ported to the
+Patches (3) and (4) live **only here** — deliberately not back-ported to the
 pipeline (that repo is dormant for now); if the pipeline is ever revived and
-re-copied, re-apply all three patches (diff first — they drift if edited
+re-copied, re-apply all four patches (diff first — they drift if edited
 independently). The outline record shape is also read directly
 in `chatbot.py` (`_graph_context_text`, `format_sources`) — `term`/`text`/
 `url`, no nested `metadata`.
@@ -407,7 +422,12 @@ Only runs when `course_codes` or `program_query` is non-empty.
   onto tokens — without this, the exact credential string the disambiguation
   flow itself displays (`"Computer Science (Bachelor of Science - Honours)"`)
   tokenizes to `(bachelor` / `honours)` and matches **nothing**, which is what
-  used to trap users in a disambiguation loop. **On multiple matches,
+  used to trap users in a disambiguation loop. Each token then matches a whole
+  **word** — by prefix for title/credential (`math`→Mathematics), exact for the
+  opaque `code` — never as a substring of a flattened haystack; see patch (4)
+  above for why (`"CS"` used to return 65 unrelated programs). A short
+  abbreviation that isn't a real word prefix (`"CS"`, `"stats"`) therefore
+  returns nothing and the caller asks for the exact name. **On multiple matches,
   `_program_facts` auto-selects the closest** via `_rank_program_matches()`
   rather than always asking: since every candidate already contains all the
   query's tokens, it ranks by *surplus* tokens (the candidate adding the least

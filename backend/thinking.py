@@ -35,6 +35,7 @@ differentiated only by prompt. Retrieval reuses `bot.vector_retrieve` /
     {"type": "mode",    "data": "<plan label, e.g. 'Course Planner'>"}  # first event, always
     {"type": "status",  "data": "<phase text>"}
     {"type": "clarify", "data": "<question to the user>"}   # terminal — no answer
+    {"type": "planning_state", "data": {<see below>}}  # course_planning only
     {"type": "sources", "data": [<source dict>, ...]}
     {"type": "token",   "data": "<answer piece>"}
     {"type": "done"}
@@ -44,11 +45,43 @@ Slot-gathering that needs input (course_planning / situational) emits a single
 `clarify` event and stops; the user's reply arrives as an ordinary next turn in
 `history`, and re-entry finds the slots there (rebuild-from-history — no
 server-side session state, no conversation id).
+
+**Course-planning slot persistence (client-echoed, still no server state).**
+Rebuild-from-history alone was not enough for `course_planning`: re-deriving
+every slot from the whole conversation on every turn meant a slot that had
+already been *resolved* could be collapsed back to its vaguer original form.
+The confirmed failure was a program-disambiguation loop — turn 1 "CS major" →
+ambiguous → "which one?"; turn 2 the user picks an exact option → the whole
+history is re-read → "computer science" again → the identical question,
+forever, with no way out through normal conversation.
+
+The fix keeps the module stateless: `_run_planning` accepts a `planning_state`
+dict from the caller, emits an updated one as a `planning_state` event, and the
+**client echoes the latest one back** on the next turn (exactly how `history`
+already works). It carries only STABLE inputs:
+
+    {"program": {"pid","title","credential"} | null,
+     "term_season": str|null, "term_year": int|null,
+     "completed_courses": [str], "completed_known": bool,
+     "constraints": {"include_courses": [], "exclude_courses": [],
+                     "soft_preferences": []},
+     "non_course_resolved": {"<COURSE>": {"satisfied": bool, "reason": str|null}},
+     "pending_clarify": {"kind": str, "options": [...]} | null}
+
+Volatile outputs (eligible-course list, Banner sections/seats, computed
+schedules) are deliberately NOT persisted — they're recomputed fresh every turn
+from the stable inputs, because seat counts change constantly (see the Banner
+TTL design in CLAUDE.md).
+
+It degrades safely in both directions: a missing/None/malformed `planning_state`
+falls back to the original full re-derivation from history, and every field is
+re-validated on the way in (it arrives from the client, so it is not trusted).
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 
@@ -63,6 +96,11 @@ SCATTERED_QUERY_N = 4          # chunks pulled per sub-query (matches N_CONTEXT)
 # course_planning: cap how many eligible courses we throw at Banner in one batch
 # (a huge remaining-requirements list would be a slow, pointless fan-out).
 PLANNING_MAX_ELIGIBLE = 18
+
+# How many candidate programs to list back in a disambiguation question. Only a
+# display cap — every candidate is kept in `pending_clarify.options`, so a
+# student who names one that wasn't shown still resolves.
+PLANNING_MAX_PROGRAM_OPTIONS = 8
 
 # Short, user-facing labels for each plan — emitted as a "mode" event so the
 # frontend can tag which pipeline produced an answer.
@@ -262,13 +300,19 @@ class ExtendedThinking:
     # -- Public entry ---------------------------------------------------------
 
     def run(self, question: str, history: list[dict], audience: str,
-            route: dict, plan: str, confidence: float):
+            route: dict, plan: str, confidence: float,
+            planning_state: dict | None = None):
         """Dispatch into one of the three plans. Yields event dicts (see module
         docstring). `route`/`plan`/`confidence` come from
         `GeorgeBot.rewrite_and_route(..., mode="default")` — the planner
         already classified the query and applied the confidence downgrade, so
         this no longer classifies anything itself (that used to be this
-        module's own `classify_mode`)."""
+        module's own `classify_mode`).
+
+        `planning_state` is the client-echoed course-planning state from the
+        previous turn (see the module docstring). It is optional and untrusted:
+        None/malformed means "derive everything from history", i.e. exactly the
+        pre-persistence behavior. Ignored by the other two plans."""
         log: dict = {"question": question, "audience": audience,
                      "t_start": time.monotonic()}
         try:
@@ -282,7 +326,8 @@ class ExtendedThinking:
             yield {"type": "mode", "data": PLAN_LABELS[plan]}
 
             if plan == "course_planning":
-                yield from self._run_planning(question, history, audience, log)
+                yield from self._run_planning(question, history, audience, log,
+                                              planning_state)
             elif plan == "situational":
                 yield from self._run_situational(question, history, audience, log)
             else:
@@ -440,26 +485,68 @@ class ExtendedThinking:
     # Mode: course_planning (fixed enumeration -> solver; no fuzzy evaluator)
     # ------------------------------------------------------------------
 
-    def _planning_slots(self, question: str, history: list[dict]) -> dict:
-        """Extract completed courses, program, target term, and constraints."""
+    def _planning_slots(self, question: str, history: list[dict],
+                        state: dict | None = None) -> dict:
+        """Extract course-planning slots. Returns a *delta*: every field is
+        nullable, and null means "the extraction says nothing about this",
+        which `_merge_planning_slots` reads as "keep what's already there".
+
+        Two framings:
+          - `state is None` — full derivation from the whole conversation (the
+            original, pre-persistence behavior; the baseline it merges into is
+            empty, so the result is identical to what this returned before).
+          - `state` given — DELTA extraction: the already-established slots are
+            shown to the model and it is asked to report only what the LATEST
+            message states or changes. This is what stops a resolved slot being
+            re-derived from scratch — and collapsed back to a vaguer value —
+            on every single turn.
+        """
+        if state is None:
+            scope = ("Extract course-planning slots from the whole conversation "
+                     "for a UVic student. Use null for anything never stated.")
+            known = ""
+        else:
+            prog = state["program"]
+            prog_line = (f"{prog['title']} ({prog['credential']})" if prog
+                         else "(not resolved yet)")
+            completed = ", ".join(state["completed_courses"]) or "(none recorded)"
+            known = (
+                "ALREADY ESTABLISHED for this student (from earlier turns — "
+                "treat as settled):\n"
+                f"  program: {prog_line}\n"
+                f"  term: {state['term_season'] or '?'} {state['term_year'] or '?'}\n"
+                f"  completed courses: {completed} "
+                f"(known={state['completed_known']})\n"
+                f"  constraints: {json.dumps(state['constraints'])}\n\n"
+            )
+            scope = ("Report ONLY what the student's LATEST message states or "
+                     "changes about these slots. Use null for every slot the "
+                     "latest message doesn't speak to — it's already recorded "
+                     "above and must not be restated or re-guessed.")
         data = self._json_llm(
             f"{self._history_text(history)}"
             f"Today's date is {time.strftime('%Y-%m-%d')}.\n"
-            "Extract course-planning slots from the conversation for a UVic "
-            "student. Return ONLY JSON with:\n"
+            f"{known}{scope} Return ONLY JSON with:\n"
             '  "program": the student\'s program/major as stated (e.g. "computer '
-            'science", "mechanical engineering"), or null if never stated.\n'
-            '  "completed_courses": array of course codes they said they have '
-            'completed (normalized like "CSC110"), or [] if none stated.\n'
-            '  "completed_known": true if the student indicated what they have '
-            "taken (or explicitly said none/first-year), false if it's simply "
-            "never been mentioned.\n"
+            'science", "mechanical engineering"). If the assistant just offered a '
+            "list of programs to choose from and the student picked one, return "
+            "that option's full text VERBATIM. null if not stated here.\n"
+            '  "program_changed": true ONLY if the latest message explicitly '
+            "corrects or switches an already-established program (e.g. "
+            '"actually I\'m in Honours, not the Major"); false otherwise.\n'
+            '  "completed_courses": the student\'s FULL list of completed course '
+            'codes as of now (normalized like "CSC110"), including any already '
+            "recorded above, or null if the latest message says nothing about "
+            "completed courses.\n"
+            '  "completed_known": true if the student has indicated what they have '
+            "taken (or explicitly said none/first-year), else null.\n"
             '  "term_season": "spring"|"summer"|"fall"|null for the term they want '
             "to plan (resolve relative phrases using today's date).\n"
             '  "term_year": 4-digit year or null.\n'
             '  "include_courses": array of course codes they specifically want '
-            "included, or [].\n"
-            '  "exclude_courses": array of course codes they want to avoid, or [].\n'
+            "included, or null if not mentioned.\n"
+            '  "exclude_courses": array of course codes they want to avoid, or '
+            "null if not mentioned.\n"
             '  "soft_preferences": array of {"type","value"} using ONLY these '
             'types: no_time_before (HHMM), no_time_after (HHMM), no_days (array of '
             'day codes Mo/Tu/We/Th/Fr), delivery ("online"|"in_person"), '
@@ -467,28 +554,63 @@ class ExtendedThinking:
             '{"type":"no_time_before","value":"1000"}, "no Friday classes" -> '
             '{"type":"no_days","value":["Fr"]}, "5 courses" -> {"type":'
             '"max_courses","value":5}. Drop anything that doesn\'t fit these '
-            "types.\n\n"
-            f"Latest question: {question}",
+            "types. null if not mentioned.\n\n"
+            f"Latest message: {question}",
             thinking="disabled", max_tokens=1200,
         ) or {}
         return {
-            "program": data.get("program") or None,
-            "completed_courses": [c.replace(" ", "").upper()
-                                  for c in (data.get("completed_courses") or [])],
+            "program": (data.get("program") or "").strip() or None,
+            "program_changed": bool(data.get("program_changed")),
+            "completed_courses": (_norm_codes(data.get("completed_courses"))
+                                  if data.get("completed_courses") is not None else None),
             "completed_known": bool(data.get("completed_known")),
             "term_season": (data.get("term_season") or "").strip().lower() or None,
-            "term_year": data.get("term_year"),
-            "constraints": {
-                "include_courses": [c.replace(" ", "").upper()
-                                    for c in (data.get("include_courses") or [])],
-                "exclude_courses": [c.replace(" ", "").upper()
-                                    for c in (data.get("exclude_courses") or [])],
-                "soft_preferences": data.get("soft_preferences") or [],
-            },
+            "term_year": _coerce_year(data.get("term_year")),
+            "include_courses": (_norm_codes(data.get("include_courses"))
+                                if data.get("include_courses") is not None else None),
+            "exclude_courses": (_norm_codes(data.get("exclude_courses"))
+                                if data.get("exclude_courses") is not None else None),
+            "soft_preferences": (data.get("soft_preferences")
+                                 if isinstance(data.get("soft_preferences"), list) else None),
         }
+
+    @staticmethod
+    def _merge_planning_slots(state: dict, ex: dict) -> dict:
+        """Fold an extraction delta into the persisted state, in place.
+
+        Merge policy: explicitly-stated new info wins (so corrections work);
+        silence about an already-resolved slot leaves it exactly as it was
+        (so nothing gets re-derived and degraded). `program` is deliberately
+        NOT merged here — it needs graph resolution, handled in
+        `_resolve_program`.
+        """
+        if ex.get("term_season") in ("spring", "summer", "fall"):
+            state["term_season"] = ex["term_season"]
+        if ex.get("term_year"):
+            state["term_year"] = ex["term_year"]
+        if ex.get("completed_courses") is not None:
+            codes = ex["completed_courses"]
+            # An empty list only overwrites when the student actually said
+            # "none / just starting" — otherwise a null-ish extraction would
+            # silently wipe a list they gave us three turns ago.
+            if codes or ex.get("completed_known"):
+                state["completed_courses"] = codes
+            if codes:
+                state["completed_known"] = True
+        if ex.get("completed_known"):
+            state["completed_known"] = True
+        cons = state["constraints"]
+        for key in ("include_courses", "exclude_courses"):
+            if ex.get(key) is not None:
+                cons[key] = ex[key]
+        if ex.get("soft_preferences") is not None:
+            cons["soft_preferences"] = [p for p in ex["soft_preferences"]
+                                        if isinstance(p, dict) and p.get("type")]
+        return state
 
     def _resolve_non_course_requirements(
         self, blocked: dict[str, list[dict]], history: list[dict],
+        question: str = "",
     ) -> tuple[list[str], list[str], dict[str, str]]:
         """Resolve non-course requirements (year standing, declared program,
         GPA, permission, AWR, units-from-list, ...) that `prereq_satisfied`
@@ -498,6 +620,12 @@ class ExtendedThinking:
         `blocked` — {course_code: [unknown_requirement, ...]} for candidate
         courses whose only remaining gap is non-course (course prereqs already
         satisfied).
+
+        `question` is the CURRENT turn, which `history` does not contain. It
+        must be included: when the previous turn asked "do you meet these?",
+        the student's answer *is* the current turn, and reading only `history`
+        made that answer invisible for one full round — so the identical
+        question got asked again immediately after being answered.
 
         Returns:
           resolved   — course codes where every non-course requirement was
@@ -531,7 +659,9 @@ class ExtendedThinking:
             "cover at least one alternative, even if the others were never "
             "addressed.\n\n"
             + "\n".join(f'- "{r}"' for r in req_list) +
-            '\n\nReturn ONLY JSON: {"results":[{"requirement":"<exact text '
+            f"\n\nThe student's latest message (the most likely place an answer "
+            f"to these appears): {question}\n\n"
+            'Return ONLY JSON: {"results":[{"requirement":"<exact text '
             'above>","status":"satisfied|not_satisfied|unknown"}]}',
             thinking="disabled", max_tokens=1000,
         ) or {}
@@ -555,56 +685,138 @@ class ExtendedThinking:
                         unresolved.add(d)
         return resolved, sorted(unresolved), notes
 
+    def _resolve_program(self, text: str | None, question: str, state: dict,
+                         log: dict) -> str | None:
+        """Resolve the student's program to a pid, storing it on `state`.
+
+        Returns a clarify question to ask, or None when `state["program"]` is
+        now resolved (or there was nothing to resolve).
+
+        **This is the loop-breaker.** Once `state["program"]` holds a pid, the
+        fuzzy `search_programs` path is never entered again for the rest of the
+        conversation unless the student explicitly corrects their program — so
+        a vague phrase like "CS major" can no longer be re-derived from history
+        and collapse an already-picked program back into an ambiguous match.
+        """
+        pending = state.get("pending_clarify")
+        reply = text or question
+
+        # (a) The previous turn asked "which of these programs?" — match the
+        # reply against the options WE offered, deterministically. No fuzzy
+        # re-search: the options are already exact program records, and
+        # re-searching the reply text is precisely what used to loop.
+        if pending and pending.get("kind") == "program_disambiguation":
+            picked = _match_program_option(reply, pending.get("options") or [])
+            if picked:
+                state["program"] = picked
+                state["pending_clarify"] = None
+                log["program_resolved_via"] = "disambiguation_reply"
+                return None
+
+        # (b) Nothing new to resolve from -> keep whatever is pinned (the
+        # caller only passes `text` when the program is unpinned or the student
+        # explicitly corrected it, so this is the common steady-state path and
+        # the one that keeps `search_programs` out of the loop entirely).
+        if not text:
+            if state["program"]:
+                log["program_resolved_via"] = "persisted"
+            return None
+
+        # (c) Fresh resolution (first time, or an explicit correction). Drop any
+        # existing pin first: until the new text resolves, the state must not
+        # claim the program the student just corrected away from.
+        state["program"] = None
+        # Mirror chatbot.py's _program_facts: rank by
+        # surplus tokens and auto-pick a clear winner instead of asking on any
+        # raw multi-match — search_programs only guarantees token-subset
+        # containment, so e.g. "computer science honours" legitimately matches
+        # the standalone Honours program AND both combined-honours programs;
+        # ranking is what tells them apart.
+        matches = self.bot.gs.search_programs(text)
+        if not matches:
+            return (f"I couldn't find a program matching \"{text}\" in the "
+                    f"calendar. Could you give the exact program/degree name?")
+        if len(matches) > 1:
+            ranked = self.bot._rank_program_matches(text, matches)
+            best, runner_up = ranked[0], ranked[1]
+            if (best["_extra"], best["_size"]) == (runner_up["_extra"], runner_up["_size"]):
+                # Genuine tie -> ask, and remember every candidate so the
+                # student's reply next turn resolves against this exact list
+                # (path (a)) instead of being fuzzy-searched all over again.
+                options = [{"pid": m["pid"], "title": m["title"],
+                            "credential": m.get("credential") or ""} for m in ranked]
+                state["pending_clarify"] = {"kind": "program_disambiguation",
+                                            "options": options}
+                shown = options[:PLANNING_MAX_PROGRAM_OPTIONS]
+                names = "; ".join(f"{o['title']} ({o['credential']})" for o in shown)
+                more = (f" (and {len(options) - len(shown)} more)"
+                        if len(options) > len(shown) else "")
+                return (f"A few programs match \"{text}\": {names}{more}. Which one? "
+                        f"Copy the one you're in.")
+            matches = ranked
+        m = matches[0]
+        state["program"] = {"pid": m["pid"], "title": m["title"],
+                            "credential": m.get("credential") or ""}
+        state["pending_clarify"] = None
+        log["program_resolved_via"] = "search"
+        return None
+
     def _run_planning(self, question: str, history: list[dict], audience: str,
-                      log: dict):
+                      log: dict, planning_state: dict | None = None):
         yield {"type": "status", "data": "Working out your course options…"}
-        slots = self._planning_slots(question, history)
+
+        # Client-echoed state is untrusted input: sanitize, and on anything
+        # missing/malformed fall back to full derivation from history (exactly
+        # the pre-persistence behavior).
+        state = _sanitize_planning_state(planning_state)
+        had_state = state is not None
+        log["planning_state_in"] = had_state
+        incoming = _state_fingerprint(state)
+        if state is None:
+            state = _empty_planning_state()
+
+        ex = self._planning_slots(question, history, state if had_state else None)
+        self._merge_planning_slots(state, ex)
+
+        def _state_event():
+            """Emit the updated state iff it actually changed this turn."""
+            if _state_fingerprint(state) != incoming:
+                return [{"type": "planning_state", "data": state}]
+            return []
+
+        # Program: resolve (or keep the pin) before the missing-slot check, so
+        # a turn that only answers the disambiguation question counts as having
+        # a program.
+        prog_text = ex["program"] if (ex["program"] and
+                                      (ex["program_changed"] or not state["program"] or
+                                       state.get("pending_clarify"))) else None
+        clarify = self._resolve_program(prog_text, question, state, log)
+        if clarify:
+            log["termination_reason"] = "clarify_pending"
+            yield from _state_event()
+            yield {"type": "clarify", "data": clarify}
+            return
 
         # Pre-check: required slots. Missing -> clarify and STOP (design §4.1).
         missing = []
-        if not slots["program"]:
+        if not state["program"]:
             missing.append("your program or major")
-        if not (slots["term_season"] and slots["term_year"]):
+        if not (state["term_season"] and state["term_year"]):
             missing.append("which term you're planning for (e.g. Spring 2026)")
-        if not slots["completed_known"]:
+        if not state["completed_known"]:
             missing.append("which courses you've already completed (or say you're "
                            "just starting)")
         if missing:
             log["termination_reason"] = "clarify_pending"
             log["missing_slots"] = missing
+            yield from _state_event()
             yield {"type": "clarify",
                    "data": ("To plan your courses I need a bit more: "
                             + "; ".join(missing) + ".")}
             return
 
-        # Resolve program. Mirror chatbot.py's _program_facts: rank by surplus
-        # tokens and auto-pick a clear winner instead of asking on any raw
-        # multi-match — search_programs only guarantees token-subset
-        # containment, so e.g. "computer science honours" legitimately
-        # matches the standalone Honours program AND both combined-honours
-        # programs; ranking is what tells them apart.
-        matches = self.bot.gs.search_programs(slots["program"])
-        if not matches:
-            log["termination_reason"] = "clarify_pending"
-            yield {"type": "clarify",
-                   "data": (f"I couldn't find a program matching "
-                            f"\"{slots['program']}\" in the calendar. Could you give "
-                            f"the exact program/degree name?")}
-            return
-        if len(matches) > 1:
-            ranked = self.bot._rank_program_matches(slots["program"], matches)
-            best, runner_up = ranked[0], ranked[1]
-            if (best["_extra"], best["_size"]) == (runner_up["_extra"], runner_up["_size"]):
-                names = "; ".join(f"{m['title']} ({m.get('credential', '')})"
-                                  for m in matches[:6])
-                log["termination_reason"] = "clarify_pending"
-                yield {"type": "clarify",
-                       "data": (f"A few programs match \"{slots['program']}\": {names}. "
-                                f"Which one?")}
-                return
-            matches = ranked
-        pid = matches[0]["pid"]
-        completed = slots["completed_courses"]
+        pid = state["program"]["pid"]
+        completed = state["completed_courses"]
 
         # Step 1: enumerate eligible courses (graph, deterministic).
         yield {"type": "status", "data": "Finding courses you're eligible for…"}
@@ -639,17 +851,40 @@ class ExtendedThinking:
 
         non_course_notes: dict[str, str] = {}
         if non_course_blocked:
-            resolved_codes, unresolved_reqs, non_course_notes = \
-                self._resolve_non_course_requirements(non_course_blocked, history)
-            eligible.extend(resolved_codes)
-            if unresolved_reqs:
-                log["termination_reason"] = "clarify_pending"
-                log["unresolved_non_course_reqs"] = unresolved_reqs
-                yield {"type": "clarify",
-                       "data": ("A few of your remaining courses depend on things "
-                                "I can't tell from our conversation — do you meet "
-                                "these: " + "; ".join(unresolved_reqs) + "?")}
-                return
+            # Same pinning rule as `program`: a course whose non-course
+            # requirements were already settled in an earlier turn is never
+            # re-resolved (and so never re-asked about) — only genuinely new
+            # blocked courses go to the LLM.
+            settled = state["non_course_resolved"]
+            for code in non_course_blocked:
+                verdict = settled.get(code)
+                if not verdict:
+                    continue
+                if verdict["satisfied"]:
+                    eligible.append(code)
+                else:
+                    non_course_notes[code] = (verdict.get("reason")
+                                              or "requirements you haven't confirmed")
+            fresh = {c: reqs for c, reqs in non_course_blocked.items() if c not in settled}
+            log["n_non_course_persisted"] = len(non_course_blocked) - len(fresh)
+            if fresh:
+                resolved_codes, unresolved_reqs, fresh_notes = \
+                    self._resolve_non_course_requirements(fresh, history, question)
+                eligible.extend(resolved_codes)
+                non_course_notes.update(fresh_notes)
+                for code in resolved_codes:
+                    settled[code] = {"satisfied": True, "reason": None}
+                for code, note in fresh_notes.items():
+                    settled[code] = {"satisfied": False, "reason": note}
+                if unresolved_reqs:
+                    log["termination_reason"] = "clarify_pending"
+                    log["unresolved_non_course_reqs"] = unresolved_reqs
+                    yield from _state_event()
+                    yield {"type": "clarify",
+                           "data": ("A few of your remaining courses depend on things "
+                                    "I can't tell from our conversation — do you meet "
+                                    "these: " + "; ".join(unresolved_reqs) + "?")}
+                    return
 
         eligible = eligible[:PLANNING_MAX_ELIGIBLE]
         log["n_remaining_groups"] = len(remaining_groups)
@@ -664,6 +899,7 @@ class ExtendedThinking:
             blocked.update(non_course_notes)
             context = _render_remaining_groups(remaining_groups, blocked)
             sources = self.bot.format_sources([], {}, {}, {})
+            yield from _state_event()
             yield from self._stream_answer(
                 question, context, history, sources,
                 _planning_system_prompt(self.bot.SYSTEM_PROMPT))
@@ -671,7 +907,7 @@ class ExtendedThinking:
 
         # Step 2: batch Banner for live sections (distinguish error vs not-offered).
         yield {"type": "status", "data": "Checking live class times and seats…"}
-        season, year = slots["term_season"], _coerce_year(slots["term_year"])
+        season, year = state["term_season"], state["term_year"]
         banner_facts = banner_retrieve(eligible, season, year)
         banner_error = False
         offered_codes: set[str] = set()
@@ -708,7 +944,7 @@ class ExtendedThinking:
         # include/exclude enforced structurally) then solve.
         yield {"type": "status", "data": "Building conflict-free schedules…"}
         sections = [s for c in banner_facts.get("courses", []) for s in c.get("sections", [])]
-        schedules = solve_schedule(sections, slots["constraints"])
+        schedules = solve_schedule(sections, state["constraints"])
         log["termination_reason"] = "solver_returned"
         log["n_schedules"] = len(schedules)
 
@@ -738,6 +974,7 @@ class ExtendedThinking:
         context = f"{sched_text}{gap_text}\n\n{banner_context}".strip()
 
         sources = self.bot.format_sources([], {}, banner_facts, {})
+        yield from _state_event()
         yield from self._stream_answer(
             question, context, history, sources,
             _planning_system_prompt(self.bot.SYSTEM_PROMPT))
@@ -827,6 +1064,129 @@ def _coerce_year(value) -> int | None:
         return int(value) if value else None
     except (TypeError, ValueError):
         return None
+
+
+def _norm_codes(value) -> list[str]:
+    """Normalize a course-code list to the graph's spaceless upper form."""
+    if not isinstance(value, list):
+        return []
+    return [c.replace(" ", "").upper() for c in value if isinstance(c, str) and c.strip()]
+
+
+# ---------------------------------------------------------------------------
+# course_planning persisted state (client-echoed — see the module docstring)
+# ---------------------------------------------------------------------------
+
+def _empty_planning_state() -> dict:
+    return {
+        "program": None,
+        "term_season": None,
+        "term_year": None,
+        "completed_courses": [],
+        "completed_known": False,
+        "constraints": {"include_courses": [], "exclude_courses": [],
+                        "soft_preferences": []},
+        "non_course_resolved": {},
+        "pending_clarify": None,
+    }
+
+
+def _sanitize_planning_state(raw) -> dict | None:
+    """Validate client-echoed planning state into the canonical shape.
+
+    Returns None when there's nothing usable — the caller then derives
+    everything from history, i.e. the original behavior. This runs on data
+    that came back through the browser, so every field is re-checked rather
+    than trusted; a partially-bad payload keeps whatever fields survive.
+    """
+    if not isinstance(raw, dict):
+        return None
+    try:
+        state = _empty_planning_state()
+
+        prog = raw.get("program")
+        if isinstance(prog, dict) and prog.get("pid"):
+            state["program"] = {"pid": str(prog["pid"]),
+                                "title": str(prog.get("title") or ""),
+                                "credential": str(prog.get("credential") or "")}
+
+        season = raw.get("term_season")
+        if isinstance(season, str) and season.strip().lower() in ("spring", "summer", "fall"):
+            state["term_season"] = season.strip().lower()
+        state["term_year"] = _coerce_year(raw.get("term_year"))
+
+        state["completed_courses"] = _norm_codes(raw.get("completed_courses"))
+        state["completed_known"] = bool(raw.get("completed_known"))
+
+        cons = raw.get("constraints")
+        if isinstance(cons, dict):
+            state["constraints"] = {
+                "include_courses": _norm_codes(cons.get("include_courses")),
+                "exclude_courses": _norm_codes(cons.get("exclude_courses")),
+                "soft_preferences": [p for p in (cons.get("soft_preferences") or [])
+                                     if isinstance(p, dict) and p.get("type")],
+            }
+
+        ncr = raw.get("non_course_resolved")
+        if isinstance(ncr, dict):
+            state["non_course_resolved"] = {
+                str(code).replace(" ", "").upper(): {
+                    "satisfied": bool(v.get("satisfied")),
+                    "reason": (str(v["reason"]) if v.get("reason") else None),
+                }
+                for code, v in ncr.items() if isinstance(v, dict)
+            }
+
+        pc = raw.get("pending_clarify")
+        if isinstance(pc, dict) and pc.get("kind"):
+            options = [{"pid": str(o["pid"]), "title": str(o.get("title") or ""),
+                        "credential": str(o.get("credential") or "")}
+                       for o in (pc.get("options") or [])
+                       if isinstance(o, dict) and o.get("pid")]
+            state["pending_clarify"] = {"kind": str(pc["kind"]), "options": options}
+
+        # Nothing actually survived validation (e.g. a client that sent `{}`).
+        # Report it as absent so the caller uses full derivation from history —
+        # delta extraction with an empty baseline would ignore anything the
+        # student stated in an earlier turn.
+        if _state_fingerprint(state) == _state_fingerprint(_empty_planning_state()):
+            return None
+        return state
+    except Exception as e:
+        print(f"  [thinking._sanitize_planning_state] discarding bad state: {e}",
+              file=sys.stderr)
+        return None
+
+
+def _state_fingerprint(state: dict | None) -> str:
+    """Stable serialization, so we only emit a `planning_state` event when the
+    state actually changed this turn."""
+    return json.dumps(state, sort_keys=True, default=str)
+
+
+def _program_tokens(text: str) -> list[str]:
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).split()
+
+
+def _match_program_option(reply: str, options: list[dict]) -> dict | None:
+    """Match a student's reply to a disambiguation question against the exact
+    options we offered. Deterministic (no graph search, no LLM) — this is what
+    the fuzzy re-search used to get wrong.
+
+    Exact normalized match on "title (credential)" wins; otherwise the reply's
+    tokens must be a subset of exactly ONE option's tokens. Ambiguity returns
+    None (ask again) rather than guessing the wrong requirements list.
+    """
+    tokens = _program_tokens(reply)
+    if not tokens or not options:
+        return None
+    exact = [o for o in options
+             if _program_tokens(f"{o['title']} {o['credential']}") == tokens]
+    if len(exact) == 1:
+        return exact[0]
+    subset = [o for o in options
+              if set(tokens) <= set(_program_tokens(f"{o['title']} {o['credential']}"))]
+    return subset[0] if len(subset) == 1 else None
 
 
 def _hhmm(t: str | None) -> str:

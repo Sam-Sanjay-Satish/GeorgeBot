@@ -507,24 +507,48 @@ class GraphStore:
         program-scoped accessors like requirements_remaining().
 
         Matching is token-based, not whole-string substring: `query` is split on
-        whitespace and every token must appear somewhere in the combined
+        whitespace and every token must match a WORD in the combined
         "title code credential" text (case-insensitive). This is what lets a query
         like "computer science honours" match a program whose title is just
         "Computer Science" — "honours" lives in its credential ("Bachelor of Science
         - Honours"), not its title, so a literal substring match on the full query
         string would silently return nothing.
 
+        A token matches a title/credential word by PREFIX, not by bare substring:
+        "math" finds "Mathematics" and "eng" finds "Engineering", but a token can
+        no longer match across a word's interior. Bare substring matching (what
+        this used to do, against one flattened haystack string) made short
+        queries match near-everything: "CS" matched 65 unrelated programs,
+        because "cs" falls inside "Economi-cs", "Ethi-cs", "Physi-cs" and so on.
+        That produced a disambiguation list of pure noise for one of the most
+        common ways a student names their program.
+
+        `code` is matched by WHOLE token instead, because codes are opaque
+        registry strings ("BSC-CSSC", "MNR-APPL"), not words: a prefix of one
+        carries no meaning, and prefix-matching them was the second half of the
+        same bug — "CS" still pulled in Canadian Studies (DIPL-CSIS), Coastal
+        Studies (MNR-CSS) and Chemistry and Ocean Sciences (BSC-CSSC) while
+        missing Computer Science itself. Exact-token keeps deliberate
+        search-by-code ("BSC-ECAH", or "bsc") working.
+
         Returns a list of {"pid", "code", "title", "credential"} dicts, sorted by
         title then code. Empty list if nothing matches or `query` is blank.
+
+        Note this is prefix matching, not abbreviation expansion: "stats" still
+        finds nothing (no word starts with "stats" — "statistics" does not), and
+        clipped forms generally need the real word. Callers already handle the
+        no-match case by asking for the exact program name.
         """
         # Normalize punctuation to spaces on both sides so tokens don't get
         # glued to parens/hyphens: a query like "Computer Science (Bachelor of
         # Science - Honours)" (exactly what this method's own callers display
         # back to the user) would otherwise produce tokens "(bachelor" and
-        # "honours)" that never substring-match the un-parenthesized haystack.
-        def _norm(s: str) -> str:
-            return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
-        tokens = _norm(query).split()
+        # "honours)" that never match the un-parenthesized haystack. Splitting
+        # the haystack into words (rather than keeping it as one string) is
+        # also what confines a token to a single word — see the docstring.
+        def _norm_words(s: str) -> list:
+            return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).split()
+        tokens = _norm_words(query)
         if not tokens:
             return []
         matches = []
@@ -534,8 +558,10 @@ class GraphStore:
             title = d.get("title") or ""
             code = d.get("code") or ""
             credential = d.get("credential") or ""
-            haystack = _norm(f"{title} {code} {credential}")
-            if all(tok in haystack for tok in tokens):
+            name_words = _norm_words(f"{title} {credential}")
+            code_words = _norm_words(code)
+            if all(any(w.startswith(tok) for w in name_words) or tok in code_words
+                   for tok in tokens):
                 matches.append({
                     "pid": pid,
                     "code": code,
