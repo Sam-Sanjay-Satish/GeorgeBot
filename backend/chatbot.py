@@ -130,7 +130,7 @@ COLLECTION_NAMES = {
     "faculty": "georgebot_v22_faculty",
 }
 VALID_AUDIENCES = ("undergrad", "faculty", "both")
-DEFAULT_AUDIENCE = "undergrad"
+DEFAULT_AUDIENCE = "both"
 VOYAGE_MODEL = "voyage-4-large"
 
 # Single provider — official MiniMax API (OpenAI-compatible), not the
@@ -172,6 +172,9 @@ CAMPUS_TERM_GLOSSARY = {
     "the cove": "The Cove dining hall, UVic's campus dining facility in "
                  "Cheko'nien House (Student Housing and Dining) — not the "
                  "UVic Cove child care centre.",
+    "cl": "Community Leader — a student staff role in UVic Student Housing "
+          "(residence life), similar to a residence advisor/don at other "
+          "schools.",
 }
 
 # Default-mode verify-then-answer path: combined verify-then-answer call,
@@ -813,9 +816,12 @@ class GeorgeBot:
                 lines.append(f"{role}: {turn.get('content', '')}")
             convo = "Conversation so far:\n" + "\n".join(lines) + "\n\n"
 
+        # Whole-word match (not substring) — a short acronym like "cl" would
+        # otherwise false-positive inside "class", "declare", "include", etc.
+        question_lower = question.lower()
         glossary_hits = {
             term: meaning for term, meaning in CAMPUS_TERM_GLOSSARY.items()
-            if term in question.lower()
+            if re.search(rf"\b{re.escape(term)}\b", question_lower)
         }
         glossary_block = ""
         if glossary_hits:
