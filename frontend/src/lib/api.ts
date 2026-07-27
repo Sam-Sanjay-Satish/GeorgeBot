@@ -1,4 +1,4 @@
-import type { Audience, Message, PlanningState, Source, ThinkingMode } from '@/types'
+import type { Audience, Message, Source, ThinkingMode } from '@/types'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:5001'
 
@@ -111,40 +111,18 @@ interface StreamHandlers {
   onToken: (text: string) => void
   onDone: () => void
   onError: (message: string) => void
-  // "default" mode only: the course-planning/situational plan needs more info
-  // (e.g. program/term, or which situation type) and asks a question instead
-  // of answering. Terminal for this turn — the user's reply comes back as an
-  // ordinary next question carrying prior history.
-  onClarify?: (text: string) => void
-  // "default" mode only: fires once, before any status/token, when the
-  // planner dispatched into an extended-thinking plan — the plan's display
-  // label (e.g. "Course Planner"). Absent entirely for ordinary answers.
-  onMode?: (label: string) => void
-  // Course-planning plan only: the resolved planning slots, fired whenever
-  // they changed this turn. Store it and pass it back as `planningState` on
-  // the next call for this conversation — without the echo the backend
-  // re-derives every slot from history and can re-ask questions the user
-  // already answered.
-  onPlanningState?: (state: PlanningState) => void
 }
 
 // POST + manually parsed SSE — EventSource doesn't support POST bodies, so we
 // read the fetch response stream directly and split on the "event:\ndata:\n\n"
-// frame format the backend (/api/chat/stream) emits. Events: status (pre-answer
-// phase text), sources, token, done, error, and — in "default" mode's three
-// extended-thinking plans — mode (plan label, fires first), clarify, and
-// planning_state (course planning only).
-//
-// `planningState` is the last state the backend emitted for THIS conversation
-// (null to start a fresh one); echoing it back is what keeps already-resolved
-// course-planning slots from being re-derived every turn.
+// frame format the backend (/api/chat/stream) emits. Events: status
+// (pre-answer phase text), sources, token, done, error.
 export async function askGeorgeStream(
   question: string,
   priorMessages: Message[],
   audience: Audience,
   handlers: StreamHandlers,
   mode: ThinkingMode = 'quick',
-  planningState: PlanningState | null = null,
 ): Promise<void> {
   const res = await fetch(`${API_BASE}/api/chat/stream`, {
     method: 'POST',
@@ -154,7 +132,6 @@ export async function askGeorgeStream(
       history: toHistory(priorMessages),
       audience,
       mode,
-      planning_state: planningState,
     }),
   })
   if (!res.ok || !res.body) {
@@ -184,18 +161,12 @@ export async function askGeorgeStream(
 
       try {
         const data = JSON.parse(rawData)
-        if (event === 'mode') {
-          handlers.onMode?.(data as string)
-        } else if (event === 'status') {
+        if (event === 'status') {
           handlers.onStatus(data as string)
         } else if (event === 'sources') {
           handlers.onSources((data as ApiSource[]).map(mapSource))
         } else if (event === 'token') {
           handlers.onToken(data as string)
-        } else if (event === 'clarify') {
-          handlers.onClarify?.(data as string)
-        } else if (event === 'planning_state') {
-          handlers.onPlanningState?.(data as PlanningState)
         } else if (event === 'done') {
           handlers.onDone()
         } else if (event === 'error') {

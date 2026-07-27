@@ -1,12 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
-import { LogOut, User } from 'lucide-react'
+import { RotateCcw, User } from 'lucide-react'
 
 interface Props {
-  name: string
-  onLogout: () => void
+  onReset: () => void
 }
 
-export function AccountMenu({ name, onLogout }: Props) {
+export function AccountMenu({ onReset }: Props) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
 
@@ -31,17 +30,27 @@ export function AccountMenu({ name, onLogout }: Props) {
       </button>
 
       {open && (
-        <div className="absolute right-0 top-10 w-48 rounded-xl border border-border bg-card shadow-md z-50 overflow-hidden">
+        <div className="absolute right-0 top-10 w-56 rounded-xl border border-border bg-card shadow-md z-50 overflow-hidden">
           <div className="px-4 py-3 border-b border-border">
-            <p className="text-xs text-muted-foreground">Signed in as</p>
-            <p className="text-sm font-medium truncate">{name}</p>
+            <p className="text-xs text-muted-foreground">
+              For educational use only — always verify important info on{' '}
+              <a
+                href="https://www.uvic.ca"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline underline-offset-2 hover:text-foreground"
+              >
+                uvic.ca
+              </a>
+              .
+            </p>
           </div>
           <button
-            onClick={() => { setOpen(false); onLogout() }}
+            onClick={() => { setOpen(false); onReset() }}
             className="w-full flex items-center gap-2 px-4 py-2.5 text-sm hover:bg-muted transition-colors text-left"
           >
-            <LogOut className="w-4 h-4 text-muted-foreground" />
-            Log out
+            <RotateCcw className="w-4 h-4 text-muted-foreground" />
+            Start over
           </button>
         </div>
       )}

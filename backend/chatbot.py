@@ -174,15 +174,9 @@ CAMPUS_TERM_GLOSSARY = {
                  "UVic Cove child care centre.",
 }
 
-# Planner (rewrite_and_route, mode="default") mode-selection tuning.
-VALID_PLANS = ("scattered_info", "course_planning", "situational")
-DEFAULT_PLAN = "scattered_info"
-# Router confidence below this on a non-default plan pick -> fall back to
-# scattered_info (the most general plan) rather than trust a shaky read.
-CONFIDENCE_THRESHOLD = 0.6
-
-# Default-mode "simple" path: combined verify-then-answer call, thinking
-# adaptive. Capped gated rounds before forcing a plain (no-verify) answer.
+# Default-mode verify-then-answer path: combined verify-then-answer call,
+# thinking adaptive. Capped gated rounds before forcing a plain (no-verify)
+# answer.
 MAX_VERIFY_ROUNDS = 2
 
 
@@ -793,7 +787,7 @@ class GeorgeBot:
         return None
 
     def rewrite_and_route(self, question: str, history: list[dict],
-                          audience: str = DEFAULT_AUDIENCE, mode: str = "quick") -> dict:
+                          audience: str = DEFAULT_AUDIENCE) -> dict:
         """
         One minimax-m3 call: rewrite the question into a standalone search query
         AND classify whether it needs structured course/program facts (graph
@@ -802,13 +796,6 @@ class GeorgeBot:
         `audience` selects which topic-family vocabulary the router chooses from
         (undergrad / faculty / both) — it must match the collection(s) that
         vector_retrieve will search, or the predicted families won't filter.
-
-        `mode="default"` additionally asks the same call to decide whether the
-        question is simple (answerable in one pass) or needs one of the three
-        extended-thinking plans (scattered_info / course_planning / situational)
-        — this subsumes what used to be a separate `thinking.classify_mode`
-        call. `mode="quick"` (default) skips that extra prompt content
-        entirely, since quick mode never dispatches into a plan.
         """
         # Topic-family vocabulary the router may choose from for this audience.
         if audience == "both":
@@ -825,34 +812,6 @@ class GeorgeBot:
                 role = "User" if turn.get("role") == "user" else "Assistant"
                 lines.append(f"{role}: {turn.get('content', '')}")
             convo = "Conversation so far:\n" + "\n".join(lines) + "\n\n"
-
-        mode_fields = ""
-        if mode == "default":
-            mode_fields = (
-                f'  "is_simple": true if this question can be answered directly '
-                f"from one retrieval pass (a single lookup or fact, even if it "
-                f"needs graph/vector/live-data retrieval), false if it needs "
-                f"deeper multi-step handling. This is the DEFAULT (true) when "
-                f"unsure — only say false for a clear case below.\n"
-                f'  "plan": required (and must be one of the three values below) '
-                f'when is_simple is false, else null. Exactly one of:\n'
-                f"    - \"scattered_info\": the answer needs information gathered "
-                f"across many topics/documents, or several differently-worded "
-                f"searches to surface content one phrasing would miss. Research-"
-                f"style, broad, or compare/summarize-across-X questions.\n"
-                f"    - \"course_planning\": the student wants help choosing what "
-                f"courses to take (next term or to finish their degree), based on "
-                f"completed courses, program, and preferences. Involves "
-                f"eligibility + live section timing.\n"
-                f"    - \"situational\": the student is in a specific procedural/"
-                f"policy situation (academic-integrity allegation, financial "
-                f"hold, medical/compassionate withdrawal, academic standing/"
-                f"probation, grade appeal, admission/registration issue) and "
-                f"needs to know what it means and what to do.\n"
-                f'  "confidence": 0.0-1.0, how confident you are in the "plan" '
-                f"pick (0.0 and null is_simple=true is fine when is_simple is "
-                f"true).\n"
-            )
 
         glossary_hits = {
             term: meaning for term, meaning in CAMPUS_TERM_GLOSSARY.items()
@@ -931,7 +890,6 @@ class GeorgeBot:
             f"process) — null if the question is general/cross-departmental or "
             f"you're not confident which department applies:\n"
             f"{json.dumps(self.departments)}\n"
-            f"{mode_fields}\n"
             f"Populate course_codes whenever the question is actually ABOUT a "
             f"specific course — either its structured catalog facts (prerequisites, "
             f"credits, cross-listings, description, degree/program requirements, "
@@ -961,23 +919,6 @@ class GeorgeBot:
                 year = int(data["term_year"]) if data.get("term_year") else None
             except (TypeError, ValueError):
                 year = None
-            # Mode-selection fields — only asked for (and only meaningful) when
-            # mode="default"; quick mode gets the harmless defaults below.
-            is_simple, plan, confidence = True, None, 0.0
-            if mode == "default":
-                is_simple = bool(data.get("is_simple", True))
-                if not is_simple:
-                    plan = data.get("plan")
-                    if plan not in VALID_PLANS:
-                        plan = DEFAULT_PLAN
-                    try:
-                        confidence = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
-                    except (TypeError, ValueError):
-                        confidence = 0.0
-                    # Low-confidence non-default pick -> fall back to the most
-                    # general plan rather than trust a shaky read.
-                    if confidence < CONFIDENCE_THRESHOLD and plan != DEFAULT_PLAN:
-                        plan = DEFAULT_PLAN
             return {
                 "search_query": data.get("search_query") or question,
                 "completed_courses": [c.replace(" ", "").upper() for c in (data.get("completed_courses") or [])],
@@ -992,9 +933,6 @@ class GeorgeBot:
                 "term_year": year,
                 "topic_families": [f for f in (data.get("topic_families") or []) if f in valid_families],
                 "department": dept,
-                "is_simple": is_simple,
-                "plan": plan,
-                "confidence": confidence,
             }
         except Exception as e:
             print(f"  [rewrite_and_route] failed, falling back to vector-only: {e}", file=sys.stderr)
@@ -1002,8 +940,7 @@ class GeorgeBot:
                     "wants_outline": False, "wants_availability": False, "instructor_query": None,
                     "professor_query": None, "wants_rating": False,
                     "term_season": None, "term_year": None, "completed_courses": [],
-                    "topic_families": [], "department": None,
-                    "is_simple": True, "plan": None, "confidence": 0.0}
+                    "topic_families": [], "department": None}
 
     @staticmethod
     def _build_context(chunks: list[dict], graph_text: str, offset: int) -> str:
@@ -1107,11 +1044,9 @@ class GeorgeBot:
         "- Be concise and direct. Use plain text (no LaTeX)."
     )
 
-    # Appended to SYSTEM_PROMPT for the default-mode "simple" path's combined
-    # verify-then-answer call (see `answer_verified_stream`). Kept narrow by
-    # design — NEED_MORE should be rare, since a broad/multi-part question
-    # should already have been routed to scattered_info by the planner
-    # instead of down this path at all.
+    # Appended to SYSTEM_PROMPT for default mode's combined verify-then-answer
+    # call (see `answer_verified_stream`). Kept narrow by design — NEED_MORE
+    # should be rare, reserved for a genuine, narrowly-scoped gap.
     VERIFY_ANSWER_ADDENDUM = (
         "\n\nRESPONSE FORMAT\n"
         "This call has one extra requirement on top of everything above. "
@@ -1165,10 +1100,9 @@ class GeorgeBot:
         material, framed as system-supplied (NOT part of the user turn) so the
         model doesn't treat it as something the user typed or attached.
 
-        `base_prompt` overrides the default `SYSTEM_PROMPT` — used by the
-        extended-thinking modes (thinking.py) to supply a mode-specific
-        behavioral contract (e.g. the situational tone/no-case-assessment
-        rules) while reusing the same reference-material framing below."""
+        `base_prompt` overrides the default `SYSTEM_PROMPT` — used by
+        `_quick_mode_system_prompt` to supply a mode-specific behavioral
+        contract while reusing the same reference-material framing below."""
         base = base_prompt if base_prompt is not None else self.SYSTEM_PROMPT
         context = (context or "").strip()
         if context:
@@ -1207,8 +1141,8 @@ class GeorgeBot:
         """MiniMax-M3, thinking disabled — reference material is supplied via the
         system prompt (`_system_prompt_with_context`), not the user turn.
 
-        `system_prompt` overrides the default behavioral contract (used by the
-        extended-thinking modes for a mode-specific answer prompt)."""
+        `system_prompt` overrides the default behavioral contract (e.g. a
+        mode-specific answer prompt)."""
         messages = self._answer_messages(question, history)
         text = self._call_llm(messages,
                                system=self._system_prompt_with_context(context, system_prompt),
@@ -1266,12 +1200,10 @@ class GeorgeBot:
             yield "Sorry, I couldn't generate an answer right now — please try again."
 
     def answer_verified_stream(self, question: str, context: str, history: list[dict]):
-        """Combined verify-then-answer call for default mode's "simple" path.
+        """Combined verify-then-answer call for default mode's answering path.
 
-        Streamed, `thinking: "adaptive"` (the one other place this repo uses
-        adaptive thinking is `thinking.py`'s scattered_info coverage
-        evaluator). The model prefixes its response with `<<SUFFICIENT>>` or
-        `<<NEED_MORE>>` (see `VERIFY_ANSWER_ADDENDUM`) before writing the
+        Streamed, `thinking: "adaptive"`. The model prefixes its response with
+        `<<SUFFICIENT>>` or `<<NEED_MORE>>` (see `VERIFY_ANSWER_ADDENDUM`) before writing the
         answer or a correction request, so one call serves as both judge and
         answerer in the common case. The header is peeled off by buffering up
         to the first newline — the same buffer-then-decide idiom
@@ -1589,8 +1521,8 @@ def main() -> None:
                          help=f"corpus to search (default {DEFAULT_AUDIENCE})")
     parser.add_argument("--mode", default="quick", choices=("quick", "default"),
                          help="quick (default): flat retrieve->answer, 2 calls. "
-                              "default: the planner also picks simple vs. one of the "
-                              "course_planning/situational/scattered_info plans.")
+                              "default: retrieve->answer->self-verify, with one "
+                              "targeted re-fetch if the model flags a gap.")
     args = parser.parse_args()
 
     bot = GeorgeBot()
@@ -1599,17 +1531,10 @@ def main() -> None:
     else:
         # Mirrors /api/chat's non-streaming "default" dispatch (api.py) —
         # imported lazily so plain `--mode quick` runs never need fastapi.
-        from api import _default_simple_events, _drain_events
-        from thinking import ExtendedThinking
+        from api import _default_verified_events, _drain_events
 
-        route = bot.rewrite_and_route(args.ask, [], args.audience, mode="default")
-        print(f"[cli] is_simple={route['is_simple']} plan={route['plan']} "
-              f"confidence={route['confidence']}", file=sys.stderr)
-        if route["is_simple"]:
-            events = _default_simple_events(bot, args.ask, [], args.audience, route)
-        else:
-            events = ExtendedThinking(bot).run(
-                args.ask, [], args.audience, route, route["plan"], route["confidence"])
+        route = bot.rewrite_and_route(args.ask, [], args.audience)
+        events = _default_verified_events(bot, args.ask, [], args.audience, route)
         result = _drain_events(events)
         result.setdefault("search_query", route["search_query"])
 
@@ -1617,8 +1542,6 @@ def main() -> None:
     print(f"Chunks used:  {result.get('n_chunks', len(result.get('sources', [])))}\n")
     print("Answer:")
     print(result.get("answer") or result.get("error", "(no answer)"))
-    if result.get("needs_clarification"):
-        print("\n(needs_clarification: the plan asked a question instead of answering)")
     print("\nSources:")
     for s in result.get("sources", []):
         tags = " ".join(t for t in [s.get("source", ""), s.get("course_code") or "",

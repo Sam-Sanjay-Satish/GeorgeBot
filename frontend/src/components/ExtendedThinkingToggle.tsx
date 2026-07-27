@@ -6,11 +6,9 @@ interface Props {
   disabled?: boolean
 }
 
-// On (checked) = "quick": today's single-shot answer path. Off = "default": a
-// planner call decides per-question whether it's simple or needs deeper
-// handling (research, course planning, or situational guidance) and
-// auto-dispatches — no separate label needed, "off" is just the richer default
-// behavior. Sent with each question as `mode`.
+// On (checked) = "quick": today's single-shot answer path. Off = "default":
+// retrieve, answer, then the model self-checks its own answer and does one
+// targeted re-fetch if it flagged a gap. Sent with each question as `mode`.
 export function ExtendedThinkingToggle({ value, onChange, disabled }: Props) {
   const checked = value === 'quick'
 
@@ -28,7 +26,7 @@ export function ExtendedThinkingToggle({ value, onChange, disabled }: Props) {
         title={
           checked
             ? 'Quick mode: fast, single-pass answers.'
-            : 'Automatically goes deeper when it helps: multi-step research, course planning, or situational guidance.'
+            : 'Double-checks its own answer and re-fetches once if it spots a gap.'
         }
         className="flex items-center gap-2 rounded-md px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
       >

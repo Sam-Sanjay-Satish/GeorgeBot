@@ -13,16 +13,9 @@ HTTP API:
   GET  /health
   POST /api/chat          {question, history?}  -> {answer, sources, ...}  (JSON)
   POST /api/chat/stream   {question, history?}  -> text/event-stream (SSE)
-                          SSE events: mode, status, planning_state, clarify,
-                          sources, token, done, error
+                          SSE events: status, sources, token, done, error
                           ("status" fires before tokens with a short, templated
-                          phase message, e.g. "Looking up CSC 225…"; "mode"
-                          fires first, only in mode="default" when an
-                          extended-thinking plan is dispatched — see
-                          thinking.PLAN_LABELS; "planning_state" fires only for
-                          the course_planning plan and MUST be echoed back in
-                          the next request's `planning_state` field — see
-                          thinking.py's module docstring)
+                          phase message, e.g. "Looking up CSC 225…")
 
 Env (.env): MINIMAX_SUB_KEY, VOYAGE_API_KEY
 """
@@ -38,7 +31,6 @@ from pydantic import BaseModel
 
 from banner import banner_instructor_retrieve, banner_retrieve
 from chatbot import DEFAULT_AUDIENCE, MAX_VERIFY_ROUNDS, VALID_AUDIENCES, GeorgeBot
-from thinking import ExtendedThinking
 
 VALID_MODES = ("quick", "default")
 DEFAULT_MODE = "default"
@@ -51,16 +43,10 @@ class ChatRequest(BaseModel):
     # the user via the frontend toggle; anything unrecognized falls back to the
     # default rather than erroring.
     audience: str = DEFAULT_AUDIENCE
-    # "quick" (today's flat retrieve->answer pipeline) | "default" (the
-    # planner also decides simple vs. one of the three extended-thinking
-    # plans -- see chatbot.rewrite_and_route(mode=...) and thinking.py).
-    # Replaces the old boolean `extended_thinking` toggle.
+    # "quick": today's flat retrieve->answer pipeline.
+    # "default": retrieve->answer->self-verify, with one targeted re-fetch if
+    # the model flags a gap (see _default_verified_events).
     mode: str = DEFAULT_MODE
-    # Course-planning slots the client is echoing back from the previous turn's
-    # `planning_state` event (see thinking.py's module docstring). Optional and
-    # untrusted — thinking.py sanitizes it, and None/malformed simply means
-    # "derive everything from history", the pre-persistence behavior.
-    planning_state: dict | None = None
 
 
 def _clean_audience(value: str | None) -> str:
@@ -106,17 +92,11 @@ def _route_status(route: dict) -> str:
 
 
 def _drain_events(events) -> dict:
-    """Collect a `{type, data}` event generator (`ExtendedThinking.run` or
-    `_default_simple_events` -- the same shapes `/api/chat/stream` maps to
-    SSE frames) into one JSON-friendly dict, for the non-streaming endpoint
-    and the CLI. A `clarify` event terminates the turn without a real answer
-    -- surfaced as the answer text with `needs_clarification` set so callers
-    can render it like any other answer."""
+    """Collect a `{type, data}` event generator (`_default_verified_events` --
+    the same shape `/api/chat/stream` maps to SSE frames) into one
+    JSON-friendly dict, for the non-streaming endpoint and the CLI."""
     answer_parts: list[str] = []
     sources: list[dict] = []
-    needs_clarification = False
-    mode_label = None
-    planning_state = None
     error = None
     for ev in events:
         etype, data = ev.get("type"), ev.get("data")
@@ -124,37 +104,20 @@ def _drain_events(events) -> dict:
             answer_parts.append(data)
         elif etype == "sources":
             sources = data
-        elif etype == "clarify":
-            answer_parts = [data]
-            needs_clarification = True
-        elif etype == "mode":
-            mode_label = data
-        elif etype == "planning_state":
-            planning_state = data
         elif etype == "error":
             error = data
     if error is not None:
         return {"error": error}
-    result = {"answer": "".join(answer_parts), "sources": sources,
-              "n_chunks": len(sources)}
-    if needs_clarification:
-        result["needs_clarification"] = True
-    if mode_label:
-        result["mode_label"] = mode_label
-    if planning_state is not None:
-        # Course-planning only: the caller must echo this back on the next turn
-        # (see thinking.py's module docstring) or slots re-derive from scratch.
-        result["planning_state"] = planning_state
-    return result
+    return {"answer": "".join(answer_parts), "sources": sources,
+            "n_chunks": len(sources)}
 
 
-def _default_simple_events(bot: GeorgeBot, question: str, history: list[dict],
-                           audience: str, route: dict):
-    """Default mode's "simple" path: retrieve, then a combined verify-answer
+def _default_verified_events(bot: GeorgeBot, question: str, history: list[dict],
+                             audience: str, route: dict):
+    """Default mode's answering path: retrieve, then a combined verify-answer
     loop (`bot.answer_verified_stream`) capped at `MAX_VERIFY_ROUNDS` gated
-    rounds before a forced plain answer. Yields the same `{type, data}` event
-    shape as `ExtendedThinking.run()`, so both the SSE handler and
-    `_drain_events` can treat them uniformly.
+    rounds before a forced plain answer. Yields `{type, data}` events that
+    both the SSE handler and `_drain_events` can treat uniformly.
 
     Nothing is forwarded to the caller for a NEED_MORE round (per
     `answer_verified_stream`, it never yields a "token" before a verdict is
@@ -209,7 +172,6 @@ def _default_simple_events(bot: GeorgeBot, question: str, history: list[dict],
 
 def create_app(bot: GeorgeBot) -> FastAPI:
     app = FastAPI(title="GeorgeBot")
-    thinker = ExtendedThinking(bot)
 
     # CORS allow-list. Prod origins come from CORS_ALLOW_ORIGINS (comma-
     # separated, e.g. "https://georgebot.ca,https://www.georgebot.ca"); local
@@ -250,16 +212,10 @@ def create_app(bot: GeorgeBot) -> FastAPI:
         if mode == "quick":
             return bot.ask(question, req.history, audience=audience)
 
-        # mode == "default": one planner call decides simple vs. one of the
-        # three extended-thinking plans; both paths yield the same {type,
-        # data} event shape, drained here into one JSON response.
-        route = bot.rewrite_and_route(question, req.history, audience, mode=mode)
-        if route["is_simple"]:
-            events = _default_simple_events(bot, question, req.history, audience, route)
-        else:
-            events = thinker.run(question, req.history, audience,
-                                 route, route["plan"], route["confidence"],
-                                 req.planning_state)
+        # mode == "default": retrieve -> answer -> self-verify, drained here
+        # into one JSON response.
+        route = bot.rewrite_and_route(question, req.history, audience)
+        events = _default_verified_events(bot, question, req.history, audience, route)
         result = _drain_events(events)
         result.setdefault("search_query", route["search_query"])
         return result
@@ -279,19 +235,12 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                 # can emit an early "status" event during the gap before
                 # retrieval/answer tokens start streaming. Status text is
                 # templated from route state — no extra LLM call, no added
-                # latency beyond the planner call itself.
-                route = bot.rewrite_and_route(question, req.history, audience, mode=mode)
+                # latency beyond the router call itself.
+                route = bot.rewrite_and_route(question, req.history, audience)
                 yield f"event: status\ndata: {json.dumps(_route_status(route))}\n\n"
 
-                if mode == "default" and not route["is_simple"]:
-                    # Not-simple: dispatch into one of the three preset plans.
-                    # The planner already classified + downgraded low-
-                    # confidence picks, so this no longer re-classifies.
-                    events = thinker.run(question, req.history, audience,
-                                         route, route["plan"], route["confidence"],
-                                         req.planning_state)
-                elif mode == "default":  # is_simple
-                    events = _default_simple_events(bot, question, req.history, audience, route)
+                if mode == "default":
+                    events = _default_verified_events(bot, question, req.history, audience, route)
                 else:  # mode == "quick"
                     events = None
 

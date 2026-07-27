@@ -4,10 +4,10 @@ import { ChatInput } from './components/ChatInput'
 import { AudienceToggle } from './components/AudienceToggle'
 import { ExtendedThinkingToggle } from './components/ExtendedThinkingToggle'
 import { ThemeToggle } from './components/ThemeToggle'
-import { LoginPage } from './components/LoginPage'
+import { DisclaimerPage } from './components/DisclaimerPage'
 import { AccountMenu } from './components/AccountMenu'
 import { askGeorgeStream } from './lib/api'
-import type { Audience, Message, PlanningState, Source, Theme, ThinkingMode } from './types'
+import type { Audience, Message, Source, Theme, ThinkingMode } from './types'
 
 // Tokens arrive from the backend in bursts (network + generation timing, not
 // a steady per-character rate), which reads as jittery/too-fast on screen.
@@ -18,18 +18,11 @@ const REVEAL_CHARS_PER_TICK = 3
 const REVEAL_TICK_MS = 16
 
 export default function App() {
-  const [loggedIn, setLoggedIn] = useState(false)
-  const [userName, setUserName] = useState('')
+  const [acknowledged, setAcknowledged] = useState(false)
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)
   const [audience, setAudience] = useState<Audience>('undergrad')
   const [thinkingMode, setThinkingMode] = useState<ThinkingMode>('default')
-  // Course-planning slots the backend has resolved so far in this conversation.
-  // Opaque to us — we just hold the last one it emitted and echo it back on
-  // every send, so it doesn't re-derive (and re-ask about) settled slots. Kept
-  // in a ref, not state: it's written and read inside a single send and never
-  // rendered, so it must not depend on a re-render to be current.
-  const planningStateRef = useRef<PlanningState | null>(null)
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = localStorage.getItem('theme')
     if (saved === 'light' || saved === 'dark') return saved
@@ -88,11 +81,6 @@ export default function App() {
 
     // History the backend should see = everything before this new question.
     const priorMessages = messages
-    // No prior messages = a genuinely new conversation, so any planning slots
-    // left over from a previous one must not leak into it. There's no explicit
-    // "new chat" control to hook into yet; if one is added, reset the ref there
-    // too (this check alone won't catch a clear-mid-conversation).
-    if (priorMessages.length === 0) planningStateRef.current = null
     setMessages((prev) => [...prev, userMsg, loadingMsg])
     setLoading(true)
 
@@ -147,18 +135,6 @@ export default function App() {
 
     try {
       await askGeorgeStream(text, priorMessages, audience, {
-        onMode: (mode) => {
-          // Fires once, before status/tokens — persists on the message
-          // (subsequent updates below all spread `...m`, so it survives).
-          setMessages((prev) =>
-            prev.map((m) => (m.id === loadingId ? { ...m, mode } : m))
-          )
-        },
-        onPlanningState: (state) => {
-          // Course-planning only. Held for the next send in this conversation;
-          // nothing is rendered from it.
-          planningStateRef.current = state
-        },
         onStatus: (status) => {
           // Transient pre-answer phase line; overwritten by later status events
           // and cleared once the first token arrives (see onToken).
@@ -179,18 +155,6 @@ export default function App() {
             )
           }
           pending += token
-          startFlushing()
-        },
-        onClarify: (text) => {
-          // Extended-thinking asked the user a question instead of answering.
-          // Clear the status line and reveal the clarify text through the same
-          // typewriter path as a normal answer, then finish (no sources, no
-          // further tokens — the stream ends after clarify).
-          setMessages((prev) =>
-            prev.map((m) => (m.id === loadingId ? { ...m, status: undefined } : m))
-          )
-          pending += text
-          streamEnded = true
           startFlushing()
         },
         onDone: () => {
@@ -220,7 +184,7 @@ export default function App() {
             setLoading(false)
           }
         },
-      }, thinkingMode, planningStateRef.current)
+      }, thinkingMode)
     } catch (err) {
       setMessages((prev) =>
         prev.map((m) =>
@@ -239,8 +203,8 @@ export default function App() {
     }
   }
 
-  if (!loggedIn) {
-    return <LoginPage onLogin={(name) => { setUserName(name); setLoggedIn(true) }} />
+  if (!acknowledged) {
+    return <DisclaimerPage onContinue={() => setAcknowledged(true)} />
   }
 
   return (
@@ -255,14 +219,7 @@ export default function App() {
           <p className="text-xs text-muted-foreground mt-0.5">UVic AI Assistant</p>
         </div>
         <ThemeToggle theme={theme} onToggle={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))} />
-        <AccountMenu
-          name={userName}
-          onLogout={() => {
-            setLoggedIn(false)
-            setUserName('')
-            planningStateRef.current = null
-          }}
-        />
+        <AccountMenu onReset={() => setAcknowledged(false)} />
       </header>
 
       {/* Messages */}

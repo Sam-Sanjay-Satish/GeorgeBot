@@ -1,7 +1,6 @@
 import { User } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { ModeTag } from './ModeTag'
 import { SourcePanel } from './SourcePanel'
 import type { Message } from '@/types'
 
@@ -25,11 +24,6 @@ export function MessageBubble({ message }: Props) {
       </div>
 
       <div className={`max-w-[78%] ${isUser ? 'items-end' : 'items-start'} flex flex-col`}>
-        {!isUser && message.mode && (
-          <div className="px-1 mb-1">
-            <ModeTag label={message.mode} />
-          </div>
-        )}
         <div
           className={`rounded-2xl px-4 py-3 text-sm leading-relaxed ${
             isUser

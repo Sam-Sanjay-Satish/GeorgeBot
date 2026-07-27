@@ -657,18 +657,29 @@ after new corpus content lands.
 
 ## Known issues / open items
 
-- **This doc is stale on the planner/extended-thinking split (2026-07-20 in
-  progress).** `rewrite_and_route` now takes a `mode` param ("quick" | the
-  planner's "default", which also decides `is_simple`/`plan`/`confidence` in
-  the same call — `thinking.py`'s old standalone `classify_mode` is gone).
-  The frontend's boolean extended-thinking toggle is now a quick/default
-  `ThinkingMode` segmented control (`ExtendedThinkingToggle.tsx`), and
-  `api.py`'s request body field is `mode`, not `extended_thinking`. The
-  "Retrieval Pipeline — Full Detail" section's step-1 description of
-  `rewrite_and_route`, the frontend section's `ExtendedThinkingToggle`
-  description, and any other mention of the old boolean toggle need a full
-  rewrite to match — not done as part of this change, flagging so it doesn't
-  go stale silently.
+- **The extended-thinking plan system was removed (2026-07-27).** There used
+  to be a "planner" layer where `rewrite_and_route(mode="default")` also
+  classified `is_simple`/`plan`/`confidence`, and a not-simple question
+  dispatched into one of three plans via `ExtendedThinking`
+  (`backend/thinking.py`): `scattered_info` ("Deep Research" — an
+  evaluator-driven multi-round retrieval loop), `course_planning` (multi-turn
+  course scheduling with persisted slot state, `backend/scheduler.py`), and
+  `situational` ("Guidance" — a fixed policy/procedure checklist).
+  `course_planning` had too many bugs to be worth keeping, and rather than
+  patch it in isolation, all three plans were removed together — there is no
+  plan-dispatch system anymore, and `thinking.py`/`scheduler.py` are gone.
+  `rewrite_and_route` no longer takes a `mode` param or returns
+  `is_simple`/`plan`/`confidence` — it always returns the same routing
+  fields regardless of caller. The Quick/Default toggle
+  (`ExtendedThinkingToggle.tsx`, `ThinkingMode`) still exists but now means
+  something simpler: Quick is the flat retrieve→answer pipeline; Default
+  additionally self-verifies the answer and does one targeted re-fetch if
+  the model flags a gap (`answer_verified_stream`/`MAX_VERIFY_ROUNDS`, via
+  `api.py`'s `_default_verified_events`) — this was already independent of
+  the plan system, just previously only reachable via the `is_simple=true`
+  branch. If course planning (or research/guidance modes) get rebuilt later,
+  they're starting from scratch — no scaffolding (`PlanningState`, the
+  `planning_state` SSE event, `ModeTag.tsx`, `Message.mode`) was preserved.
 - **MiniMax account-level Token Plan rate limit (429)**: opaque,
   token-throughput-based (not a flat request cap). Hit reliably under
   back-to-back calls (e.g. batch testing) — surfaces as `rate_limit_error
@@ -696,8 +707,10 @@ after new corpus content lands.
 - **Frontend**: `App.tsx` uses the streaming endpoint (`askGeorgeStream` →
   `/api/chat/stream`); tokens now arrive incrementally and a client-side
   typewriter (`REVEAL_CHARS_PER_TICK`/`REVEAL_TICK_MS`) paces the reveal.
-  Sources are buffered and shown only after the reveal completes. Login is a
-  mock shell (no real OAuth). `mockData.ts` exists but is unused.
+  Sources are buffered and shown only after the reveal completes. There is no
+  login/auth — the app gates on a one-time `DisclaimerPage` (educational-use
+  notice + a "Continue" button, state held as `acknowledged` in `App.tsx`);
+  `mockData.ts` exists but is unused.
 
 ---
 
