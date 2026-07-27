@@ -18,16 +18,14 @@ export function DisclaimerPage({ onContinue }: Props) {
           </div>
         </div>
 
-        {/* Disclaimer card */}
+        {/* Intro card */}
         <div className="w-full rounded-2xl border border-border bg-card shadow-sm p-6 flex flex-col gap-4">
           <div className="text-center">
-            <p className="text-sm font-medium">Before you get started</p>
+            <p className="text-sm font-medium">Ask anything about UVic</p>
           </div>
 
           <p className="text-sm text-muted-foreground text-center">
-            GeorgeBot is for educational and informational purposes only. It can
-            make mistakes, so always verify anything important — deadlines,
-            requirements, fees, policies — on{' '}
+            GeorgeBot answers straight from{' '}
             <a
               href="https://www.uvic.ca"
               target="_blank"
@@ -36,9 +34,9 @@ export function DisclaimerPage({ onContinue }: Props) {
             >
               uvic.ca
             </a>{' '}
-            or by contacting the relevant UVic office directly. If GeorgeBot
-            doesn't have a good answer, that's your cue to check an official
-            source instead.
+            — course details, policies, live registration data, and even
+            niche facts — so you get accurate, up-to-date information without
+            digging through the site yourself.
           </p>
 
           <button

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { RotateCcw, User } from 'lucide-react'
+import { RotateCcw, Settings } from 'lucide-react'
 
 interface Props {
   onReset: () => void
@@ -24,9 +24,9 @@ export function AccountMenu({ onReset }: Props) {
       <button
         onClick={() => setOpen((o) => !o)}
         className="w-8 h-8 rounded-full bg-muted flex items-center justify-center hover:bg-accent transition-colors"
-        aria-label="Account menu"
+        aria-label="Settings menu"
       >
-        <User className="w-4 h-4 text-muted-foreground" />
+        <Settings className="w-4 h-4 text-muted-foreground" />
       </button>
 
       {open && (
