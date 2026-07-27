@@ -37,7 +37,6 @@ Env (.env): MINIMAX_SUB_KEY, VOYAGE_API_KEY
 """
 
 import argparse
-import itertools
 import json
 import os
 import re
@@ -122,6 +121,102 @@ def _iter_visible_deltas(chunks):
     # Flush any trailing text that wasn't a real (partial) tag.
     if not in_think and pending:
         yield pending
+
+
+_CITED_TAG_OPEN = "<<CITED_SOURCES:"
+_CITED_TAG_CLOSE = ">>"
+
+
+def _split_cited_sources(chunks):
+    """Yield visible answer text, stripping a trailing `<<CITED_SOURCES:
+    2,3>>` marker (see SYSTEM_PROMPT's CITED SOURCES section) that reports
+    which numbered `[n]` reference blocks the answer actually relied on —
+    even when the marker straddles chunk boundaries (same buffer-then-decide
+    idiom `_iter_visible_deltas` uses for `<think>` tags). The marker is
+    expected at most once, at the very end of the response.
+
+    This generator's return value (readable via `yield from` or manual
+    `next()`/`StopIteration.value`) is the raw string between the tag
+    delimiters, or None if no complete marker was found — callers should
+    treat None as "unknown" and fail open (show every source) rather than
+    hiding real ones over a parsing hiccup.
+    """
+    pending = ""
+    tag_open = False
+    done = False
+    body: str | None = None
+    for chunk in chunks:
+        if done or not chunk:
+            continue
+        pending += chunk
+        if not tag_open:
+            idx = pending.find(_CITED_TAG_OPEN)
+            if idx == -1:
+                # Emit everything except a possible partial opening tag.
+                keep = _suffix_prefix_len(pending, _CITED_TAG_OPEN)
+                emit = pending[:len(pending) - keep] if keep else pending
+                if emit:
+                    yield emit
+                pending = pending[len(pending) - keep:] if keep else ""
+                continue
+            if idx > 0:
+                yield pending[:idx]
+            pending = pending[idx:]
+            tag_open = True
+        close_idx = pending.find(_CITED_TAG_CLOSE, len(_CITED_TAG_OPEN))
+        if close_idx != -1:
+            body = pending[len(_CITED_TAG_OPEN):close_idx]
+            pending = ""
+            done = True
+    # Anything still pending here is either ordinary text (no tag ever
+    # started) or a truncated marker (tag opened but never closed, e.g. the
+    # model got cut off mid-tag) — the latter is dropped rather than leaked
+    # to the user as broken-looking text.
+    if not tag_open and pending:
+        yield pending
+    return body
+
+
+def _parse_cited_sources(body: str | None) -> list[int] | None:
+    """Parse a `_split_cited_sources`/`_extract_cited_sources` body into a
+    list of cited `[n]` numbers. `"none"` (the model relied on no numbered
+    material) parses to an empty list; a missing/malformed body returns None
+    ("unknown" — callers should fail open, not hide every source)."""
+    if body is None:
+        return None
+    body = body.strip()
+    if not body:
+        return None
+    if body.lower() == "none":
+        return []
+    nums = [int(n) for n in re.findall(r"\d+", body)]
+    return nums or None
+
+
+def _extract_cited_sources(text: str) -> tuple[str, list[int] | None]:
+    """Non-streaming counterpart to `_split_cited_sources`: strip a trailing
+    `<<CITED_SOURCES: ...>>` marker from a complete answer string, returning
+    (clean_text, cited_numbers)."""
+    idx = text.rfind(_CITED_TAG_OPEN)
+    if idx == -1:
+        return text, None
+    close = text.find(_CITED_TAG_CLOSE, idx + len(_CITED_TAG_OPEN))
+    if close == -1:
+        return text, None
+    body = text[idx + len(_CITED_TAG_OPEN):close]
+    clean = (text[:idx] + text[close + len(_CITED_TAG_CLOSE):]).strip()
+    return clean, _parse_cited_sources(body)
+
+
+def _filter_cited_sources(sources: list[dict], cited: list[int] | None) -> list[dict]:
+    """Keep only the sources the model reported actually relying on (see
+    `_parse_cited_sources`). `cited=None` means no valid marker was found —
+    fail open and return every source rather than hiding real ones."""
+    if cited is None:
+        return sources
+    cited_set = set(cited)
+    return [s for s in sources if s["n"] in cited_set]
+
 
 # v2.2 splits the corpus into two Chroma collections in one DB. The user picks
 # which to search per request (undergrad / faculty / both) — see `audience`.
@@ -1047,7 +1142,21 @@ class GeorgeBot:
         "- If a program search returned multiple candidates, ask the user to "
         "clarify which one they mean rather than guessing.\n\n"
         "STYLE\n"
-        "- Be concise and direct. Use plain text (no LaTeX)."
+        "- Be concise and direct. Use plain text (no LaTeX).\n\n"
+        "CITED SOURCES\n"
+        "After you finish writing your answer, on a new line by itself, "
+        "report which numbered reference blocks (the [n] tags in the "
+        "reference material above) you actually relied on to write it. "
+        "Format: `<<CITED_SOURCES: 2,3>>` listing only the numbers you "
+        "used, in any order — not every number that was offered to you, "
+        "just the ones you actually leaned on. If you answered from your "
+        "own knowledge without relying on any numbered material (including "
+        "when all of it was irrelevant), write `<<CITED_SOURCES: none>>` "
+        "instead. This must be the very last thing in your response, "
+        "exactly once, with nothing after it, and never mentioned or "
+        "explained anywhere in the visible answer. (This does not apply "
+        "when you are writing a NEED_MORE JSON response instead of an "
+        "answer — that response has no CITED_SOURCES tag.)"
     )
 
     # Appended to SYSTEM_PROMPT for default mode's combined verify-then-answer
@@ -1143,27 +1252,38 @@ class GeorgeBot:
         return messages
 
     def answer(self, question: str, context: str, history: list[dict],
-               system_prompt: str | None = None) -> str:
+               system_prompt: str | None = None) -> tuple[str, list[int] | None]:
         """MiniMax-M3, thinking disabled — reference material is supplied via the
         system prompt (`_system_prompt_with_context`), not the user turn.
 
         `system_prompt` overrides the default behavioral contract (e.g. a
-        mode-specific answer prompt)."""
+        mode-specific answer prompt).
+
+        Returns (answer_text, cited_source_numbers) — see
+        `_extract_cited_sources`/`_parse_cited_sources` for what the second
+        element means. Callers should pass it to `_filter_cited_sources`
+        before showing sources to the user."""
         messages = self._answer_messages(question, history)
         text = self._call_llm(messages,
                                system=self._system_prompt_with_context(context, system_prompt),
                                max_tokens=ANSWER_MAX_TOKENS, thinking="disabled")
-        return text or "Sorry, I couldn't generate an answer right now — please try again."
+        text = text or "Sorry, I couldn't generate an answer right now — please try again."
+        return _extract_cited_sources(text)
 
     def _stream_answer_raw(self, messages: list[dict], system: str, thinking: str):
         """Low-level streamed MiniMax-M3 call, shared by `answer_stream` and
         `answer_verified_stream`. Builds the full message list, streams, and
-        pipes raw `content` deltas through `_iter_visible_deltas`, which drops
-        any `<think>...</think>` span even when a tag straddles chunk
-        boundaries — regardless of `thinking`, since `reasoning_split` isn't
-        100% reliable (see `_call_llm`). Yields raw visible text deltas with
-        no leading-whitespace trimming or empty-stream fallback; callers own
-        that."""
+        pipes raw `content` deltas through `_iter_visible_deltas` (drops any
+        `<think>...</think>` span, even split across chunk boundaries —
+        regardless of `thinking`, since `reasoning_split` isn't 100% reliable,
+        see `_call_llm`) and then `_split_cited_sources` (strips a trailing
+        `<<CITED_SOURCES: ...>>` marker the same way). Yields raw visible
+        text deltas with no leading-whitespace trimming or empty-stream
+        fallback; callers own that.
+
+        Returns (via this generator's return value — retrievable through
+        `yield from` or manual `next()`/`StopIteration.value`) the parsed
+        cited-source numbers (list[int] | None; see `_parse_cited_sources`)."""
         full_messages = [{"role": "system", "content": system}] + messages
         stream = self.llm.chat.completions.create(
             model=MINIMAX_MODEL,
@@ -1180,11 +1300,17 @@ class GeorgeBot:
                 if text:
                     yield text
 
-        yield from _iter_visible_deltas(_content_deltas())
+        visible = _iter_visible_deltas(_content_deltas())
+        body = yield from _split_cited_sources(visible)
+        return _parse_cited_sources(body)
 
     def answer_stream(self, question: str, context: str, history: list[dict],
                       system_prompt: str | None = None):
-        """Streamed MiniMax-M3 answer, thinking disabled — yielded token-by-token.
+        """Streamed MiniMax-M3 answer, thinking disabled — yields
+        `("token", text)` token-by-token, then a final `("cited",
+        numbers_or_None)` once (see `_stream_answer_raw`/
+        `_parse_cited_sources`) — callers should pass that to
+        `_filter_cited_sources` before showing sources to the user.
 
         The reference material rides in the system prompt (not the user turn),
         so the model treats it as system-supplied. This lets the answer stream
@@ -1194,16 +1320,24 @@ class GeorgeBot:
         """
         messages = self._answer_messages(question, history)
         system = self._system_prompt_with_context(context, system_prompt)
+        gen = self._stream_answer_raw(messages, system, thinking="disabled")
         emitted = False
-        for piece in self._stream_answer_raw(messages, system, thinking="disabled"):
+        cited: list[int] | None = None
+        while True:
+            try:
+                piece = next(gen)
+            except StopIteration as stop:
+                cited = stop.value
+                break
             if not emitted:
                 piece = piece.lstrip()
                 if not piece:
                     continue
             emitted = True
-            yield piece
+            yield ("token", piece)
         if not emitted:
-            yield "Sorry, I couldn't generate an answer right now — please try again."
+            yield ("token", "Sorry, I couldn't generate an answer right now — please try again.")
+        yield ("cited", cited)
 
     def answer_verified_stream(self, question: str, context: str, history: list[dict]):
         """Combined verify-then-answer call for default mode's answering path.
@@ -1218,6 +1352,10 @@ class GeorgeBot:
         Yields:
           ("token", text)   -- repeatedly, for a SUFFICIENT verdict; caller
                                 forwards these live as the answer.
+          ("cited", numbers_or_None) -- once, after the last "token", for a
+                                SUFFICIENT verdict (see `_parse_cited_sources`);
+                                caller should pass it to `_filter_cited_sources`
+                                before showing sources to the user.
           ("need_more", {"reason", "search_query", "term_season", "term_year"})
                                 -- once, for a NEED_MORE verdict. The stream is
                                 fully drained here to parse the JSON — nothing
@@ -1266,7 +1404,17 @@ class GeorgeBot:
         else:
             first = header
         emitted = False
-        for piece in itertools.chain([first], raw):
+        cited: list[int] | None = None
+        pending_first: str | None = first
+        while True:
+            if pending_first is not None:
+                piece, pending_first = pending_first, None
+            else:
+                try:
+                    piece = next(raw)
+                except StopIteration as stop:
+                    cited = stop.value
+                    break
             if not piece:
                 continue
             if not emitted:
@@ -1277,6 +1425,7 @@ class GeorgeBot:
             yield ("token", piece)
         if not emitted:
             yield ("token", "Sorry, I couldn't generate an answer right now — please try again.")
+        yield ("cited", cited)
 
     # -- source formatting --------------------------------------------------
 
@@ -1507,12 +1656,14 @@ class GeorgeBot:
             question, history, audience)
         context, n_prefix_blocks = self._assemble_context(
             chunks, graph_facts, banner_facts, rmp_facts)
-        answer = self.answer(question, context, history)
+        answer, cited = self.answer(question, context, history)
+        sources = _filter_cited_sources(
+            self.format_sources(chunks, graph_facts, banner_facts, rmp_facts), cited)
         return {
             "answer": answer,
-            "sources": self.format_sources(chunks, graph_facts, banner_facts, rmp_facts),
+            "sources": sources,
             "search_query": route["search_query"],
-            "n_chunks": len(chunks) + n_prefix_blocks,
+            "n_chunks": len(sources),
         }
 
 

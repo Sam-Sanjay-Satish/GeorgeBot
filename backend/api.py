@@ -30,7 +30,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from banner import banner_instructor_retrieve, banner_retrieve
-from chatbot import DEFAULT_AUDIENCE, MAX_VERIFY_ROUNDS, VALID_AUDIENCES, GeorgeBot
+from chatbot import (
+    DEFAULT_AUDIENCE,
+    MAX_VERIFY_ROUNDS,
+    VALID_AUDIENCES,
+    GeorgeBot,
+    _filter_cited_sources,
+)
 
 VALID_MODES = ("quick", "default")
 DEFAULT_MODE = "default"
@@ -123,7 +129,10 @@ def _default_verified_events(bot: GeorgeBot, question: str, history: list[dict],
     `answer_verified_stream`, it never yields a "token" before a verdict is
     known) -- `sources` and `token` events for a round only appear once that
     round's answer is confirmed SUFFICIENT, so a discarded round is never
-    shown to the user.
+    shown to the user. `sources` is emitted after all tokens (not before),
+    once the model has reported which numbered blocks it actually relied on
+    (see `_filter_cited_sources`) -- the frontend buffers sources until the
+    answer finishes revealing regardless, so this adds no visible delay.
     """
     chunks, graph_facts, banner_facts, rmp_facts = bot.retrieve_with_route(route, audience)
     context, n_prefix_blocks = bot._assemble_context(chunks, graph_facts, banner_facts, rmp_facts)
@@ -131,17 +140,18 @@ def _default_verified_events(bot: GeorgeBot, question: str, history: list[dict],
     yield {"type": "status", "data": "Reading through sources…" if has_context else "Thinking…"}
 
     for _round in range(MAX_VERIFY_ROUNDS):
-        need_more, sources_emitted = None, False
+        need_more, cited = None, None
         for kind, payload in bot.answer_verified_stream(question, context, history):
             if kind == "token":
-                if not sources_emitted:
-                    yield {"type": "sources",
-                           "data": bot.format_sources(chunks, graph_facts, banner_facts, rmp_facts)}
-                    sources_emitted = True
                 yield {"type": "token", "data": payload}
+            elif kind == "cited":
+                cited = payload
             else:  # "need_more"
                 need_more = payload
         if need_more is None:
+            sources = _filter_cited_sources(
+                bot.format_sources(chunks, graph_facts, banner_facts, rmp_facts), cited)
+            yield {"type": "sources", "data": sources}
             yield {"type": "done"}
             return
 
@@ -163,10 +173,15 @@ def _default_verified_events(bot: GeorgeBot, question: str, history: list[dict],
 
     # MAX_VERIFY_ROUNDS gated rounds exhausted, still NEED_MORE -> force a
     # plain answer (no verify wrapper) instead of gating a third time.
-    yield {"type": "sources",
-           "data": bot.format_sources(chunks, graph_facts, banner_facts, rmp_facts)}
-    for text in bot.answer_stream(question, context, history):
-        yield {"type": "token", "data": text}
+    cited = None
+    for kind, payload in bot.answer_stream(question, context, history):
+        if kind == "token":
+            yield {"type": "token", "data": payload}
+        else:  # "cited"
+            cited = payload
+    sources = _filter_cited_sources(
+        bot.format_sources(chunks, graph_facts, banner_facts, rmp_facts), cited)
+    yield {"type": "sources", "data": sources}
     yield {"type": "done"}
 
 
@@ -264,12 +279,22 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                 has_context = bool(chunks) or n_prefix_blocks > 0
                 yield f"event: status\ndata: {json.dumps('Reading through sources…' if has_context else 'Thinking…')}\n\n"
 
-                # Emit sources first so the UI can render them immediately.
-                sources = bot.format_sources(chunks, graph_facts, banner_facts, rmp_facts)
+                # Sources are emitted after all tokens (not before), once the
+                # model has reported which numbered blocks it actually relied
+                # on (see `_filter_cited_sources`) -- the frontend buffers
+                # sources until the answer finishes revealing regardless, so
+                # this adds no visible delay.
+                cited = None
+                for kind, payload in bot.answer_stream(
+                        question, context, req.history,
+                        system_prompt=bot._quick_mode_system_prompt()):
+                    if kind == "token":
+                        yield f"event: token\ndata: {json.dumps(payload)}\n\n"
+                    else:  # "cited"
+                        cited = payload
+                sources = _filter_cited_sources(
+                    bot.format_sources(chunks, graph_facts, banner_facts, rmp_facts), cited)
                 yield f"event: sources\ndata: {json.dumps(sources)}\n\n"
-                for text in bot.answer_stream(question, context, req.history,
-                                              system_prompt=bot._quick_mode_system_prompt()):
-                    yield f"event: token\ndata: {json.dumps(text)}\n\n"
                 yield "event: done\ndata: {}\n\n"
             except Exception as e:
                 yield f"event: error\ndata: {json.dumps(str(e))}\n\n"

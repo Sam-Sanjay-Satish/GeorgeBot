@@ -587,6 +587,25 @@ after new corpus content lands.
   `MAX_HISTORY_TURNS` conversation turns. Both defensively strip any leaked
   `<think>` block (see "Single LLM provider" above); `answer_stream`
   forwards visible deltas incrementally (token-by-token).
+- **Cited-sources filtering (2026-07-28).** `format_sources()` numbers every
+  retrieved graph/banner/rmp/vector block, but not everything the router
+  retrieves is actually relevant (see `MAX_CHUNK_DISTANCE`'s caveat above) —
+  previously the full retrieved list was shown to the user regardless of
+  whether the model actually used it. The `SYSTEM_PROMPT`'s **CITED
+  SOURCES** section now requires the model to end every answer with a
+  machine-readable `<<CITED_SOURCES: 1,3>>` (or `<<CITED_SOURCES: none>>`)
+  marker reporting which `[n]` blocks it actually relied on. `answer()`/
+  `answer_stream()`/`answer_verified_stream()` all strip this marker before
+  any text reaches the user (`_extract_cited_sources` non-streaming,
+  `_split_cited_sources` streaming — same buffer-then-decide idiom as the
+  `<think>`-tag stripper, so it works even split across stream chunks) and
+  return/yield the parsed numbers alongside the answer. `_filter_cited_sources`
+  then trims `format_sources()`'s output down to just those numbers before
+  it's sent to the frontend — `cited=None` (marker missing/malformed) fails
+  open and shows everything rather than hiding real sources. In the
+  streaming endpoint this means the `sources` SSE event now fires *after*
+  all `token` events (previously before) — harmless, since the frontend
+  already buffers sources until the answer finishes revealing regardless.
 
 ### Tunable constants (top of `chatbot.py`)
 
@@ -624,6 +643,14 @@ after new corpus content lands.
 - Chunks are retrieved by similarity search, not guaranteed relevance — use
   each chunk's tags + content to judge fit; silently drop chunks that don't
   address the question rather than forcing them in.
+- **CITED SOURCES**: every answer must end with a `<<CITED_SOURCES: 1,3>>`
+  (or `<<CITED_SOURCES: none>>`) marker naming which `[n]` blocks were
+  actually relied on — never described or mentioned in the visible answer.
+  This is stripped before the user ever sees it and drives which sources
+  the frontend shows (see "Cited-sources filtering" under §4 above) — it's
+  the mechanism that turns "silently drop chunks that don't address the
+  question" (previous bullet) into something the Sources panel actually
+  reflects, instead of always listing everything retrieved.
 - **If the material doesn't cover what's asked, don't say so and don't
   describe what it does cover instead** — answer directly and helpfully as
   you would with no context, and for any specific UVic fact you can't

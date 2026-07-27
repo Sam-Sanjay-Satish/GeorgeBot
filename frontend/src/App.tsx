@@ -219,7 +219,12 @@ export default function App() {
           <p className="text-xs text-muted-foreground mt-0.5">UVic AI Assistant</p>
         </div>
         <ThemeToggle theme={theme} onToggle={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))} />
-        <AccountMenu onReset={() => setAcknowledged(false)} />
+        <AccountMenu
+          onReset={() => {
+            setAcknowledged(false)
+            setMessages([])
+          }}
+        />
       </header>
 
       {/* Messages */}
