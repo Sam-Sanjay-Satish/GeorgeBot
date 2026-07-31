@@ -21,7 +21,7 @@ export default function App() {
   const [acknowledged, setAcknowledged] = useState(false)
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)
-  const [audience, setAudience] = useState<Audience>('both')
+  const [audience, setAudience] = useState<Audience>('undergrad')
   const [thinkingMode, setThinkingMode] = useState<ThinkingMode>('default')
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = localStorage.getItem('theme')

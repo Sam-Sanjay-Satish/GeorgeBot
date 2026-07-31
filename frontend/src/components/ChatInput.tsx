@@ -50,7 +50,7 @@ export function ChatInput({ onSend, disabled }: Props) {
         autoCorrect="off"
         autoCapitalize="off"
         autoComplete="off"
-        className="flex-1 resize-none bg-transparent text-sm leading-relaxed outline-none placeholder:text-muted-foreground disabled:opacity-50 max-h-40"
+        className="flex-1 resize-none bg-transparent text-base leading-relaxed outline-none placeholder:text-muted-foreground disabled:opacity-50 max-h-40 md:text-sm"
       />
       <Button
         size="icon"

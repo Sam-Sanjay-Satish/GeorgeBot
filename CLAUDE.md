@@ -166,6 +166,8 @@ reading this first:
 │   ├── RMP_API.md             # RMP endpoint/auth/school-id/query research + the best-effort caveat
 │   ├── graph_queries.py       # GraphStore — copy of georgebot-pipeline's course-graph/graph_queries.py
 │   ├── api.py                 # FastAPI server (thin wrapper over GeorgeBot); Railway PORT/HOST-aware
+│   ├── querylog.py            # per-turn query log (SQLite on the Volume) — corpus-gap analysis; best-effort, never breaks an answer
+│   ├── admin_page.py          # the /admin query-log viewer, one self-contained HTML string (no build step)
 │   ├── Dockerfile             # backend container build (Railway); multi-stage python:3.14-slim, CMD python api.py
 │   ├── .dockerignore          # excludes volume artifacts (chroma_db/graph_data/taxonomy), .env, pycache
 │   ├── requirements.txt       # serving deps only (openai, voyageai, chromadb, networkx, fastapi, uvicorn)
@@ -267,7 +269,14 @@ volume file API — so the seed goes over `railway ssh`:
 **Current production Volume state:** `georgebot-volume`, mounted at **`/data`**
 on the backend service, `DATA_DIR=/data` set. Holds v2.2 (`chroma_db/` two
 collections, `graph_data/{course_graph.pkl, program_graph.pkl,
-heat_outlines.json}`, `vector_taxonomy.json`), ~1.3 GB of a 5 GB volume.
+heat_outlines.json}`, `vector_taxonomy.json`), ~1.3 GB of a 5 GB volume — plus
+`query_logs.db` (see Query logging below).
+
+⚠️ **`/data/query_logs.db` is the only NON-reproducible file on the Volume.**
+Everything else can be rebuilt from `georgebot-pipeline`; the query log cannot.
+A re-seed (step 3 above) must scope its `rm -rf` to the three artifact paths and
+never wipe `/data` wholesale. Copy it out (`railway ssh -- "cat
+/data/query_logs.db" > backup.db`) before any destructive volume work.
 
 **Pointing the code at the Volume (env vars — this landed 2026-07-14).**
 The artifact paths are no longer hardcoded. They resolve, in priority order:
@@ -305,7 +314,9 @@ three artifacts under it — no per-deploy code change.
 - Backend service has a **Volume** (`georgebot-volume`) mounted at **`/data`**
   holding the three artifacts, with `DATA_DIR=/data` set. Live as of
   2026-07-15 — see "Data" section for how it was seeded and how to re-seed.
-- Backend env vars: `MINIMAX_SUB_KEY`, `VOYAGE_API_KEY`. Railway also
+- Backend env vars: `MINIMAX_SUB_KEY`, `VOYAGE_API_KEY`, `ADMIN_TOKEN` (gates
+  `/api/admin/*` — the query log; **unset means the log is unreachable over
+  HTTP**, 503, never open). Railway also
   injects `PORT` automatically — `api.py`'s `main()` already reads
   `$PORT`/`$HOST` (default `0.0.0.0`) so no Railway-side config needed for
   that part; this was a real gap fixed on 2026-07-14 (originally hardcoded
@@ -336,7 +347,8 @@ three artifacts under it — no per-deploy code change.
   reusing `georgebot-pipeline`'s `venv/`. Worth creating this repo's own
   venv + lockfile before it's truly independent of the pipeline repo.
 - **.env** (this repo's root, gitignored): `MINIMAX_SUB_KEY`, `VOYAGE_API_KEY`
-  only — this repo does **not** use `KESAR_API_KEY`/`CHINESE_API_KEY` (that
+  (plus optionally `ADMIN_TOKEN` to try `/admin` locally) — this repo does
+  **not** use `KESAR_API_KEY`/`CHINESE_API_KEY` (that
   provider split was retired; see the "Single LLM provider" section above).
   `chatbot.py` calls `load_dotenv()` with no path; it walks up from the
   cwd, so run from repo root (or anywhere under it).
@@ -364,6 +376,8 @@ cd frontend && npm run dev
 | GET  | `/health` | — | `{status, chunks}` |
 | POST | `/api/chat` | `{question, history?, audience?}` | `{answer, sources[], search_query, n_chunks}` (JSON) |
 | POST | `/api/chat/stream` | `{question, history?, audience?}` | `text/event-stream` (SSE: `status`, `sources`, `token`, `done`, `error`) |
+| GET  | `/admin` | — | the query-log viewer (HTML; prompts for the token) |
+| GET  | `/api/admin/logs`, `/logs.csv`, `/sessions`, `/sessions/{id}`, `/stats` | — | query log, gated on `ADMIN_TOKEN` |
 
 `audience` is `"undergrad"` (default) `| "faculty" | "both"`; unrecognized
 values fall back to the default. The `status` SSE event fires before `token`s
@@ -376,6 +390,52 @@ through sources…"`) derived from the route — no extra LLM call.
 curl -s -X POST http://127.0.0.1:5001/api/chat -H 'Content-Type: application/json' \
   -d '{"question":"How do I apply for co-op?"}'
 ```
+
+### Query logging + the /admin viewer (landed 2026-07-31)
+
+Every chat turn is recorded to a SQLite log (`backend/querylog.py`) so real
+questions can be mined for **corpus gaps** — what students ask that retrieves
+nothing, routes to the wrong department, or gets a generic answer. Stdlib only;
+no new dependencies.
+
+- **Location:** `$DATA_DIR/query_logs.db` (`/data/query_logs.db` in prod), same
+  resolution scheme as `CHROMA_DIR`/`TAXONOMY_FILE`; `QUERY_LOG_DB` overrides the
+  path, `QUERY_LOG_ENABLED=0` disables logging entirely. See the ⚠️ under
+  "Current production Volume state" — it's the one file on the Volume a re-seed
+  must not delete.
+- **Per turn:** question, rewritten `search_query`, full route dict, final answer
+  text, cited source titles/urls, audience, mode, latency, status. Retrieved
+  **chunk text is deliberately not stored** — this is a usage log, not a cache.
+- **Best-effort, always.** Every function swallows its own exceptions and prints
+  to stderr; a broken/unwritable DB degrades to "no logs", never to a failed
+  answer (same posture as `banner.py`/`rmp.py`). Verified against a read-only path.
+- **Two-step write — do not "simplify" this.** `start_turn` INSERTs the row when
+  the request arrives (status `started`), `update_route` attaches the route the
+  moment the router returns, `finish_turn` UPDATEs with the answer at the end.
+  The obvious single-write-in-a-`finally` version **silently loses every
+  abandoned turn**: when the client closes the tab mid-stream, Starlette cancels
+  the streaming response *without closing the sync generator*, so no
+  `GeneratorExit`, no `finally`, no row. Measured on this stack, not assumed.
+  Rows left `started` past `STALE_SECONDS` (10 min) are relabelled `abandoned` by
+  `sweep_stale()`, which runs on each admin read.
+- **Sessions are inferred, not client-supplied** (no frontend change). The
+  frontend already sends the full untruncated history every turn, so
+  `resolve_session()` keys a `session_chain` table on a sha256 of the
+  conversation's **user** turns: empty history starts a new session, a matching
+  prefix continues one. Caveat: two users whose questions match word-for-word
+  from turn 1 collapse into one session — fine for gap analysis. If exact
+  grouping ever matters, send a real `session_id` from `App.tsx` instead.
+- **Reading it:** `GET /admin` — a self-contained HTML page (`admin_page.py`, no
+  build step, no CDN, served from the backend so there's no CORS or Vercel
+  involvement). It prompts once for `ADMIN_TOKEN`, keeps it in `localStorage`, and
+  sends it as `X-Admin-Token`. Sessions view (transcript per conversation), Turns
+  view (flat, searchable, status filter, **no-sources filter** — the primary gap
+  signal), stats strip, CSV export. `_require_admin` fails **closed**: no
+  `ADMIN_TOKEN` in the environment → 503 on every admin route.
+- **CLI peek**, no server: `python3 backend/querylog.py 20`.
+- Known thin spot: `mode=quick` on the non-streaming `/api/chat` logs
+  `search_query` but no `route_json` — `bot.ask()` doesn't return the route. The
+  streaming path (what the frontend uses) always logs it.
 
 ---
 

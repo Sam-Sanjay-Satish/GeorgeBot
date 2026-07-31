@@ -1,6 +1,7 @@
 backend/chroma_db/
 backend/graph_data/
 backend/vector_taxonomy.json
+backend/query_logs.db*          # local query log (prod's lives on the Volume)
 
 .env
 venv/

@@ -16,19 +16,30 @@ HTTP API:
                           SSE events: status, sources, token, done, error
                           ("status" fires before tokens with a short, templated
                           phase message, e.g. "Looking up CSC 225…")
+  GET  /admin             query-log viewer (HTML; prompts for the admin token)
+  GET  /api/admin/*       query-log JSON/CSV, gated on ADMIN_TOKEN
 
-Env (.env): MINIMAX_SUB_KEY, VOYAGE_API_KEY
+Every chat turn is recorded to the query log (querylog.py) — best-effort, so a
+logging failure never affects the answer.
+
+Env (.env): MINIMAX_SUB_KEY, VOYAGE_API_KEY, ADMIN_TOKEN (admin routes)
 """
 
 import argparse
+import csv
+import hmac
+import io
 import json
 import os
+import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
+import querylog
+from admin_page import ADMIN_HTML
 from banner import banner_instructor_retrieve, banner_retrieve
 from chatbot import (
     DEFAULT_AUDIENCE,
@@ -95,6 +106,22 @@ def _route_status(route: dict) -> str:
     if route.get("program_query"):
         return "Checking program requirements…"
     return "Finding relevant UVic documents…"
+
+
+def _require_admin(request) -> None:
+    """Gate the /api/admin/* query-log endpoints on ADMIN_TOKEN.
+
+    Fails CLOSED: with no ADMIN_TOKEN set in the environment the log is simply
+    unreachable over HTTP (503), never open. The token may arrive as the
+    X-Admin-Token header (what the admin page sends) or a ?token= query param
+    (so the CSV link works as a plain browser download)."""
+    expected = os.getenv("ADMIN_TOKEN", "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="ADMIN_TOKEN is not configured")
+    supplied = request.headers.get("X-Admin-Token") or \
+        request.query_params.get("token") or ""
+    if not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="bad admin token")
 
 
 def _drain_events(events) -> dict:
@@ -224,15 +251,35 @@ def create_app(bot: GeorgeBot) -> FastAPI:
 
         audience = _clean_audience(req.audience)
         mode = _clean_mode(req.mode)
-        if mode == "quick":
-            return bot.ask(question, req.history, audience=audience)
+        session_id, turn_index = querylog.resolve_session(req.history)
+        row_id = querylog.start_turn(
+            session_id=session_id, turn_index=turn_index, question=question,
+            history=req.history, audience=audience, mode=mode)
+        t0 = time.monotonic()
+        try:
+            if mode == "quick":
+                # bot.ask() doesn't hand back the route, only search_query.
+                result = bot.ask(question, req.history, audience=audience)
+            else:
+                # retrieve -> answer -> self-verify, drained into one response.
+                route = bot.rewrite_and_route(question, req.history, audience)
+                querylog.update_route(row_id, route)
+                events = _default_verified_events(bot, question, req.history,
+                                                  audience, route)
+                result = _drain_events(events)
+                result.setdefault("search_query", route["search_query"])
+        except Exception as e:
+            querylog.finish_turn(
+                row_id, latency_ms=int((time.monotonic() - t0) * 1000),
+                status="error", error=str(e))
+            raise
 
-        # mode == "default": retrieve -> answer -> self-verify, drained here
-        # into one JSON response.
-        route = bot.rewrite_and_route(question, req.history, audience)
-        events = _default_verified_events(bot, question, req.history, audience, route)
-        result = _drain_events(events)
-        result.setdefault("search_query", route["search_query"])
+        querylog.finish_turn(
+            row_id, search_query=result.get("search_query"),
+            answer=result.get("answer"), sources=result.get("sources") or [],
+            latency_ms=int((time.monotonic() - t0) * 1000),
+            status="error" if result.get("error") else "ok",
+            error=result.get("error"))
         return result
 
     @app.post("/api/chat/stream")
@@ -243,8 +290,28 @@ def create_app(bot: GeorgeBot) -> FastAPI:
 
         audience = _clean_audience(req.audience)
         mode = _clean_mode(req.mode)
+        session_id, turn_index = querylog.resolve_session(req.history)
+        # The turn is logged in two steps (see querylog.start_turn): the row is
+        # written HERE, before a single token exists, because a client that
+        # disconnects mid-stream never lets `generate()` reach any end-of-turn
+        # code -- Starlette cancels the response without closing the generator.
+        # Such a row stays 'started' and is later swept to 'abandoned'.
+        row_id = querylog.start_turn(
+            session_id=session_id, turn_index=turn_index, question=question,
+            history=req.history, audience=audience, mode=mode)
 
         def generate():
+            t0 = time.monotonic()
+            answer_parts: list[str] = []
+            logged_sources: list[dict] = []
+
+            def _finish(status: str, error: str | None = None):
+                querylog.finish_turn(
+                    row_id, answer="".join(answer_parts) or None,
+                    sources=logged_sources,
+                    latency_ms=int((time.monotonic() - t0) * 1000),
+                    status=status, error=error)
+
             try:
                 # Route is computed once up front (regardless of mode) so we
                 # can emit an early "status" event during the gap before
@@ -252,6 +319,7 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                 # templated from route state — no extra LLM call, no added
                 # latency beyond the router call itself.
                 route = bot.rewrite_and_route(question, req.history, audience)
+                querylog.update_route(row_id, route)
                 yield f"event: status\ndata: {json.dumps(_route_status(route))}\n\n"
 
                 if mode == "default":
@@ -263,7 +331,12 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                     for ev in events:
                         etype = ev.get("type")
                         data = ev.get("data", {})
+                        if etype == "token":
+                            answer_parts.append(data)
+                        elif etype == "sources":
+                            logged_sources = data
                         yield f"event: {etype}\ndata: {json.dumps(data)}\n\n"
+                    _finish("ok")
                     return
 
                 # Quick mode: today's flat retrieve -> answer pipeline, with a
@@ -289,14 +362,18 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                         question, context, req.history,
                         system_prompt=bot._quick_mode_system_prompt()):
                     if kind == "token":
+                        answer_parts.append(payload)
                         yield f"event: token\ndata: {json.dumps(payload)}\n\n"
                     else:  # "cited"
                         cited = payload
                 sources = _filter_cited_sources(
                     bot.format_sources(chunks, graph_facts, banner_facts, rmp_facts), cited)
+                logged_sources = sources
                 yield f"event: sources\ndata: {json.dumps(sources)}\n\n"
                 yield "event: done\ndata: {}\n\n"
+                _finish("ok")
             except Exception as e:
+                _finish("error", str(e))
                 yield f"event: error\ndata: {json.dumps(str(e))}\n\n"
 
         return StreamingResponse(
@@ -304,6 +381,57 @@ def create_app(bot: GeorgeBot) -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    # ----------------------------------------------------------------
+    # Admin: query-log viewer (see querylog.py + admin_page.py).
+    # ----------------------------------------------------------------
+
+    @app.get("/admin", response_class=HTMLResponse)
+    def admin_page():
+        # The page itself is unauthenticated -- it holds no data, it just
+        # prompts for the token and calls the (gated) endpoints below.
+        return HTMLResponse(ADMIN_HTML)
+
+    @app.get("/api/admin/stats")
+    def admin_stats(request: Request):
+        _require_admin(request)
+        return querylog.stats()
+
+    @app.get("/api/admin/logs")
+    def admin_logs(request: Request, limit: int = 100, offset: int = 0,
+                   q: str | None = None, status: str | None = None,
+                   since: str | None = None, zero_sources: bool = False):
+        _require_admin(request)
+        return querylog.recent_turns(limit=min(limit, 1000), offset=offset, q=q,
+                                     status=status, since=since,
+                                     zero_sources=zero_sources)
+
+    @app.get("/api/admin/sessions")
+    def admin_sessions(request: Request, limit: int = 50, offset: int = 0):
+        _require_admin(request)
+        return querylog.sessions(limit=min(limit, 1000), offset=offset)
+
+    @app.get("/api/admin/sessions/{session_id}")
+    def admin_session(request: Request, session_id: str):
+        _require_admin(request)
+        return querylog.session_turns(session_id)
+
+    @app.get("/api/admin/logs.csv")
+    def admin_logs_csv(request: Request, q: str | None = None,
+                       status: str | None = None, since: str | None = None,
+                       zero_sources: bool = False, limit: int = 100000):
+        _require_admin(request)
+        rows = querylog.recent_turns(limit=limit, q=q, status=status,
+                                     since=since, zero_sources=zero_sources)
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=list(querylog.TURN_COLUMNS),
+                                extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+        return StreamingResponse(
+            iter([buf.getvalue()]), media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="georgebot_logs.csv"'})
 
     return app
 
