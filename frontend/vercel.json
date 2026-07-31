@@ -1,0 +1,13 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    {
+      "source": "/admin",
+      "destination": "https://georgebot-production.up.railway.app/admin"
+    },
+    {
+      "source": "/api/admin/:path*",
+      "destination": "https://georgebot-production.up.railway.app/api/admin/:path*"
+    }
+  ]
+}
