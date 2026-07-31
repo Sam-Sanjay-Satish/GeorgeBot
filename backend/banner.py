@@ -32,11 +32,14 @@ CLI smoke test (no LLM):
 from __future__ import annotations
 
 import argparse
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
+
+from ttlcache import BoundedTTLCache
 
 BASE = "https://banner.uvic.ca/StudentRegistrationSsb/ssb"
 # Undocumented internal endpoints — present as a real browser, don't look like a bare
@@ -51,6 +54,18 @@ SECTIONS_TTL = 120       # seat counts move minute-to-minute during registration
 FACULTY_TTL = 6 * 3600   # instructor for a section barely changes
 TERMS_TTL = 6 * 3600     # valid-term list barely changes
 
+# Outbound-amplification guard (2026-08-01, audit issue 4). `course_codes` reach
+# this module from an LLM router — chatbot.py caps + pattern-validates them at
+# parse time, but this bounds the module itself no matter who calls it.
+MAX_COURSES_PER_CALL = int(os.environ.get("BANNER_MAX_COURSES", "5"))
+# Global ceiling on simultaneous in-flight HTTP requests to banner.uvic.ca
+# across ALL threads/requests (handshakes, searches, and the per-CRN faculty
+# fan-out all count). When saturated, a waiter gives up after
+# _SEM_ACQUIRE_TIMEOUT and the lookup degrades to "no live data" ({} from the
+# best-effort top-level entries) instead of queueing more load onto UVic.
+MAX_OUTBOUND_CONCURRENCY = int(os.environ.get("BANNER_MAX_CONCURRENCY", "8"))
+_SEM_ACQUIRE_TIMEOUT = 2  # seconds to wait for a slot before giving up
+
 # Season -> the MM half of a YYYYMM Banner term code.
 #   01 = Second Term  (Jan-Apr, "Spring")
 #   05 = Summer Session (May-Aug)
@@ -64,11 +79,34 @@ _MM_SEASON = {"01": "Spring", "05": "Summer", "09": "Fall"}
 # lock only guards the cache dicts. The FastAPI SSE generator is a sync def run
 # in a threadpool, so concurrent requests can hit these caches at once.
 # ---------------------------------------------------------------------------
+#
+# The caches are BOUNDED (audit issue 5): their keys are user-driven — arbitrary
+# course codes and instructor names — and as plain dicts they were never pruned,
+# so a loop of unique keys grew them until the container OOM-died. BoundedTTLCache
+# keeps the same (t, value) entry shape and the TTL checks below, and adds real
+# eviction (expired on read, least-recently-used past maxsize). Sizes are far
+# above real traffic; they only bite under abuse.
 _lock = threading.Lock()
-_sections_cache: dict[tuple, tuple[float, list]] = {}  # (term,subject,number) -> (t, sections)
-_faculty_cache: dict[tuple, tuple[float, list]] = {}   # (term, crn) -> (t, faculty)
-_instructor_cache: dict[tuple, tuple[float, dict]] = {}  # (term, name) -> (t, result)
-_terms_cache: tuple[float, list] | None = None         # (t, [{code, description}])
+_sections_cache = BoundedTTLCache(512, SECTIONS_TTL)    # (term,subject,number) -> (t, sections)
+_faculty_cache = BoundedTTLCache(4096, FACULTY_TTL)     # (term, crn) -> (t, faculty)
+_instructor_cache = BoundedTTLCache(512, SECTIONS_TTL)  # (term, name) -> (t, result); 120s, as its reader checks
+_terms_cache: tuple[float, list] | None = None         # (t, [{code, description}]) — single entry, unbounded growth impossible
+_outbound_sem = threading.BoundedSemaphore(MAX_OUTBOUND_CONCURRENCY)
+
+
+def _outbound(call, *args, **kwargs):
+    """Run one outbound HTTP call (a bound `session.get`/`session.post`) under the
+    global concurrency cap. The semaphore is held only for the network call itself
+    and is never held while waiting on `_lock` (cache writes happen after release),
+    so the lock->semaphore nesting in `get_terms` can't deadlock. Raises
+    RuntimeError when saturated ("give up fast"); the best-effort top-level
+    entries catch it and return {}."""
+    if not _outbound_sem.acquire(timeout=_SEM_ACQUIRE_TIMEOUT):
+        raise RuntimeError("banner.uvic.ca outbound concurrency limit reached")
+    try:
+        return call(*args, **kwargs)
+    finally:
+        _outbound_sem.release()
 
 
 def split_course_code(code: str) -> tuple[str, str]:
@@ -111,9 +149,9 @@ def _handshake_session(term: str) -> requests.Session:
     per search gives each its own isolated form state — no stale bleed, no lock held
     across the network. Cheap: two quick calls, and results are cached (see callers)."""
     s = _new_session()
-    s.get(f"{BASE}/registration", timeout=HTTP_TIMEOUT)                       # sets JSESSIONID
-    s.post(f"{BASE}/term/search?mode=search", data={"term": term},           # binds the term
-           timeout=HTTP_TIMEOUT)
+    _outbound(s.get, f"{BASE}/registration", timeout=HTTP_TIMEOUT)            # sets JSESSIONID
+    _outbound(s.post, f"{BASE}/term/search?mode=search", data={"term": term},  # binds the term
+              timeout=HTTP_TIMEOUT)
     return s
 
 
@@ -129,9 +167,9 @@ def get_terms() -> list[dict]:
         if _terms_cache and (time.monotonic() - _terms_cache[0] < TERMS_TTL):
             return _terms_cache[1]
         s = _new_session()
-        resp = s.get(f"{BASE}/classSearch/getTerms",
-                     params={"searchTerm": "", "offset": 1, "max": 20},
-                     timeout=HTTP_TIMEOUT)
+        resp = _outbound(s.get, f"{BASE}/classSearch/getTerms",
+                         params={"searchTerm": "", "offset": 1, "max": 20},
+                         timeout=HTTP_TIMEOUT)
         terms = resp.json() or []
         _terms_cache = (time.monotonic(), terms)
         return terms
@@ -192,9 +230,9 @@ def _fetch_faculty(session: requests.Session, term: str, crn: str) -> list[dict]
         hit = _faculty_cache.get(key)
         if hit and (time.monotonic() - hit[0] < FACULTY_TTL):
             return hit[1]
-    resp = session.get(f"{BASE}/searchResults/getFacultyMeetingTimes",
-                       params={"term": term, "courseReferenceNumber": crn},
-                       timeout=HTTP_TIMEOUT)
+    resp = _outbound(session.get, f"{BASE}/searchResults/getFacultyMeetingTimes",
+                     params={"term": term, "courseReferenceNumber": crn},
+                     timeout=HTTP_TIMEOUT)
     fmt = (resp.json() or {}).get("fmt") or []
     faculty: list[dict] = []
     for entry in fmt:
@@ -248,7 +286,8 @@ def search_sections(subject: str, number: str, term: str) -> list[dict]:
             return hit[1]
 
     session = _handshake_session(term)   # dedicated session — no cross-course bleed
-    resp = session.get(
+    resp = _outbound(
+        session.get,
         f"{BASE}/searchResults/searchResults",
         params={"txt_subject": subject, "txt_courseNumber": number, "txt_term": term,
                 "pageOffset": 0, "pageMaxSize": 50,
@@ -313,9 +352,9 @@ def _get_instructor_matches(session: requests.Session, term: str, name: str) -> 
     """`get_instructor` autocomplete -> [{code, description}]. NOTE the `code` is a
     SESSION-SCOPED ephemeral id (it changes every session), so it's only valid for a
     `txt_instructor` search issued on this same session — never cache or reuse it."""
-    resp = session.get(f"{BASE}/classSearch/get_instructor",
-                       params={"term": term, "searchTerm": name, "offset": 1, "max": 15},
-                       timeout=HTTP_TIMEOUT)
+    resp = _outbound(session.get, f"{BASE}/classSearch/get_instructor",
+                     params={"term": term, "searchTerm": name, "offset": 1, "max": 15},
+                     timeout=HTTP_TIMEOUT)
     return resp.json() or []
 
 
@@ -355,7 +394,8 @@ def search_by_instructor(name: str, term: str) -> dict:
         result = {"instructor": None, "candidates": descs, "sections": []}
     else:
         code = matches[0]["code"]
-        resp = session.get(
+        resp = _outbound(
+            session.get,
             f"{BASE}/searchResults/searchResults",
             params={"txt_instructor": code, "txt_term": term, "pageOffset": 0,
                     "pageMaxSize": 100, "sortColumn": "subjectDescription",
@@ -398,14 +438,16 @@ def banner_retrieve(course_codes: list[str], season: str | None = None,
         {"term": "202609", "term_label": "Fall 2026",
          "courses": [{"code": "CSC225", "sections": [ ... ]}]}
 
-    Courses with no sections found in the resolved term are dropped.
+    Courses with no sections found in the resolved term are dropped. At most
+    MAX_COURSES_PER_CALL codes are honored (each code costs ~10 outbound calls
+    on a cold cache — see the outbound-amplification guard at the top).
     """
     try:
         term = resolve_term(season, year)
         if not term:
             return {}
         courses = []
-        for code in course_codes:
+        for code in course_codes[:MAX_COURSES_PER_CALL]:
             subject, num = split_course_code(code)
             if not subject or not num:
                 continue

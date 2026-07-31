@@ -35,11 +35,14 @@ CLI smoke test (no LLM):
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
 import time
 
 import requests
+
+from ttlcache import BoundedTTLCache
 
 RMP_GRAPHQL = "https://www.ratemyprofessors.com/graphql"
 # Public constant hardcoded in every RMP wrapper — base64("test:test"). Not a
@@ -57,15 +60,46 @@ HTTP_TIMEOUT = 15    # seconds per request
 REVIEWS_N = 20       # recent reviews pulled for a matched professor
 RMP_TTL = 6 * 3600   # ratings barely move — hours (mirrors Banner's FACULTY_TTL)
 
+# Outbound-amplification guard (2026-08-01, audit issue 4). Names reach this
+# module chained from Banner-resolved instructors or an LLM router field —
+# chatbot.py caps them at the call site, but this bounds the module itself no
+# matter who calls it (each name costs up to 2 GraphQL calls on a cold cache).
+MAX_NAMES_PER_CALL = int(os.environ.get("RMP_MAX_NAMES", "5"))
+# Global ceiling on simultaneous in-flight requests to ratemyprofessors.com
+# across all threads/requests. When saturated, a waiter gives up after
+# _SEM_ACQUIRE_TIMEOUT and the lookup degrades to "no ratings" ({} from
+# rmp_retrieve) — mirrors banner.py's guard.
+MAX_OUTBOUND_CONCURRENCY = int(os.environ.get("RMP_MAX_CONCURRENCY", "4"))
+_SEM_ACQUIRE_TIMEOUT = 2  # seconds to wait for a slot before giving up
+
 # ---------------------------------------------------------------------------
 # Module-level state: one TTL cache guarded by a lock, keyed by the queried name.
 # A single shared Session is fine here (unlike Banner — RMP has no per-session
 # search-form state to leak). The FastAPI SSE generator runs sync in a
 # threadpool, so concurrent requests can hit this at once.
 # ---------------------------------------------------------------------------
+#
+# BOUNDED (audit issue 5): the key is a user-supplied professor name and entries
+# are the fattest in the app — each holds up to REVIEWS_N full review bodies — so
+# as an unpruned dict this was the quickest path to an OOM kill. Same (t, value)
+# entry shape and TTL check as before, now with real eviction.
 _lock = threading.Lock()
-_rmp_cache: dict[str, tuple[float, dict]] = {}   # name.lower() -> (t, professor entry)
+_rmp_cache = BoundedTTLCache(512, RMP_TTL)   # name.lower() -> (t, professor entry)
 _session: requests.Session | None = None
+_outbound_sem = threading.BoundedSemaphore(MAX_OUTBOUND_CONCURRENCY)
+
+
+def _outbound(call, *args, **kwargs):
+    """Run one outbound HTTP call under the global concurrency cap. Held only for
+    the network call itself, never while waiting on `_lock`. Raises RuntimeError
+    when saturated ("give up fast"); best-effort `rmp_retrieve` catches it and
+    returns {}. Mirrors banner.py's `_outbound`."""
+    if not _outbound_sem.acquire(timeout=_SEM_ACQUIRE_TIMEOUT):
+        raise RuntimeError("ratemyprofessors.com outbound concurrency limit reached")
+    try:
+        return call(*args, **kwargs)
+    finally:
+        _outbound_sem.release()
 
 _SEARCH_QUERY = (
     "query($text:String!,$schoolID:ID!){newSearch{teachers(query:{text:$text,"
@@ -95,8 +129,9 @@ def _get_session() -> requests.Session:
 
 def _graphql(query: str, variables: dict) -> dict:
     """POST a GraphQL query, return the `data` object ({} on any error/absence)."""
-    resp = _get_session().post(RMP_GRAPHQL, json={"query": query, "variables": variables},
-                               timeout=HTTP_TIMEOUT)
+    resp = _outbound(_get_session().post, RMP_GRAPHQL,
+                     json={"query": query, "variables": variables},
+                     timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     return (resp.json() or {}).get("data") or {}
 
@@ -227,12 +262,15 @@ def rmp_retrieve(names: list[str]) -> dict:
 
     where each entry is a matched professor (summary + reviews), an ambiguous
     name (candidates to disambiguate), or a no-match note. Duplicate/empty names
-    are ignored; {} if nothing usable was requested.
+    are ignored, at most MAX_NAMES_PER_CALL are honored (outbound-amplification
+    guard — see top); {} if nothing usable was requested.
     """
     try:
         seen: set[str] = set()
         professors = []
         for name in names:
+            if len(professors) >= MAX_NAMES_PER_CALL:
+                break
             key = (name or "").strip().lower()
             if not key or key in seen:
                 continue

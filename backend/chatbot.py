@@ -256,6 +256,51 @@ MAX_CHUNK_DISTANCE = 0.75  # cosine distance cutoff (voyage-4-large) — chunks
                             # that class of case)
 MAX_HISTORY_TURNS = 6   # trailing conversation turns kept for context
 
+# Router-output hard bounds (2026-08-01, audit issue 4 — outbound amplification).
+# course_codes / completed_courses / the name queries come from the LLM router at
+# whatever length the model emits. Each course code fans out into ~10 live Banner
+# HTTP calls (handshake + searchResults + per-CRN faculty lookups), so a question
+# engineered to make the router list dozens of codes would turn one inbound
+# request into hundreds of outbound requests to banner.uvic.ca. Cap the lists and
+# validate each code against the real UVic shape at parse time, so arbitrary
+# router output never reaches banner.py's URL params. banner.py / rmp.py carry
+# matching boundary caps + outbound concurrency limits of their own.
+MAX_COURSE_CODES = 5        # courses per question — plenty (drives graph + Banner fan-out)
+MAX_COMPLETED_COURSES = 20  # graph-only (never hits Banner), so roomier — a real course list
+MAX_RMP_NAMES = 5           # professors chained from Banner into one RMP lookup
+MAX_NAME_QUERY_LEN = 80     # instructor_query / professor_query length bound
+# Normalized shape: "CSC225", "CSC225A", and the hyphenated Education subjects
+# ("ED-D301", "ED-P420"). The hyphen branch is NOT optional polish — validated
+# against course_graph.pkl, 52 of the 4015 real course codes are ED-D/ED-P, and
+# a pattern without it silently drops every one of them from graph + Banner
+# retrieval. Re-check against the graph before tightening this.
+COURSE_CODE_RE = re.compile(r"^[A-Z]{2,4}(?:-[A-Z]{1,2})?\d{3}[A-Z]?$")
+
+
+def _clean_course_codes(raw, cap: int) -> list[str]:
+    """Normalize ("csc 225" -> "CSC225"), validate against COURSE_CODE_RE, dedupe
+    (order-preserving), and cap a router-emitted course-code list. Non-strings and
+    anything not shaped like a real UVic course code are dropped silently — a bad
+    entry degrades that code to vector-only retrieval, never an error."""
+    out: list[str] = []
+    for c in raw or []:
+        if not isinstance(c, str):
+            continue
+        code = c.replace(" ", "").upper()
+        if COURSE_CODE_RE.fullmatch(code) and code not in out:
+            out.append(code)
+            if len(out) >= cap:
+                break
+    return out
+
+
+def _clean_name_query(raw) -> str | None:
+    """Length-bound a router-emitted single-name field (instructor_query /
+    professor_query). None for anything empty or non-string."""
+    if not isinstance(raw, str):
+        return None
+    return raw.strip()[:MAX_NAME_QUERY_LEN].strip() or None
+
 # Campus nickname glossary for the router's search_query rewrite. Interim
 # mitigation for ambiguous/colloquial place names whose reverse-HyDE question
 # set doesn't anchor on the bare nickname (e.g. corpus questions for the Cove
@@ -1022,13 +1067,13 @@ class GeorgeBot:
                 year = None
             return {
                 "search_query": data.get("search_query") or question,
-                "completed_courses": [c.replace(" ", "").upper() for c in (data.get("completed_courses") or [])],
-                "course_codes": [c.replace(" ", "").upper() for c in (data.get("course_codes") or [])],
+                "completed_courses": _clean_course_codes(data.get("completed_courses"), MAX_COMPLETED_COURSES),
+                "course_codes": _clean_course_codes(data.get("course_codes"), MAX_COURSE_CODES),
                 "program_query": data.get("program_query") or None,
                 "wants_outline": bool(data.get("wants_outline")),
                 "wants_availability": bool(data.get("wants_availability")),
-                "instructor_query": (data.get("instructor_query") or None),
-                "professor_query": (data.get("professor_query") or None),
+                "instructor_query": _clean_name_query(data.get("instructor_query")),
+                "professor_query": _clean_name_query(data.get("professor_query")),
                 "wants_rating": bool(data.get("wants_rating")),
                 "term_season": season,
                 "term_year": year,
@@ -1622,7 +1667,9 @@ class GeorgeBot:
         if route.get("professor_query"):
             names = [route["professor_query"]]
         elif route.get("wants_rating") and banner_facts:
-            names = cls._instructor_names_from_banner(banner_facts)
+            # Bounded: Banner can resolve many distinct instructors across sections;
+            # don't let that chain into unbounded RMP lookups (audit issue 4).
+            names = cls._instructor_names_from_banner(banner_facts)[:MAX_RMP_NAMES]
         else:
             names = []
         return rmp_retrieve(names) if names else {}

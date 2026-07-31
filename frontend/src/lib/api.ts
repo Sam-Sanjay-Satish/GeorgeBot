@@ -135,7 +135,16 @@ export async function askGeorgeStream(
     }),
   })
   if (!res.ok || !res.body) {
-    handlers.onError(`API error ${res.status}`)
+    // Rate-limit rejections (429/503) carry a human-readable `detail` from
+    // the backend — show that instead of a bare status code.
+    let message = `API error ${res.status}`
+    try {
+      const data = await res.json()
+      if (typeof data?.detail === 'string') message = data.detail
+    } catch {
+      // no JSON body — keep the generic message
+    }
+    handlers.onError(message)
     return
   }
 
