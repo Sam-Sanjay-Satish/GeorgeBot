@@ -41,6 +41,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -256,6 +257,33 @@ MAX_CHUNK_DISTANCE = 0.75  # cosine distance cutoff (voyage-4-large) — chunks
                             # that class of case)
 MAX_HISTORY_TURNS = 6   # trailing conversation turns kept for context
 
+# Keep-warm (2026-08-01). Two separate costs are being defended against here,
+# both measured against the live Railway service — see GeorgeBot.warm_up():
+#   1. Container start: Chroma loads a collection's ~263 MB of HNSW index off
+#      the network-attached Volume on its FIRST query, not at get_collection().
+#      Measured 24.6s first request vs ~11.5s steady-state.
+#   2. Idle: the HNSW graphs live in heap and survive (anon memory held flat at
+#      ~537 MB across 16 idle hours), but the page cache backing the 968 MB
+#      chroma.sqlite3 does NOT — the host reclaims it, and `file` fell from a
+#      891 MB peak to 180 MB with 77k page refaults on the next queries. That
+#      cost ~1.1s on the first retrieval after idle (1.46s vs 0.11-0.37s warm).
+# (1) is fixed at boot; (2) needs re-touching on a timer, which is what
+# WARM_INTERVAL_SECONDS drives. Keep the interval well under the hours-long
+# window over which reclaim was observed, so the pages stay on the active LRU.
+WARM_INTERVAL_SECONDS = float(os.getenv("WARM_INTERVAL_SECONDS", "300"))
+# Rotating through several representative questions (rather than replaying one)
+# keeps a broader spread of sqlite pages hot, since each query fetches the
+# documents/metadata for its own QUESTION_K nearest neighbours. Spans both
+# collections' subject matter on purpose.
+WARM_QUERIES = [
+    "how do I apply for co-op",
+    "course registration and add drop deadlines",
+    "tuition fees and payment deadlines",
+    "academic advising and degree requirements",
+    "faculty hiring and human resources policy",
+    "research grant administration and ethics approval",
+]
+
 # Router-output hard bounds (2026-08-01, audit issue 4 — outbound amplification).
 # course_codes / completed_courses / the name queries come from the LLM router at
 # whatever length the model emits. Each course code fans out into ~10 live Banner
@@ -346,6 +374,13 @@ class GeorgeBot:
 
         t0 = time.monotonic()
         print("Loading GeorgeBot...")
+
+        # Keep-warm state (see WARM_INTERVAL_SECONDS). `_last_query_at` is only
+        # ever bumped by REAL retrievals, never by the warming passes, so the
+        # ticker can tell an idle process from a busy one. Plain float
+        # read/write needs no lock — no read-modify-write, so no race.
+        self._warm_embeddings: list[list[float]] | None = None
+        self._last_query_at: float = time.monotonic()
 
         # Route/rewrite + answer — official MiniMax API (OpenAI-compatible).
         self.llm = openai.OpenAI(api_key=os.getenv("MINIMAX_SUB_KEY"), base_url=MINIMAX_BASE_URL)
@@ -475,6 +510,98 @@ class GeorgeBot:
                 break
         return [chunks[cid] for cid in order]
 
+    def _warm_vectors(self) -> list[list[float]]:
+        """Embeddings for WARM_QUERIES, computed once and reused forever.
+
+        Cached deliberately: the keep-warm ticker runs for the life of the
+        process, and re-embedding on every tick would spend a Voyage call every
+        WARM_INTERVAL_SECONDS and make a background optimization depend on an
+        external API staying up. One batch call at boot, then pure local work.
+        """
+        if self._warm_embeddings is None:
+            resp = self.voyage.embed(WARM_QUERIES, model=VOYAGE_MODEL, input_type="query")
+            self._warm_embeddings = list(resp.embeddings)
+        return self._warm_embeddings
+
+    def _warm_pass(self, embeddings: list[list[float]], with_filter: bool) -> None:
+        """Touch every collection with each embedding. Raises nothing on a
+        per-collection failure — warming is never worth taking the app down."""
+        for aud, coll in self.collections.items():
+            # Any real department works; pick one that isn't GENERAL so the
+            # clause is the two-value `$in` a routed query actually builds.
+            where = None
+            if with_filter:
+                dept = next((d for d in self.departments if d != GENERAL_DEPARTMENT), None)
+                where = self._build_where([], dept, aud)
+            for emb in embeddings:
+                try:
+                    self._query_candidates(coll, emb, where)
+                except Exception as e:  # noqa: BLE001
+                    print(f"  Warm-up skipped for '{coll.name}': {e}", file=sys.stderr)
+                    break  # collection-level problem; other embeddings will fail too
+
+    def warm_up(self) -> None:
+        """Force the lazy per-collection state to load before serving traffic.
+
+        `GeorgeBot.__init__` is NOT enough to make the first real question fast.
+        `get_collection()` only opens metadata; Chroma loads a collection's HNSW
+        graph off disk on its *first query*, and the chunk text + metadata come
+        from `chroma.sqlite3` page-by-page. On Railway that disk is a
+        network-attached Volume, so the first question after a container start
+        paid ~12s of index load that every later question got for free
+        (measured: 24.6s first request vs ~11.5s steady-state).
+
+        Calling this before the server binds its port moves that cost into boot,
+        where Railway's healthcheck gates it and no user is waiting. Both the
+        filtered and unfiltered pass run, matching what `vector_retrieve`
+        actually does, since the two touch different SQLite indexes.
+
+        Best-effort by design: warming is an optimization, never a startup
+        precondition, so any failure here degrades to "the first question is
+        slow again" rather than a container that won't boot.
+        """
+        t0 = time.monotonic()
+        try:
+            embeddings = self._warm_vectors()
+        except Exception as e:  # noqa: BLE001 - never block boot on a warm-up
+            print(f"  Warm-up skipped (embedding failed): {e}", file=sys.stderr)
+            return
+        self._warm_pass(embeddings, with_filter=False)
+        self._warm_pass(embeddings, with_filter=True)
+        print(f"  Warmed {len(self.collections)} collection(s) with "
+              f"{len(embeddings)} queries in {time.monotonic() - t0:.1f}s")
+
+    def _keep_warm_loop(self, interval: float) -> None:
+        while True:
+            time.sleep(interval)
+            # Real traffic touches the same pages far better than synthetic
+            # queries do, so a server that's actually being used needs no help.
+            if time.monotonic() - self._last_query_at < interval:
+                continue
+            try:
+                self._warm_pass(self._warm_vectors(), with_filter=False)
+            except Exception as e:  # noqa: BLE001 - a background thread must never die
+                print(f"  Keep-warm tick failed: {e}", file=sys.stderr)
+
+    def start_keep_warm(self, interval: float = WARM_INTERVAL_SECONDS) -> None:
+        """Re-touch the vector store on a timer so idle page-cache reclaim
+        doesn't hand the next real question a cold read off the Volume.
+
+        The HNSW graphs sit in heap and survive idling on their own; this exists
+        purely for the `chroma.sqlite3` page cache, which the host reclaims out
+        from under an idle container (see the WARM_INTERVAL_SECONDS note above).
+
+        Daemon thread, so it never keeps the process alive at shutdown, and it
+        deliberately does NOT use the chat executor — warming must never consume
+        a slot that a real request could have had.
+        """
+        if interval <= 0:
+            return
+        t = threading.Thread(target=self._keep_warm_loop, args=(interval,),
+                             name="keep-warm", daemon=True)
+        t.start()
+        print(f"  Keep-warm thread started (every {interval:.0f}s)")
+
     def vector_retrieve(self, query: str, audience: str = DEFAULT_AUDIENCE,
                          n: int = N_CONTEXT, topic_families: list[str] | None = None,
                          department: str | None = None) -> list[dict]:
@@ -497,6 +624,7 @@ class GeorgeBot:
         return fewer than n chunks — even zero — rather than being padded out to
         n with irrelevant ones just to hit the count.
         """
+        self._last_query_at = time.monotonic()  # tells the keep-warm ticker to stand down
         emb = self._embed_query(query)
         auds = self._audiences(audience)
         has_filter = bool(topic_families or department)

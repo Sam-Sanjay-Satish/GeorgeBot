@@ -752,6 +752,14 @@ def main() -> None:
     import uvicorn
 
     bot = GeorgeBot()
+    # Before the port is even open, so the cost lands in container boot (behind
+    # Railway's healthcheck) instead of on whoever asks the first question.
+    # Skippable for fast local iteration: WARM_UP=0.
+    if os.getenv("WARM_UP", "1").lower() not in ("0", "false", "no"):
+        bot.warm_up()
+        # Boot warming only covers the first request after a container start;
+        # the ticker covers the page cache the host reclaims while idle.
+        bot.start_keep_warm()
     app = create_app(bot)
     print(f"Serving GeorgeBot (FastAPI) on http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)

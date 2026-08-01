@@ -2,6 +2,41 @@ import type { Audience, Message, Source, ThinkingMode } from '@/types'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:5001'
 
+/**
+ * Is the backend up and serving?
+ *
+ * Vercel and Railway deploy independently off the same push, and the frontend
+ * almost always wins: Vite builds in seconds while the backend rebuilds its
+ * image, remounts the Volume, and now also warms the vector store before it
+ * binds a port. During that window georgebot.org is live but every question
+ * would fail, so the disclaimer gate polls this before letting anyone in.
+ *
+ * `/health` is deliberately the cheapest route on the backend (async, no Chroma
+ * or SQLite touch, chunk count snapshotted at boot), so polling it is free.
+ * Any transport error, non-200, or non-"ok" body counts as not-ready — during a
+ * redeploy this shows up as a network error or a Railway 502, never a clean
+ * false, so failing closed on the catch is the whole point rather than an edge
+ * case. Aborts after `timeoutMs` so a connection that hangs mid-deploy can't
+ * wedge the poll loop.
+ */
+export async function checkHealth(timeoutMs = 8000): Promise<boolean> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetch(`${API_BASE}/health`, {
+      signal: controller.signal,
+      cache: 'no-store',
+    })
+    if (!res.ok) return false
+    const data = await res.json()
+    return data?.status === 'ok'
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 // Raw source shape returned by the backend (chatbot.format_sources).
 interface ApiSource {
   n: number
