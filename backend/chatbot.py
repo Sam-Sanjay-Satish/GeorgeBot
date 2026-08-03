@@ -1122,7 +1122,13 @@ class GeorgeBot:
             text = f"{graph_text}\n\n{text}" if text else graph_text
         return text
 
-    SYSTEM_PROMPT = (
+    # The answer-model contract is assembled from three pieces so the two modes
+    # can differ in their style/scope section ONLY. Quick mode must be exactly
+    # as accurate and as grounded as default mode — it is narrower in what it
+    # volunteers, never looser about facts — so every accuracy rule lives in
+    # the shared head and applies to both by construction. Don't fork these
+    # blocks; edit the head and both modes move together.
+    _ANSWER_RULES_HEAD = (
         "You are GeorgeBot, a helpful assistant that answers questions about the "
         "University of Victoria (UVic) for students and staff.\n\n"
         "USING THE REFERENCE MATERIAL\n"
@@ -1199,8 +1205,9 @@ class GeorgeBot:
         "those can't be auto-verified from a course list.\n"
         "- If a program search returned multiple candidates, ask the user to "
         "clarify which one they mean rather than guessing.\n\n"
-        "STYLE\n"
-        "- Be concise and direct. Use plain text (no LaTeX).\n\n"
+    )
+
+    _CITED_SOURCES_RULES = (
         "CITED SOURCES\n"
         "After you finish writing your answer, on a new line by itself, "
         "report which numbered reference blocks (the [n] tags in the "
@@ -1216,6 +1223,58 @@ class GeorgeBot:
         "when you are writing a NEED_MORE JSON response instead of an "
         "answer — that response has no CITED_SOURCES tag.)"
     )
+
+    _DEFAULT_STYLE = (
+        "STYLE\n"
+        "- Be concise and direct. Use plain text (no LaTeX).\n\n"
+    )
+
+    # Quick mode's style/scope section. The goal is a *smaller* answer, not a
+    # weaker one: it constrains what the model volunteers, never what it has
+    # to get right. The carve-out in the last bullet matters — the ACCURACY
+    # rules in the shared head mandate certain qualifications (naming a
+    # Banner/HISTORICAL term, RMP attribution + sample size), and without an
+    # explicit exemption a hard "nothing extra" rule reads as license to drop
+    # them.
+    _QUICK_STYLE = (
+        "SCOPE AND STYLE\n"
+        "- Answer exactly what was asked, and nothing else. This is the most "
+        "important rule about how you write.\n"
+        "- No preamble, no restating or rephrasing the question, no summary or "
+        "closing line, no sign-off, no offer of further help.\n"
+        "- Do not volunteer related, adjacent, or background information the "
+        "user did not ask for — no unsolicited tips, next steps, caveats, "
+        "alternatives, related courses or programs, deadlines, or 'you may "
+        "also want to know' additions. If they asked one narrow thing, answer "
+        "that one narrow thing.\n"
+        "- Length follows the question: if one sentence fully answers it, "
+        "write one sentence and stop. Never pad an answer to look more "
+        "complete.\n"
+        "- No LaTeX ever. Markdown is allowed but must earn its place: use it "
+        "only when it makes the answer genuinely easier to read, and not when "
+        "the answer would read just as well without it. A short list of "
+        "parallel items — course sections, requirement options, steps in a "
+        "procedure — is worth a list; two or three sentences of explanation "
+        "are not. If you find yourself bolding a phrase mid-sentence, "
+        "bolding every course code, or adding a heading above a single "
+        "paragraph, drop it. Default to plain prose and reach for structure "
+        "only when the content is actually structured.\n"
+        "- Keep any list flat and light: one short line per item, no headings "
+        "above it, no nested sub-bullets, no bolded lead-ins on every line.\n"
+        "- This is about volume, not rigour. Everything the ACCURACY rules "
+        "above require you to state — naming the term for live or historical "
+        "data, section codes, attributing RateMyProfessors as student opinion "
+        "with its sample size, asking for clarification when a program search "
+        "was ambiguous — still applies in full. Those are part of the answer, "
+        "not extras.\n\n"
+    )
+
+    SYSTEM_PROMPT = _ANSWER_RULES_HEAD + _DEFAULT_STYLE + _CITED_SOURCES_RULES
+
+    # Quick mode's full contract: same accuracy head, tighter scope, same
+    # cited-sources machinery. Passed as `system_prompt` to `answer()` /
+    # `answer_stream()`, which hand it to `_system_prompt_with_context`.
+    QUICK_SYSTEM_PROMPT = _ANSWER_RULES_HEAD + _QUICK_STYLE + _CITED_SOURCES_RULES
 
     # Appended to SYSTEM_PROMPT for default mode's combined verify-then-answer
     # call (see `answer_verified_stream`). Kept narrow by design — NEED_MORE
@@ -1250,23 +1309,15 @@ class GeorgeBot:
     )
 
     def _quick_mode_system_prompt(self) -> str:
-        """SYSTEM_PROMPT + a sparing, at-most-once nudge to try quick mode
-        off when there's a genuine, identifiable gap. Quick mode has no
-        verification step (that's what `answer_verified_stream` is for in
-        default mode), so this is the only signal the user gets that
-        something might be missing."""
-        return self.SYSTEM_PROMPT + (
-            "\n\nQUICK MODE\n"
-            "This is a fast, single-pass answer with no verification step. "
-            "If, and only if, you notice a concrete, identifiable gap in "
-            "what you were able to answer — the question needs live/current "
-            "data you weren't given, or names something the reference "
-            "material clearly doesn't cover — you may add ONE brief closing "
-            "sentence noting that and suggesting the user try again with "
-            "quick mode off for a more thorough answer. Do this sparingly: "
-            "never as a routine hedge, never more than once, and never when "
-            "you were able to answer fully."
-        )
+        """Quick mode's answer contract — see `QUICK_SYSTEM_PROMPT`.
+
+        This used to be SYSTEM_PROMPT plus a nudge inviting the model to add a
+        closing sentence suggesting the user retry with quick mode off when it
+        spotted a gap. That nudge is gone: it was the one thing quick mode was
+        licensed to append beyond the answer itself, which is exactly what the
+        tightened scope rules now forbid. If a gap signal is wanted again,
+        surface it in the UI rather than in the answer text."""
+        return self.QUICK_SYSTEM_PROMPT
 
     def _system_prompt_with_context(self, context: str, base_prompt: str | None = None) -> str:
         """Build the system message: instructions + the retrieved reference
@@ -1729,7 +1780,12 @@ class GeorgeBot:
             question, history, audience)
         context, n_prefix_blocks = self._assemble_context(
             chunks, graph_facts, banner_facts, rmp_facts)
-        answer, cited = self.answer(question, context, history)
+        # `ask()` is the quick-mode path (non-streaming /api/chat and the CLI
+        # smoke test), so it takes quick mode's contract — it was silently
+        # using the default one, which is why CLI answers read longer than the
+        # streaming ones the frontend shows.
+        answer, cited = self.answer(question, context, history,
+                                    system_prompt=self.QUICK_SYSTEM_PROMPT)
         sources = _filter_cited_sources(
             self.format_sources(chunks, graph_facts, banner_facts, rmp_facts), cited)
         return {

@@ -29,8 +29,12 @@ Banner/RMP amplification, and bounded LRU caches (issue 5) close the slow OOM.
 
 **Request-size limits (issue 2) remain open by choice** — `question` and
 `history` are still unbounded, so the "six 5 MB turns" input-token bill is
-still reachable. Issue 1's per-IP limiter caps how *often* that can be done,
-not how *large* each one is.
+still reachable. Issue 1's limiter caps how *often* that can be done, not how
+*large* each one is.
+
+Issue 1's limiter was made **two-tier on 2026-08-04** (see 1a): per-device
+first, per-IP as a loose outer bound, because IP-only limiting throttled all
+of UVic campus wifi as a single user.
 
 CORS is **not** a defence here. `CORS_ALLOW_ORIGINS` is a browser-enforced
 policy; `curl`, Python `requests`, and any script ignore it entirely. The
@@ -114,6 +118,51 @@ being global if the app scales out (move to Redis then). No auth/API key was
 added; per-IP limiting + the daily cap were judged sufficient. Verified with a
 10-case functional test (burst/refill, per-mode buckets, XFF spoofing, daily
 cap, kill switch, bucket bounding, real 429s through the HTTP stack).
+
+### 1a. Shared-IP (campus NAT) starvation — ✅ FIXED 2026-08-04
+
+The IP-keyed bucket above was wrong for this app's actual user population:
+UVic campus wifi NATs the entire student body behind one public address, so
+`RATE_LIMIT_QUICK_PER_MIN=10` meant **10 questions per minute for all of
+campus**, with 429s hitting students who had asked nothing. Would have been
+the first production complaint, and it bites far below the ~12-concurrent
+capacity `MAX_INFLIGHT_CHAT` allows.
+
+**What landed:** `_check_rate_limit` is now two tiers, and a request must have
+a token in **both**.
+
+- **Device tier** — keyed on `X-Client-Id`, a UUID `frontend/src/lib/api.ts`
+  generates once and persists in `localStorage` (`clientId()`, sent via
+  `chatHeaders()` on both chat endpoints). Keeps the strict old numbers
+  (`RATE_LIMIT_BURST=5`, 10/min quick, 4/min default). This is what separates
+  users behind a shared IP.
+- **IP tier** — same rightmost-XFF address as before, sized for a whole NATed
+  campus rather than one person: `RATE_LIMIT_IP_BURST=40`,
+  `RATE_LIMIT_IP_QUICK_PER_MIN=120`, `RATE_LIMIT_IP_DEFAULT_PER_MIN=40`.
+  Its only job is to bound device-ID rotation.
+- **No usable `X-Client-Id` → the device tier keys on the IP**, so curl and
+  scripts keep exactly the old strict limit. Only clients that opt in by
+  sending an ID get per-device treatment.
+- IDs are validated (`_CLIENT_ID_RE`, 8–64 chars of `[A-Za-z0-9_-]`) before
+  ever being used as a dict key, so they can't be used to bloat `_buckets`
+  with huge keys; `_MAX_BUCKETS` eviction covers volume.
+- The IP tier is *peeked* before either tier is charged (`_peek_token` vs
+  `_take_token`), so a request the device tier will reject doesn't burn IP
+  budget its NAT neighbours are sharing.
+
+**The device ID is client-supplied and trivially spoofable — that is accepted,
+not overlooked.** It's a fairness mechanism between honest clients, not an
+authentication one. An attacker who rotates it per request falls through to
+the IP tier, and past that to `MAX_INFLIGHT_CHAT` and `DAILY_CHAT_CAP`, which
+are the real spend and load backstops. Don't "harden" it with a server-signed
+cookie without first deciding what threat that actually closes — rotation is
+just as cheap against a cookie the server hands out unauthenticated.
+
+Verified with a 9-case functional test on the limiter: single-device burst
+(5), 20 devices behind one NAT IP (40, vs 5 before), header-less curl still
+strict (5), ID-rotating attacker capped at the IP burst (40), a rejected
+neighbour leaving an innocent device's bucket untouched, malformed/oversized
+IDs rejected, daily cap still 503, per-mode buckets, and the kill switch.
 
 Original finding kept below for reference.
 

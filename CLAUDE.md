@@ -322,6 +322,18 @@ three artifacts under it — no per-deploy code change.
   `$PORT`/`$HOST` (default `0.0.0.0`) so no Railway-side config needed for
   that part; this was a real gap fixed on 2026-07-14 (originally hardcoded
   `127.0.0.1:5001`, which would not have bound correctly on Railway).
+- **Chat rate limiting is two-tier** (`_check_rate_limit`, api.py): a strict
+  bucket per **device** (`X-Client-Id`, a UUID the frontend keeps in
+  `localStorage`) inside a loose bucket per **IP**, plus the global
+  `DAILY_CHAT_CAP`. IP-only limiting was the original design and was wrong
+  here — UVic campus wifi NATs every student behind one address, so the whole
+  campus shared one 10/min bucket. A request with no `X-Client-Id` (curl,
+  scripts) keys the strict tier on its IP, i.e. the old behaviour. The device
+  ID is spoofable **by design** — it's fairness between honest clients, not
+  auth; rotation falls through to the IP tier and the daily cap. See
+  `issues.md` §1a before changing any of it. Effective capacity today is ~12
+  concurrent turns (`MAX_INFLIGHT_CHAT`) ≈ 40 concurrent users, but
+  `DAILY_CHAT_CAP=2000` binds first at ~300-600 users/day.
 - Frontend (Vercel): set `VITE_API_BASE` to the backend's Railway URL
   (`https://georgebot-production.up.railway.app`); it defaults to
   `http://127.0.0.1:5001` otherwise, which is dev-only. The backend's
@@ -682,6 +694,48 @@ after new corpus content lands.
 | `MAX_HISTORY_TURNS` | 6 | trailing turns kept for rewrite + answer |
 
 ### System prompt (answer model) — behavioral contract
+
+**Two assembled prompts, one shared accuracy contract (2026-08-04).** The
+answer contract is composed from three class constants in `chatbot.py` rather
+than written out twice:
+
+```
+SYSTEM_PROMPT       = _ANSWER_RULES_HEAD + _DEFAULT_STYLE + _CITED_SOURCES_RULES   # default mode
+QUICK_SYSTEM_PROMPT = _ANSWER_RULES_HEAD + _QUICK_STYLE   + _CITED_SOURCES_RULES   # quick mode
+```
+
+`_ANSWER_RULES_HEAD` (the SYSTEM-supplied framing + every ACCURACY rule) and
+`_CITED_SOURCES_RULES` are **shared verbatim** — quick mode is narrower in
+what it *volunteers*, never looser about facts, and that's guaranteed by
+construction rather than by keeping two texts in sync. **Don't fork the head**;
+edit it and both modes move together. `SYSTEM_PROMPT` is byte-identical to what
+it was before the split (verified against git HEAD), so default mode is
+unchanged. `_QUICK_STYLE` adds the SCOPE AND STYLE section: answer exactly
+what was asked and nothing else — no preamble, no restating the question, no
+closing/summary line, no unsolicited tips, next steps, caveats, alternatives,
+or related courses/programs; length follows the question (one sentence if that
+answers it); prose by default, short lists only when the answer really is a
+list. Its **last bullet is load-bearing**: it explicitly exempts the
+qualifications the ACCURACY rules mandate (naming a Banner/HISTORICAL term,
+section codes, RMP attribution + sample size, asking on an ambiguous program
+match) from "nothing extra" — without it a hard brevity rule reads as license
+to drop them.
+
+Quick mode's prompt reaches the model via `answer(…, system_prompt=…)` /
+`answer_stream(…, system_prompt=…)` → `_system_prompt_with_context`. Both quick
+entry points use it: `api.py`'s SSE path (via `_quick_mode_system_prompt()`,
+now a thin accessor) and `bot.ask()` (non-streaming `/api/chat` + the CLI
+`--ask` smoke test) — `ask()` previously used the default prompt by oversight,
+which made CLI answers read longer than what the frontend actually showed.
+
+**The old QUICK MODE nudge was removed** in the same change. It let the model
+append one closing sentence suggesting the user retry with quick mode off when
+it spotted a gap — the single thing quick mode was licensed to add beyond the
+answer, and exactly what the new scope rules forbid. Quick mode now has no
+in-band gap signal at all (it has no verification step either — that's default
+mode's `answer_verified_stream`); if one is wanted back, surface it in the UI,
+not in the answer text.
+
 - **Reference material is framed as SYSTEM-supplied, and the word "chunk"
   never appears in the prompt** (explicit user direction). The prompt tells
   the model the user didn't write or see the material, that some of it may
@@ -739,7 +793,9 @@ after new corpus content lands.
   common surname). The prompt owns this contract on `thinking: "disabled"`.
 - If a program search returned multiple candidates, ask the user to
   clarify rather than guessing.
-- Concise, plain text (no LaTeX).
+- Concise, plain text (no LaTeX) — default mode. Quick mode replaces this
+  bullet with the much stricter SCOPE AND STYLE section described at the top
+  of this section; everything above it is shared by both.
 
 ---
 

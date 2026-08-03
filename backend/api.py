@@ -25,8 +25,10 @@ logging failure never affects the answer.
 Env (.env): MINIMAX_SUB_KEY, VOYAGE_API_KEY, ADMIN_TOKEN (admin routes)
 
 Rate limiting (chat endpoints only; all optional, sane defaults):
-  RATE_LIMIT_QUICK_PER_MIN / RATE_LIMIT_DEFAULT_PER_MIN  per-IP refill rates
-  RATE_LIMIT_BURST                                       per-IP bucket size
+  RATE_LIMIT_QUICK_PER_MIN / RATE_LIMIT_DEFAULT_PER_MIN  per-device refill rates
+  RATE_LIMIT_BURST                                       per-device bucket size
+  RATE_LIMIT_IP_QUICK_PER_MIN / RATE_LIMIT_IP_DEFAULT_PER_MIN  per-IP refill rates
+  RATE_LIMIT_IP_BURST                                    per-IP bucket size
   DAILY_CHAT_CAP                                         global daily ceiling
   RATE_LIMIT_ENABLED=0                                   disable (load tests)
 
@@ -44,6 +46,7 @@ import io
 import itertools
 import json
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -74,10 +77,34 @@ DEFAULT_MODE = "quick"
 # ----------------------------------------------------------------
 # Rate limiting for the chat endpoints (the ones that cost real money:
 # every request is at least one Voyage embedding + two MiniMax calls).
-# Per-client-IP token buckets, with a stricter bucket for mode="default"
-# (the verify path can run three full generations), plus a global daily
-# request ceiling as a spend backstop. CORS is browser-only policy and is
-# NOT a defence here — these endpoints are effectively public API.
+# Token buckets in TWO tiers, both of which must have a token for a request
+# to pass, with a stricter bucket for mode="default" (the verify path can run
+# three full generations), plus a global daily request ceiling as a spend
+# backstop. CORS is browser-only policy and is NOT a defence here — these
+# endpoints are effectively public API.
+#
+# WHY TWO TIERS (added 2026-08-04). Keying only on IP was wrong for this
+# app's actual users: UVic campus wifi NATs the whole student body behind one
+# public address, so a 10/min per-IP bucket meant ~10 questions per minute for
+# ALL of campus and 429s for people who had asked nothing. The tiers now split
+# the two jobs the single bucket was failing to do at once:
+#
+#   device tier — X-Client-Id, a UUID the frontend generates once and keeps in
+#     localStorage. Strict (RATE_QUICK_PER_MIN), and it's what stops one
+#     person spamming. Separates users behind a shared IP, which is the point.
+#   IP tier — the real client address. Loose (RATE_IP_QUICK_PER_MIN, sized for
+#     a whole NATed campus), and it's what stops one machine rotating fake
+#     device IDs from having no limit at all.
+#
+# The device ID is client-supplied and therefore trivially spoofable — that is
+# accepted, not overlooked. An attacker who rotates it per request falls
+# through to the IP tier, and past that to MAX_INFLIGHT_CHAT and
+# DAILY_CHAT_CAP, which are the real spend/load backstops. The device tier is
+# a fairness mechanism between honest clients, not an authentication one.
+#
+# A request with NO usable X-Client-Id keys its device bucket on the IP
+# instead, so bare API callers (curl, scripts) still get the strict limit —
+# only browsers that opt in by sending an ID get per-device treatment.
 #
 # In-process state: correct for a single Railway replica. If this app ever
 # scales past one replica, the buckets stop being global — move them to a
@@ -87,11 +114,26 @@ DEFAULT_MODE = "quick"
 RATE_QUICK_PER_MIN = float(os.getenv("RATE_LIMIT_QUICK_PER_MIN", "10"))
 RATE_DEFAULT_PER_MIN = float(os.getenv("RATE_LIMIT_DEFAULT_PER_MIN", "4"))
 RATE_BURST = float(os.getenv("RATE_LIMIT_BURST", "5"))  # bucket capacity
+
+# Per-IP tier: sized to hold a whole NATed campus, not one person. It exists
+# to bound device-ID rotation, so it should stay well above what any single
+# user can consume through the device tier and well below what would drain
+# DAILY_CHAT_CAP in minutes.
+RATE_IP_QUICK_PER_MIN = float(os.getenv("RATE_LIMIT_IP_QUICK_PER_MIN", "120"))
+RATE_IP_DEFAULT_PER_MIN = float(os.getenv("RATE_LIMIT_IP_DEFAULT_PER_MIN", "40"))
+RATE_IP_BURST = float(os.getenv("RATE_LIMIT_IP_BURST", "40"))
+
 DAILY_CHAT_CAP = int(os.getenv("DAILY_CHAT_CAP", "2000"))  # all IPs combined
-_MAX_BUCKETS = 10_000  # bound the attacker-keyed dict (unique-IP floods)
+_MAX_BUCKETS = 10_000  # bound the attacker-keyed dict (unique-IP/ID floods)
+
+# Device IDs are attacker-controlled strings, so they're never used raw as
+# dict keys: anything not matching this (or longer than _MAX_CLIENT_ID) is
+# discarded and the request falls back to IP-keyed strict limiting.
+_CLIENT_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{8,64}\Z")
 
 _rate_lock = threading.Lock()
-_buckets: dict[tuple[str, str], tuple[float, float]] = {}  # (ip, mode) -> (tokens, last_ts)
+# (tier, key, mode) -> (tokens, last_ts); tier is "dev" or "ip"
+_buckets: dict[tuple[str, str, str], tuple[float, float]] = {}
 _daily = {"day": "", "count": 0}
 
 
@@ -110,17 +152,62 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _check_rate_limit(request: Request, mode: str) -> None:
-    """Raise 429 (per-IP bucket empty) or 503 (daily ceiling hit).
+def _client_device(request: Request) -> str | None:
+    """The client's self-reported device ID, or None if absent/malformed.
 
-    Token bucket: starts at RATE_BURST tokens, refills continuously at the
-    per-mode rate, each request spends one. RATE_LIMIT_ENABLED=0 disables
-    the whole thing (load tests, local batch runs)."""
+    Spoofable by design (see the tier comment above) — validated only so an
+    attacker can't use it to grow the bucket dict with huge keys."""
+    cid = request.headers.get("X-Client-Id", "").strip()
+    return cid if _CLIENT_ID_RE.match(cid) else None
+
+
+def _take_token(tier: str, key: str, mode: str, per_min: float,
+                burst: float, now: float) -> float | None:
+    """Refill this bucket and spend one token.
+
+    Returns None on success, or the seconds to wait if the bucket is empty.
+    Caller must hold _rate_lock. The bucket is written back either way, so a
+    rejected request still records its refill clock."""
+    bkey = (tier, key, mode)
+    tokens, last = _buckets.get(bkey, (burst, now))
+    tokens = min(burst, tokens + (now - last) * per_min / 60.0)
+    if tokens < 1.0:
+        _buckets[bkey] = (tokens, now)
+        return (1.0 - tokens) * 60.0 / per_min if per_min > 0 else 60.0
+    _buckets[bkey] = (tokens - 1.0, now)
+    return None
+
+
+def _peek_token(tier: str, key: str, mode: str, per_min: float,
+                burst: float, now: float) -> float | None:
+    """Like _take_token but spends nothing — used to check the second tier
+    before either is charged, so a request rejected by one tier doesn't
+    silently drain the other's budget."""
+    tokens, last = _buckets.get((tier, key, mode), (burst, now))
+    tokens = min(burst, tokens + (now - last) * per_min / 60.0)
+    if tokens < 1.0:
+        return (1.0 - tokens) * 60.0 / per_min if per_min > 0 else 60.0
+    return None
+
+
+def _check_rate_limit(request: Request, mode: str) -> None:
+    """Raise 429 (a bucket is empty) or 503 (daily ceiling hit).
+
+    Token bucket per tier: starts full, refills continuously at the per-mode
+    rate, each request spends one from BOTH tiers. RATE_LIMIT_ENABLED=0
+    disables the whole thing (load tests, local batch runs)."""
     if os.getenv("RATE_LIMIT_ENABLED", "1").lower() in ("0", "false", "no"):
         return
-    per_min = RATE_DEFAULT_PER_MIN if mode == "default" else RATE_QUICK_PER_MIN
-    key = (_client_ip(request), mode)
+    is_default = mode == "default"
+    dev_per_min = RATE_DEFAULT_PER_MIN if is_default else RATE_QUICK_PER_MIN
+    ip_per_min = RATE_IP_DEFAULT_PER_MIN if is_default else RATE_IP_QUICK_PER_MIN
+
+    ip = _client_ip(request)
+    # No usable device ID -> the strict tier keys on the IP, i.e. exactly the
+    # old single-tier behaviour for non-browser callers.
+    device = _client_device(request) or ip
     now = time.monotonic()
+
     with _rate_lock:
         # Global daily backstop: even a distributed abuser can't spend more
         # than DAILY_CHAT_CAP requests' worth of API credits in a UTC day.
@@ -133,23 +220,26 @@ def _check_rate_limit(request: Request, mode: str) -> None:
                 detail="GeorgeBot has reached its daily capacity — please try again tomorrow.",
                 headers={"Retry-After": "3600"})
 
-        tokens, last = _buckets.get(key, (RATE_BURST, now))
-        tokens = min(RATE_BURST, tokens + (now - last) * per_min / 60.0)
-        if tokens < 1.0:
-            _buckets[key] = (tokens, now)
-            retry = int((1.0 - tokens) * 60.0 / per_min) + 1 if per_min > 0 else 60
+        # Both tiers must have a token. Check the IP tier without spending
+        # first, so a request the device tier is about to reject doesn't also
+        # burn IP budget that its NAT neighbours are sharing.
+        retry = _peek_token("ip", ip, mode, ip_per_min, RATE_IP_BURST, now)
+        if retry is None:
+            retry = _take_token("dev", device, mode, dev_per_min, RATE_BURST, now)
+            if retry is None:
+                _take_token("ip", ip, mode, ip_per_min, RATE_IP_BURST, now)
+                _daily["count"] += 1
+        if retry is not None:
             raise HTTPException(
                 status_code=429,
                 detail="Too many requests — please slow down.",
-                headers={"Retry-After": str(retry)})
-        _buckets[key] = (tokens - 1.0, now)
-        _daily["count"] += 1
+                headers={"Retry-After": str(int(retry) + 1)})
 
-        # Keep the bucket dict bounded: it's keyed on client IPs, which an
-        # attacker controls. Evict idle entries first (a full bucket refills
-        # from zero in under a minute at any sane rate, so dropping stale
-        # state is harmless); a clear() only happens under an active
-        # unique-IP flood, where resetting bursts is the lesser evil.
+        # Keep the bucket dict bounded: it's keyed on client IPs and device
+        # IDs, both of which an attacker controls. Evict idle entries first (a
+        # full bucket refills from zero in under a minute at any sane rate, so
+        # dropping stale state is harmless); a clear() only happens under an
+        # active unique-key flood, where resetting bursts is the lesser evil.
         if len(_buckets) > _MAX_BUCKETS:
             cutoff = now - 600
             for k in [k for k, v in _buckets.items() if v[1] < cutoff]:

@@ -2,6 +2,62 @@ import type { Audience, Message, Source, ThinkingMode } from '@/types'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:5001'
 
+const CLIENT_ID_KEY = 'georgebot_client_id'
+
+/**
+ * A stable per-browser id, sent as X-Client-Id on every chat request.
+ *
+ * The backend rate-limits on this first and on IP only as a loose outer
+ * bound: UVic campus wifi NATs every student behind one address, so an
+ * IP-keyed limit throttled the whole campus together. This is the signal that
+ * tells those users apart.
+ *
+ * Not identity and not security — it's user-editable and the backend treats
+ * it as spoofable (see the tier comment in api.py). Nothing is stored against
+ * it server-side; it only picks which token bucket a request spends from.
+ *
+ * Falls back to a per-page-load id when localStorage is unavailable (Safari
+ * private mode, storage disabled), which degrades to "this tab is one
+ * device" rather than throwing.
+ */
+let memoryClientId: string | null = null
+
+function clientId(): string {
+  if (memoryClientId) return memoryClientId
+  try {
+    const saved = localStorage.getItem(CLIENT_ID_KEY)
+    if (saved) {
+      memoryClientId = saved
+      return saved
+    }
+  } catch {
+    // storage blocked — fall through and use a per-load id
+  }
+  // crypto.randomUUID needs a secure context; localhost and https both
+  // qualify, but keep a plain-random fallback so dev over http:// works.
+  const fresh =
+    typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+  memoryClientId = fresh
+  try {
+    localStorage.setItem(CLIENT_ID_KEY, fresh)
+  } catch {
+    // ignore — memoryClientId still keeps it stable for this page load
+  }
+  return fresh
+}
+
+// Headers for the two chat endpoints. Adding X-Client-Id makes these
+// requests non-simple for CORS, but they already were (JSON content type),
+// and the backend sends allow_headers=["*"], so no preflight change is needed.
+function chatHeaders(): Record<string, string> {
+  return {
+    'Content-Type': 'application/json',
+    'X-Client-Id': clientId(),
+  }
+}
+
 /**
  * Is the backend up and serving?
  *
@@ -126,7 +182,7 @@ export async function askGeorge(
 ): Promise<{ answer: string; sources: Source[] }> {
   const res = await fetch(`${API_BASE}/api/chat`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: chatHeaders(),
     body: JSON.stringify({ question, history: toHistory(priorMessages), audience }),
   })
   if (!res.ok) {
@@ -161,7 +217,7 @@ export async function askGeorgeStream(
 ): Promise<void> {
   const res = await fetch(`${API_BASE}/api/chat/stream`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: chatHeaders(),
     body: JSON.stringify({
       question,
       history: toHistory(priorMessages),
