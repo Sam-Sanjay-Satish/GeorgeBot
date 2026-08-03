@@ -7,9 +7,9 @@ const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:5001'
  *
  * Vercel and Railway deploy independently off the same push, and the frontend
  * almost always wins: Vite builds in seconds while the backend rebuilds its
- * image, remounts the Volume, and now also warms the vector store before it
- * binds a port. During that window georgebot.org is live but every question
- * would fail, so the disclaimer gate polls this before letting anyone in.
+ * image, remounts the Volume, and loads the graph + collections before it binds
+ * a port. During that window georgebot.org is live but every question would
+ * fail, so the disclaimer gate polls this before letting anyone in.
  *
  * `/health` is deliberately the cheapest route on the backend (async, no Chroma
  * or SQLite touch, chunk count snapshotted at boot), so polling it is free.

@@ -168,6 +168,7 @@ reading this first:
 │   ├── api.py                 # FastAPI server (thin wrapper over GeorgeBot); Railway PORT/HOST-aware
 │   ├── querylog.py            # per-turn query log (SQLite on the Volume) — corpus-gap analysis; best-effort, never breaks an answer
 │   ├── admin_page.py          # the /admin query-log viewer, one self-contained HTML string (no build step)
+│   ├── warmup.py              # hourly full-pipeline warm probes + per-phase timing heartbeat (see "Warm probes")
 │   ├── Dockerfile             # backend container build (Railway); multi-stage python:3.14-slim, CMD python api.py
 │   ├── .dockerignore          # excludes volume artifacts (chroma_db/graph_data/taxonomy), .env, pycache
 │   ├── requirements.txt       # serving deps only (openai, voyageai, chromadb, networkx, fastapi, uvicorn)
@@ -784,9 +785,54 @@ after new corpus content lands.
   queries read the HNSW index + SQLite off disk; once the working set is
   cached in RAM (and the Voyage/MiniMax keep-alive connections are
   established, and each collection's HNSW graph is loaded on its first query)
-  it hits steady-state speed. Self-resolving. Optional fix if it ever
-  matters: a boot warm-up that fires a throwaway retrieval per collection
-  before serving real traffic (not implemented).
+  it hits steady-state speed. Self-resolving.
+- ⚠️ **UNRESOLVED: the service also goes cold after a long IDLE.** A Chroma-only
+  keep-warm was removed (2026-08-03) because it did not fix it, and replaced the
+  same day by the full-pipeline warm probes in `backend/warmup.py` (see
+  "Warm probes" below). The root cause is still unidentified — the new loop is
+  as much instrumentation as mitigation. Read this before changing either.
+  - **The symptom, measured against prod:** first request after ~2 days idle
+    took **51.9s** server-side (`latency_ms` in the query log), then 8.2s and
+    5.9s back-to-back. Railway logs showed **no container restart** — same
+    process throughout — so this is not a container cold start.
+  - **What was built and removed:** `WARM_INTERVAL_SECONDS` (300s) /
+    `WARM_QUERIES` / `_warm_vectors` / `_warm_pass` / `warm_up` /
+    `_keep_warm_loop` / `start_keep_warm` in `chatbot.py`, plus a `WARM_UP`-
+    gated call block in `api.py`'s `main()`. A daemon thread re-queried Chroma
+    with 6 cached query embeddings every 300s. It was confirmed **alive** in
+    prod (`Keep-warm thread started (every 300s)` in the deploy log) during the
+    51.9s request. It made **zero HTTP calls** by design (embeddings cached at
+    boot), so it warmed only the `chroma.sqlite3` page cache — the cost
+    separately measured at ~1.1s, i.e. it defended ~1s of a ~44s problem.
+    Its boot pass also added 14.6s *before* uvicorn bound the port, making
+    genuine container cold starts slower.
+  - **Ruled out — don't re-investigate these:** container restart / Railway app
+    sleep (no new `Starting Container` in the logs); the thread failing to
+    start or being env-disabled (`WARM_UP`/`WARM_INTERVAL_SECONDS` are not set
+    on Railway, so defaults applied).
+  - **Stale outbound connection pools were the leading hypothesis and are NOT
+    the answer, at least not within minutes.** `openai.OpenAI(...)` and
+    `voyageai.Client(...)` (chatbot.py, in `__init__`) are constructed with no
+    `timeout` and no `max_retries`, so SDK defaults (600s / 2 retries) apply —
+    which predicted a ~20s hang before any retrieval. Disproved by direct
+    measurement: after **16 min idle**, an SSE run timed `request → status`
+    event (the router MiniMax call, which happens *before* embed/retrieve) at
+    **1.97s**, first token at 3.84s, whole stream 6.95s. Fully warm.
+  - **So the two data points bracket it:** ~2 days idle → 51.9s; ~16 min idle →
+    6.9s. Whatever it is develops over **hours-to-days**, not minutes. That
+    timescale matches the page-cache reclaim noted above (`file` cache observed
+    falling 891 MB → 180 MB over 16 idle hours) — which would mean the ticker's
+    idea was right but its working set (6 fixed queries, and the loop ran only
+    the *unfiltered* pass while boot ran both) was far too small a slice of the
+    968 MB SQLite. **This is inference, not measurement** — one 16-minute
+    negative does not prove what the multi-day positive was.
+  - **Next step to actually pin it:** `warmup.py`'s per-probe `route=` /
+    `retrieve=` split is now logging exactly the attribution needed, once an
+    hour, forever. Grep Railway for `[warm]` after a quiet stretch: if
+    `route_ms` balloons it's the outbound MiniMax path; if `retrieve_ms`
+    balloons it's Voyage/Chroma/the Volume page cache. That reading is what
+    should finally close this out — no further experiment needs designing.
+
 - **This repo has no venv/lockfile of its own yet** — currently dev-tested
   by borrowing `georgebot-pipeline`'s venv. Fine short-term since both
   repos share a machine during this transition, but worth fixing before
@@ -798,6 +844,50 @@ after new corpus content lands.
   login/auth — the app gates on a one-time `DisclaimerPage` (educational-use
   notice + a "Continue" button, state held as `acknowledged` in `App.tsx`);
   `mockData.ts` exists but is unused.
+
+### Warm probes (`backend/warmup.py`, 2026-08-03)
+
+Replaces the removed Chroma-only ticker. A daemon thread runs 5 synthetic
+questions through the **real** pipeline every `WARM_INTERVAL_SECONDS`, so every
+layer a live request touches is exercised: router LLM call, Voyage embedding,
+**both** Chroma collections, course graph, Banner, RMP.
+
+- **Probes are one-per-path**: `vector-undergrad`, `vector-faculty` (separate
+  HNSW graph + SQLite pages — warming one does not warm the other), `graph`,
+  `banner`, `rmp`.
+- **Gates are pinned via `Probe.force`, not left to the router.** The router
+  call still runs on every probe (that's what warms MiniMax, and it's half the
+  timing split), but its result is overridden for the gated paths. Measured
+  reason: M3's non-determinism (CLAUDE.md §1) had the *same* Banner/RMP question
+  return a full route on one cycle and an empty one on the next, warming those
+  layers on a coin flip. This pins warming coverage, **not** router correctness —
+  the loop is not a router test.
+- **RMP chains off Banner.** `_rmp_retrieve_for` only fires on `professor_query`
+  OR (`wants_rating` AND non-empty `banner_facts`), so the RMP probe must open
+  the Banner gate too. Chained deliberately rather than hardcoding a real
+  professor's name into the repo.
+- **The Banner probe's course must be OFFERED in the resolved term** or it
+  returns `{}` and warms nothing (MATH 100 and ENGL 135 both came back empty in
+  Summer 2026). `MISSED=banner` in the log means that first, not "Banner is
+  down".
+- **Never touches `querylog`** (probes call `bot.*` directly, not the HTTP
+  endpoint — synthetic turns must not pollute corpus-gap analysis) and **never
+  uses the chat executor**.
+- **Env:** `WARM_INTERVAL_SECONDS` (default 3600), `WARM_ENABLED=0` to disable,
+  `WARM_ANSWER=1` to also warm the answer generation. `WARM_ANSWER` is **off by
+  default** — it would add a second MiniMax generation of up to
+  `ANSWER_MAX_TOKENS` per probe against the documented token-throughput rate
+  limit while warming nothing the router call hasn't (same endpoint, model,
+  connection).
+- ⚠️ **1h is an assumption, not a validated number.** The only interval proven
+  to keep this service warm is ~16 min. If cold hits persist in the query log,
+  lower `WARM_INTERVAL_SECONDS` first.
+- Cycle cost ~15-25s wall, 5 router calls. Started before uvicorn binds so the
+  first cycle overlaps startup — the removed boot warm-up ran *before* the port
+  opened and added 14.6s to every container start, which the frontend health-gate
+  had to sit through. Don't reintroduce that.
+- Every cycle prints, success or failure. The removed ticker printed nothing on
+  a good tick, which is why confirming it even ran took a live experiment.
 
 ---
 
