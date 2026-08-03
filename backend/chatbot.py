@@ -982,6 +982,12 @@ class GeorgeBot:
             f'  "search_query": a single standalone search query for a document '
             f"knowledge base — resolve pronouns/references using the conversation, "
             f"keep course codes/program names/proper nouns.\n"
+            f'  "needs_retrieval": false ONLY when the turn is pure conversational '
+            f"filler that no UVic reference material could inform — a greeting "
+            f'("hi", "whats up"), thanks, goodbye, an acknowledgement ("ok", "got '
+            f'it"), or small talk about you the assistant. TRUE for everything '
+            f"else, including vague, off-topic, or poorly-worded questions — when "
+            f"in doubt, true.\n"
             f'  "course_codes": array of UVic course codes explicitly named or '
             f'clearly implied (e.g. ["CSC225", "MATH122"]), normalized with no '
             f"space (e.g. \"CSC 225\" -> \"CSC225\"). Empty array if none.\n"
@@ -1067,6 +1073,10 @@ class GeorgeBot:
                 year = None
             return {
                 "search_query": data.get("search_query") or question,
+                # Default TRUE on a missing/garbled field: skipping retrieval on a
+                # real question is a far worse failure than retrieving for a
+                # greeting, so only an explicit `false` turns it off.
+                "needs_retrieval": data.get("needs_retrieval") is not False,
                 "completed_courses": _clean_course_codes(data.get("completed_courses"), MAX_COMPLETED_COURSES),
                 "course_codes": _clean_course_codes(data.get("course_codes"), MAX_COURSE_CODES),
                 "program_query": data.get("program_query") or None,
@@ -1082,7 +1092,10 @@ class GeorgeBot:
             }
         except Exception as e:
             print(f"  [rewrite_and_route] failed, falling back to vector-only: {e}", file=sys.stderr)
-            return {"search_query": question, "course_codes": [], "program_query": None,
+            # needs_retrieval TRUE here on purpose: a router failure must degrade to
+            # vector-only, never to "no retrieval at all".
+            return {"search_query": question, "needs_retrieval": True,
+                    "course_codes": [], "program_query": None,
                     "wants_outline": False, "wants_availability": False, "instructor_query": None,
                     "professor_query": None, "wants_rating": False,
                     "term_season": None, "term_year": None, "completed_courses": [],
@@ -1629,10 +1642,23 @@ class GeorgeBot:
                 route["instructor_query"], route["term_season"], route["term_year"],
             )
         rmp_facts = self._rmp_retrieve_for(route, banner_facts)
-        chunks = self.vector_retrieve(
-            route["search_query"], audience=audience,
-            topic_families=route["topic_families"], department=route["department"],
-        )
+        # `needs_retrieval=False` is the router calling this turn pure conversational
+        # filler (a greeting, "thanks", "ok"). Skipping the vector pass is the fix for
+        # a real user-visible bug: "whats up" was rewritten to search_query="greeting",
+        # which still matched 4 chunks under MAX_CHUNK_DISTANCE (Air Quality, IT
+        # Support, Cathinones, Fluorofentanyl) — the lexical-overlap case documented
+        # in "what NOT to over-fix" #2. Those then reached the user because the answer
+        # model omits its <<CITED_SOURCES>> marker ~33% of the time on chit-chat and
+        # `_filter_cited_sources` deliberately fails open. Not retrieving at all fixes
+        # it at the source, without touching that fail-open policy for real questions.
+        # Gated on the vector path ONLY: if the router somehow set this false while
+        # naming a course, the graph/banner/rmp facts above still stand.
+        chunks = []
+        if route.get("needs_retrieval", True):
+            chunks = self.vector_retrieve(
+                route["search_query"], audience=audience,
+                topic_families=route["topic_families"], department=route["department"],
+            )
         return chunks, graph_facts, banner_facts, rmp_facts
 
     def retrieve(self, question: str, history: list[dict],

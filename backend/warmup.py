@@ -164,7 +164,11 @@ def _run_probe(bot, probe: Probe) -> None:
     try:
         route = bot.rewrite_and_route(probe.question, [], probe.audience)
         t_route = time.monotonic()
-        route.update(probe.force)   # pin this probe's gate — see Probe docstring
+        # Pin this probe's gate — see Probe docstring. `needs_retrieval` is pinned
+        # for every probe regardless: the router turns it off for conversational
+        # filler, and a probe misread that way would silently stop warming Chroma.
+        route.update(probe.force)
+        route["needs_retrieval"] = True
 
         chunks, graph_facts, banner_facts, rmp_facts = bot.retrieve_with_route(
             route, probe.audience)
