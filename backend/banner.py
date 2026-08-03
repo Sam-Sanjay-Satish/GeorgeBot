@@ -36,6 +36,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date, timedelta
 
 import requests
 
@@ -53,6 +54,10 @@ HTTP_TIMEOUT = 15  # seconds per request
 SECTIONS_TTL = 120       # seat counts move minute-to-minute during registration
 FACULTY_TTL = 6 * 3600   # instructor for a section barely changes
 TERMS_TTL = 6 * 3600     # valid-term list barely changes
+# How long after a term starts it stays the default answer for an untermed
+# question. Past this, `_default_term` rolls forward to the next registerable
+# term. ~UVic's add deadline (about two weeks in) plus slack.
+TERM_ADD_GRACE_DAYS = 30
 
 # Outbound-amplification guard (2026-08-01, audit issue 4). `course_codes` reach
 # this module from an LLM router — chatbot.py caps + pattern-validates them at
@@ -64,7 +69,24 @@ MAX_COURSES_PER_CALL = int(os.environ.get("BANNER_MAX_COURSES", "5"))
 # _SEM_ACQUIRE_TIMEOUT and the lookup degrades to "no live data" ({} from the
 # best-effort top-level entries) instead of queueing more load onto UVic.
 MAX_OUTBOUND_CONCURRENCY = int(os.environ.get("BANNER_MAX_CONCURRENCY", "8"))
-_SEM_ACQUIRE_TIMEOUT = 2  # seconds to wait for a slot before giving up
+# Seconds to wait for a slot before giving up. This bounds how long we QUEUE, not
+# how much load UVic sees — peak concurrency is MAX_OUTBOUND_CONCURRENCY either
+# way — so giving up early buys UVic nothing and costs us a wrong answer (the
+# lookup degrades to {} and the turn punts). It was 2s, which two genuinely
+# concurrent availability lookups could exceed once the term default started
+# returning real teaching terms with 25-40 sections. Waiting is the better
+# trade: a slower live answer beats a fast "I couldn't find it".
+_SEM_ACQUIRE_TIMEOUT = int(os.environ.get("BANNER_SEM_TIMEOUT", "8"))
+# Per-course ceiling on the faculty fan-out, deliberately BELOW
+# MAX_OUTBOUND_CONCURRENCY so one request can never hold every global slot.
+# It used to equal the global cap, which was survivable only because the old
+# term default landed on Summer (a handful of sections per course). Now that
+# the default is a real teaching term, one course can have 40+ sections — at
+# equal caps a single availability lookup saturated the global semaphore and
+# every concurrent Banner request timed out into "no live data". Halving it
+# costs some wall time on a cold cache (per-CRN results are cached
+# FACULTY_TTL=6h, so it's paid once per section per 6h) and buys fairness.
+MAX_COURSE_FANOUT = max(2, MAX_OUTBOUND_CONCURRENCY // 2)
 
 # Season -> the MM half of a YYYYMM Banner term code.
 #   01 = Second Term  (Jan-Apr, "Spring")
@@ -179,16 +201,51 @@ def _is_registerable(t: dict) -> bool:
     return "(View Only)" not in (t.get("description") or "")
 
 
+def _term_start(code: str) -> date | None:
+    """First day of the month a YYYYMM term code starts in (01 -> Jan, 05 -> May,
+    09 -> Sep). None if the code isn't the expected shape."""
+    try:
+        return date(int(code[:4]), int(code[4:6]), 1)
+    except (ValueError, TypeError, IndexError):
+        return None
+
+
+def _default_term(registerable: list[str]) -> str | None:
+    """The term an untermed question ("is CSC 110 full?") most likely means today.
+
+    NOT simply the earliest still-open term. UVic keeps a term out of "View Only"
+    for a while after its add/drop window closes, so the earliest registerable code
+    is often a term that is nearly over and effectively un-addable — in early
+    August that is Summer, when the asker means Fall. Worse, a term already in
+    progress carries only a fraction of the catalog, so most courses return no
+    sections at all and the answer degrades to "I couldn't find it".
+
+    So: skip any term that started more than `TERM_ADD_GRACE_DAYS` ago, provided a
+    later registerable term exists. That keeps the in-session term while it's still
+    joinable and rolls forward once it isn't. Falls back to the old behaviour (the
+    earliest registerable term) if every candidate is stale, so this can only
+    change *which* term is picked, never whether one is.
+    """
+    cutoff = date.today() - timedelta(days=TERM_ADD_GRACE_DAYS)
+    for code in registerable:                      # ascending: earliest first
+        start = _term_start(code)
+        if start is None or start >= cutoff:
+            return code
+    return registerable[0] if registerable else None
+
+
 def resolve_term(season: str | None = None, year: int | None = None) -> str | None:
     """Resolve a Banner term code from an optional season/year hint.
 
-    - No hint          -> the current/upcoming registerable term (the smallest,
-                          i.e. earliest still-open, non-"View Only" code). UVic marks
-                          past terms "View Only", so the non-View-Only set is exactly
-                          {current + upcoming}.
+    - No hint          -> `_default_term` (see there): the earliest registerable
+                          term that hasn't already been running longer than the
+                          add window, not merely the earliest registerable one.
     - season (+ year)  -> build YYYYMM from the hint and confirm it exists in the term
                           list; season-only picks the nearest registerable term of that
                           season.
+    A user-named term always wins — this default only applies when the router
+    extracted no term at all.
+
     Returns None only if Banner returned no terms at all.
     """
     terms = get_terms()
@@ -213,9 +270,7 @@ def resolve_term(season: str | None = None, year: int | None = None) -> str | No
         if matches:
             return matches[0]
 
-    if registerable:
-        return registerable[0]
-    return sorted(all_codes)[0] if all_codes else None
+    return _default_term(registerable) or (sorted(all_codes)[0] if all_codes else None)
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +360,7 @@ def search_sections(subject: str, number: str, term: str) -> list[dict]:
     unique_crns = [c for c in dict.fromkeys(crns) if c]
     faculty_by_crn: dict[str, list] = {}
     if unique_crns:
-        with ThreadPoolExecutor(max_workers=min(8, len(unique_crns))) as pool:
+        with ThreadPoolExecutor(max_workers=min(MAX_COURSE_FANOUT, len(unique_crns))) as pool:
             faculty_by_crn = dict(zip(
                 unique_crns,
                 pool.map(lambda c: _fetch_faculty(session, term, c), unique_crns),

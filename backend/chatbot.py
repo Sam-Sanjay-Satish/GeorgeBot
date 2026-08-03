@@ -633,15 +633,40 @@ class GeorgeBot:
             result["requirements_remaining"] = self.gs.requirements_remaining(m["pid"], completed)
         return result
 
+    def _course_suggestions(self, code: str, limit: int = 4) -> list[str]:
+        """Catalog codes that look like the one asked for — in practice the
+        letter-suffixed variants of a base code (PSYC100 -> PSYC100A, PSYC100B).
+
+        This is not a nicety: ~225 UVic course bases exist ONLY as A/B variants
+        (PSYC 100, SOCI 100, GEOG 101, LING 100, SPAN 100, BIOL 150/190, most
+        HSTR and MUS courses), and students type the base form."""
+        try:
+            nodes = self.gs.cg.nodes
+        except AttributeError:
+            return []
+        return sorted(
+            n for n in nodes
+            if isinstance(n, str) and n != code and n.startswith(code)
+            and len(n) == len(code) + 1
+        )[:limit]
+
     def graph_retrieve(self, course_codes: list[str], program_query: str | None,
                         want_outline: bool, completed_courses: list[str]) -> dict:
         courses = []
+        not_found = []
         for code in course_codes:
             f = self._course_facts(code, want_outline, completed_courses)
             if f:
                 courses.append(f)
+            else:
+                # Record the miss instead of dropping it silently. A dropped code
+                # left the answer model with no idea the lookup had happened, so it
+                # filled the gap from its own knowledge and stated invented catalog
+                # facts with full confidence (measured: "PSYC 100" produced a
+                # fabricated prereq relationship between PSYC 100A and 100B).
+                not_found.append({"code": code, "suggestions": self._course_suggestions(code)})
         program = self._program_facts(program_query, completed_courses) if program_query else None
-        return {"courses": courses, "program": program}
+        return {"courses": courses, "not_found": not_found, "program": program}
 
     @staticmethod
     def _graph_context_text(graph_facts: dict) -> str:
@@ -660,9 +685,26 @@ class GeorgeBot:
             if c.get("prereq_courses"):
                 lines.append(f"Prerequisite course codes: {', '.join(c['prereq_courses'])}")
             # Deeper (transitive) prereqs beyond the direct ones already listed.
+            #
+            # `prereq_chain` walks every prereq edge, and edges are emitted for each
+            # course leaf INCLUDING the ones inside "complete 1 of" groups — so this
+            # is a union of mutually exclusive alternatives, not a conjunction. The
+            # old label ("also requires (indirectly)") read as a checklist and the
+            # model relayed it as one: CSC 225 came out as needing MATH 100, 101,
+            # 102, 109, 110, 120 AND 151, where a student needs at most two of them.
             deeper = [x for x in c.get("prereq_chain", []) if x not in set(c.get("prereq_courses", []))]
             if deeper:
-                lines.append(f"Full prerequisite chain also requires (indirectly): {', '.join(deeper)}")
+                lines.append(
+                    f"Courses appearing further back in {c['code']}'s prerequisite "
+                    f"chain: {', '.join(deeper)}. "
+                    f"IMPORTANT: this is a flat union of every course reachable "
+                    f"through the chain, INCLUDING alternatives that satisfy the same "
+                    f"'complete 1 of' requirement (e.g. several different calculus "
+                    f"courses). A student needs only ONE course from each such group, "
+                    f"NOT all of these. Do not present this list as required "
+                    f"coursework, as a checklist, or as a sequence — the authoritative "
+                    f"requirements are the prerequisite text above."
+                )
             if c.get("non_course_requirements"):
                 nc = "; ".join(r.get("description", "") for r in c["non_course_requirements"])
                 lines.append(f"Other requirements: {nc}")
@@ -674,8 +716,26 @@ class GeorgeBot:
             if c.get("unlocks"):
                 lines.append(f"Courses that require {c['code']} as a prerequisite: {', '.join(c['unlocks'])}")
             if c.get("alternatives"):
-                lines.append(f"Alternative/equivalent courses — interchangeable with {c['code']} "
-                              f"wherever it's used as a prerequisite option: {', '.join(c['alternatives'])}")
+                # `get_alternatives` aggregates co-membership in ANY "1 of" group
+                # anywhere in the catalog, which is much weaker than equivalence —
+                # it routinely returns the course's own prerequisite or the next
+                # course in the sequence (CHEM101 -> CHEM102, ASTR101, GEOG103;
+                # MATH100 -> MATH101; CSC115 -> CSC110, CSC226). The old
+                # "interchangeable with" label asserted substitutability the data
+                # does not support, and being tagged source=kuali the model treated
+                # it as authoritative and passed it on.
+                lines.append(
+                    f"Courses that appear alongside {c['code']} in some "
+                    f"\"complete 1 of\" prerequisite group somewhere in the catalog: "
+                    f"{', '.join(c['alternatives'])}. "
+                    f"IMPORTANT: this is derived automatically from co-occurrence and "
+                    f"does NOT mean these are equivalent to {c['code']} or accepted in "
+                    f"its place — the list can include {c['code']}'s own prerequisite "
+                    f"or a later course in the same sequence. Never tell the student "
+                    f"one of these substitutes for {c['code']}; for substitution or "
+                    f"transfer-credit questions, refer them to the department or "
+                    f"academic advising."
+                )
             if c.get("required_by_programs"):
                 lines.append(f"Required by programs: {', '.join(c['required_by_programs'])}")
             if c.get("prereq_satisfied") is not None:
@@ -694,14 +754,55 @@ class GeorgeBot:
                 if ps.get("unknown_requirements"):
                     unk = "; ".join(u.get("description", "") for u in ps["unknown_requirements"])
                     lines.append(f"Non-course requirements (cannot verify from completed list): {unk}")
+            blocks.append("\n".join(lines))
+            # The outline is its own numbered block, not a trailer on the course
+            # block. `format_sources` has always emitted a separate `heat` source
+            # for it, so folding it into the course block here made the context's
+            # [n] sequence one short of the source list from that point on — every
+            # <<CITED_SOURCES>> number after an outline resolved to the wrong
+            # source. Numbering it here is what keeps the two sequences aligned
+            # (and lets the model cite the outline specifically).
             if c.get("outline"):
+                i += 1
                 o = c["outline"]
                 term = o.get("term", "unknown term")
-                lines.append(
-                    f"HISTORICAL course outline (term {term}, source=heat):\n"
+                blocks.append(
+                    f"[{i}] source=heat course={c['code']} term={term}\n"
+                    f"URL: {o.get('url') or c.get('url', 'n/a')}\n"
+                    f"HISTORICAL course outline for {c['code']} (term {term}) — a past-term "
+                    f"snapshot, not current. Name the term whenever you use it, and never "
+                    f"present its grading, instructor, or schedule as this term's:\n"
                     f"{o.get('text', '')[:4000]}"
                 )
-            blocks.append("\n".join(lines))
+
+        for nf in graph_facts.get("not_found", []):
+            i += 1
+            code = nf["code"]
+            suggestions = nf.get("suggestions") or []
+            if suggestions:
+                tail = (
+                    f"The catalog does list {', '.join(suggestions)} — at UVic this "
+                    f"course is split into lettered halves, so that is almost "
+                    f"certainly what the user means. Answer about those, and say "
+                    f"which ones you're using."
+                )
+            else:
+                tail = (
+                    "No similarly-named course exists either. Tell the user you "
+                    "couldn't find that course code and suggest they double-check it "
+                    "in the UVic Academic Calendar. Do NOT guess at other course "
+                    "codes they might have meant — a plausible-looking code you "
+                    "made up is worse than no suggestion."
+                )
+            blocks.append(
+                f"[{i}] source=kuali course_lookup=\"{code}\"\n"
+                f"NOT FOUND: \"{code}\" is not a course code in the UVic Academic "
+                f"Calendar. {tail} "
+                f"Do NOT state prerequisites, credits, descriptions, or any other "
+                f"catalog fact for \"{code}\" itself — there is no record to base "
+                f"them on, and inventing them is the specific failure this block "
+                f"exists to prevent."
+            )
 
         program = graph_facts.get("program")
         if program:
@@ -1158,6 +1259,20 @@ class GeorgeBot:
         "them from partial or messy data. Piecing together a plausible-sounding "
         "narrative from material that doesn't clearly state it is fabrication; "
         "state only what is explicit instead.\n"
+        "- ARITHMETIC: you may calculate only when EVERY input is either stated in "
+        "the material or given by the user. Never fill a missing input from your "
+        "own general knowledge and then present the result as a fact — the answer "
+        "inherits the invented number and looks sourced. This bites hardest on "
+        "cost: UVic charges tuition PER UNIT of course weight, and UVic uses a "
+        "UNIT system, not a US-style credit-hour system. Do not assume a course is "
+        "3 credits, do not assume a full-time load is 15 credits or 5 courses a "
+        "semester, and never multiply a per-unit rate by a course load you were "
+        "not given. If someone asks what tuition costs and no load is stated, give "
+        "the per-unit rate, say plainly that the total depends on how many units "
+        "they take (plus their program and ancillary fees), and point them to "
+        "UVic's tuition estimator — do NOT manufacture a 'typical term' or "
+        "'typical year' total. If the user does give you a load, you may compute "
+        "it, but show the arithmetic (units x rate) so they can check it.\n"
         "- Some material comes from PDF program-worksheets or curriculum grids "
         "(course-by-term tables) that lose their row/column structure and read "
         "as a flattened run-on list of course codes and terms. Treat these as "
@@ -1197,6 +1312,29 @@ class GeorgeBot:
         "historical grading weights, instructors, or schedules as current — for "
         "current course details, direct the user to Brightspace or the "
         "department.\n"
+        "- DATES: today's date is given to you below. Everything except "
+        "source=banner blocks is a static snapshot of UVic pages captured at an "
+        "unknown earlier time, so any date in it may already have passed. Before "
+        "you call something 'current', 'this term', 'upcoming', 'the next one', "
+        "or 'now', check it against today's date. If it has already passed, do "
+        "NOT present it as still ahead — give the fact together with the date it "
+        "applied to, and tell the user to confirm the current one. Keep the "
+        "specifics when you do that: '$25 as of August 2025 — worth confirming "
+        "the current amount' is far more useful than dropping the number and "
+        "saying only that a fee exists. Never manufacture precision you weren't "
+        "given, either ('mid-March' stays 'mid-March', it does not become 'March "
+        "15'). This covers event and info-session dates, application and "
+        "registration deadlines, published fees and rates, and terms of office or "
+        "appointments with an end date (an appointment whose stated end date is in "
+        "the past must not be described as who currently holds the role). For "
+        "something that recurs on the same rough schedule every year, you may "
+        "describe the usual pattern, but name the cycle you took it from instead "
+        "of implying it is this year's confirmed date. Flagging an elapsed date is "
+        "a CORRECTNESS requirement, not a caveat, a tip, or an optional extra — it "
+        "applies in full no matter how short the answer is supposed to be, and any "
+        "instruction below to be brief or to add nothing beyond what was asked "
+        "never licenses dropping it. Stating a passed date in the present tense is "
+        "simply a wrong answer.\n"
         "- When the material states 'Given completed courses [...]: prerequisites "
         "satisfied = ...' or 'outstanding requirements by group', that "
         "evaluation was computed programmatically from the courses the user said "
@@ -1264,9 +1402,10 @@ class GeorgeBot:
         "- This is about volume, not rigour. Everything the ACCURACY rules "
         "above require you to state — naming the term for live or historical "
         "data, section codes, attributing RateMyProfessors as student opinion "
-        "with its sample size, asking for clarification when a program search "
-        "was ambiguous — still applies in full. Those are part of the answer, "
-        "not extras.\n\n"
+        "with its sample size, flagging that a date you found has already "
+        "passed and naming the cycle it came from, asking for clarification "
+        "when a program search was ambiguous — still applies in full. Those "
+        "are part of the answer, not extras.\n\n"
     )
 
     SYSTEM_PROMPT = _ANSWER_RULES_HEAD + _DEFAULT_STYLE + _CITED_SOURCES_RULES
@@ -1329,6 +1468,22 @@ class GeorgeBot:
         contract while reusing the same reference-material framing below."""
         base = base_prompt if base_prompt is not None else self.SYSTEM_PROMPT
         context = (context or "").strip()
+        # Today's date, for the DATES rule in `_ANSWER_RULES_HEAD`. It has to be
+        # injected here rather than written into the prompt constants because
+        # those are class-level and would freeze at import time — a long-running
+        # container would then answer with the date it booted on.
+        #
+        # Deliberately OUTSIDE the reference-material delimiters: everything
+        # inside them is framed as "gathered automatically, may be irrelevant,
+        # ignore what doesn't help", which is exactly the wrong framing for the
+        # one fact the model must never ignore.
+        #
+        # The router prompt has had today's date for a while; the answer step did
+        # not, so it had no "now" to measure a retrieved date against and read
+        # every date it found as still upcoming — an acting appointment whose
+        # stated term ended in June was reported as who currently holds the role,
+        # and January info sessions were described as "their next ones".
+        today = f"\n\nTODAY'S DATE: {time.strftime('%Y-%m-%d')}"
         if context:
             ref = (
                 "\n\n=== BEGIN SYSTEM-SUPPLIED REFERENCE MATERIAL ===\n"
@@ -1346,7 +1501,7 @@ class GeorgeBot:
                 "knowledge as a knowledgeable UVic assistant.\n"
                 "=== END SYSTEM-SUPPLIED REFERENCE MATERIAL ==="
             )
-        return base + ref
+        return base + today + ref
 
     def _answer_messages(self, question: str, history: list[dict]) -> list[dict]:
         """Conversation turns + the user's question only — the reference
@@ -1544,7 +1699,19 @@ class GeorgeBot:
                        rmp_facts: dict | None = None) -> list[dict]:
         """Deduplicate retrieved chunks + graph facts + live Banner facts + RMP
         ratings into a clean source list. Order matches the context numbering:
-        graph, then banner, then rmp, then vector chunks."""
+        graph, then banner, then rmp, then vector chunks.
+
+        `n` is the block's index in the assembled context, NOT its position in this
+        list: every numbered block advances `n`, but only *citable* blocks add an
+        entry — a not-found note, a program-ambiguity note, and an unmatched-name
+        note are instructions to the model, not pages a user can open.
+
+        This walk must stay in lockstep with `_graph_context_text` /
+        `_banner_context_text` / `_rmp_context_text` / `_build_context`, which assign
+        the numbers. `_filter_cited_sources` resolves the model's <<CITED_SOURCES>>
+        numbers against `n`, so any drift here silently attaches the wrong sources
+        to an answer (this function used to skip the numbers for those non-citable
+        blocks, which shifted every later source by one)."""
         seen: set[str] = set()
         sources = []
         n = 0
@@ -1554,18 +1721,17 @@ class GeorgeBot:
                 n += 1
                 url = c.get("url", "")
                 key = url or f"course:{c['code']}"
-                if key in seen:
-                    continue
-                seen.add(key)
-                sources.append({
-                    "n": n,
-                    "url": url,
-                    "source": "kuali",
-                    "title": f"{c['code']} — {c.get('title', '')}",
-                    "course_code": c["code"],
-                    "term": None,
-                    "historical": False,
-                })
+                if key not in seen:
+                    seen.add(key)
+                    sources.append({
+                        "n": n,
+                        "url": url,
+                        "source": "kuali",
+                        "title": f"{c['code']} — {c.get('title', '')}",
+                        "course_code": c["code"],
+                        "term": None,
+                        "historical": False,
+                    })
                 if c.get("outline"):
                     n += 1
                     o = c["outline"]
@@ -1578,49 +1744,69 @@ class GeorgeBot:
                         "term": o.get("term"),
                         "historical": True,
                     })
+            for _nf in graph_facts.get("not_found", []):
+                n += 1          # numbered in the context; nothing to link to
             program = graph_facts.get("program")
-            if program and program.get("program"):
-                n += 1
-                p = program["program"]
-                url = p.get("url", "")
-                key = url or f"program:{p.get('code')}"
-                if key not in seen:
-                    seen.add(key)
-                    sources.append({
-                        "n": n,
-                        "url": url,
-                        "source": "kuali",
-                        "title": p.get("title", ""),
-                        "course_code": None,
-                        "term": None,
-                        "historical": False,
-                    })
+            if program:
+                n += 1          # numbered even when ambiguous / no match
+                if program.get("program"):
+                    p = program["program"]
+                    url = p.get("url", "")
+                    key = url or f"program:{p.get('code')}"
+                    if key not in seen:
+                        seen.add(key)
+                        sources.append({
+                            "n": n,
+                            "url": url,
+                            "source": "kuali",
+                            "title": p.get("title", ""),
+                            "course_code": None,
+                            "term": None,
+                            "historical": False,
+                        })
 
         if banner_facts:
             term_label = banner_facts.get("term_label", "")
-            instr = banner_facts.get("instructor")  # set only on the instructor path
-            for course in banner_facts.get("courses", []):
+            # Banner's class-search UI (no stable per-course deep link); the data
+            # itself is served inline, this is just a "look it up" pointer.
+            banner_url = "https://banner.uvic.ca/StudentRegistrationSsb/ssb/classSearch/classSearch"
+            if banner_facts.get("kind") == "instructor":
+                # The instructor shape is ONE block covering every course found (or
+                # an ambiguity/no-match note) — not one per course.
                 n += 1
-                code = course["code"]
-                sources.append({
-                    "n": n,
-                    # Banner's class-search UI (no stable per-course deep link); the
-                    # data itself is served inline, this is just a "look it up" pointer.
-                    "url": "https://banner.uvic.ca/StudentRegistrationSsb/ssb/classSearch/classSearch",
-                    "source": "banner",
-                    "title": f"{code} — {'taught by ' + instr if instr else 'live availability'}",
-                    "course_code": code,
-                    "term": term_label or None,
-                    "historical": False,
-                })
+                instr = banner_facts.get("instructor")
+                if instr and banner_facts.get("courses"):
+                    sources.append({
+                        "n": n,
+                        "url": banner_url,
+                        "source": "banner",
+                        "title": f"Courses taught by {instr}",
+                        "course_code": None,
+                        "term": term_label or None,
+                        "historical": False,
+                    })
+            else:
+                for course in banner_facts.get("courses", []):
+                    n += 1
+                    code = course["code"]
+                    sources.append({
+                        "n": n,
+                        "url": banner_url,
+                        "source": "banner",
+                        "title": f"{code} — live availability",
+                        "course_code": code,
+                        "term": term_label or None,
+                        "historical": False,
+                    })
 
         if rmp_facts:
             for p in rmp_facts.get("professors", []):
+                n += 1
                 # Only matched professors get a clickable source; ambiguous/no-match
-                # blocks are prompts to the model, not citable pages.
+                # blocks are prompts to the model, not citable pages — but they still
+                # occupy a number in the context.
                 if not p.get("matched"):
                     continue
-                n += 1
                 legacy = p.get("legacy_id")
                 url = f"https://www.ratemyprofessors.com/professor/{legacy}" if legacy else ""
                 sources.append({
@@ -1753,7 +1939,18 @@ class GeorgeBot:
 
     @staticmethod
     def _n_graph_blocks(graph_facts: dict) -> int:
-        return len(graph_facts.get("courses", [])) + (1 if graph_facts.get("program") else 0)
+        """How many numbered blocks `_graph_context_text` emits — the offset the
+        banner/rmp renderers continue from. Must stay in lockstep with BOTH
+        `_graph_context_text` (which assigns the numbers) and `format_sources`
+        (which the cited numbers are resolved against); an outline, a not-found
+        course, and a program block each take a number."""
+        courses = graph_facts.get("courses", [])
+        return (
+            len(courses)
+            + sum(1 for c in courses if c.get("outline"))
+            + len(graph_facts.get("not_found", []))
+            + (1 if graph_facts.get("program") else 0)
+        )
 
     def _assemble_context(self, chunks: list[dict], graph_facts: dict,
                           banner_facts: dict, rmp_facts: dict | None = None) -> tuple[str, int]:

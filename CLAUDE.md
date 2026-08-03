@@ -487,7 +487,46 @@ Only runs when `course_codes` or `program_query` is non-empty.
   `get_unlocks()`, `get_alternatives()`, `programs_requiring()`,
   `prereq_chain()` (full transitive prereq closure; rendered as the *deeper*
   deps beyond the direct prereqs), and — if `wants_outline` — `get_outline()`
-  (truncated to 4000 chars, tagged HISTORICAL with its term).
+  (truncated to 4000 chars, tagged HISTORICAL with its term, and numbered as
+  its **own** `[n]` block, not folded into the course block — see the numbering
+  contract in §4).
+- ⚠️ **Two of those accessors return UNIONS, not requirement sets, and their
+  block labels must keep saying so (fixed 2026-08-04).** Both were previously
+  labelled as if they were authoritative, and since the block is tagged
+  `source=kuali` — which `SYSTEM_PROMPT` calls the authoritative catalog — the
+  answer model repeated them verbatim. Measured, not theorized:
+  - `prereq_chain()` walks every prereq edge including the leaves *inside*
+    `complete 1 of` groups, so it's a union of mutually exclusive alternatives.
+    Labelled "Full prerequisite chain also requires (indirectly)", CSC 225 came
+    out as requiring MATH 100, 101, 102, 109, 110, 120 **and** 151 — seven
+    calculus courses where a student needs at most two. The label now states
+    explicitly that it's a union including alternatives and must not be
+    presented as required coursework or as a sequence.
+  - `get_alternatives()` aggregates co-membership in *any* `1 of` group anywhere
+    in the catalog, which is far weaker than equivalence: CHEM 101 → ASTR 101,
+    GEOG 103, and **CHEM 102** (the next course); MATH 100 → **MATH 101**;
+    CSC 115 → **CSC 110** (its own prereq) and **CSC 226**. Labelled
+    "interchangeable with X wherever it's used as a prerequisite option", the
+    model told students ASTR 101 substitutes for CHEM 101. The label now says
+    it's co-occurrence only, explicitly warns it can contain the course's own
+    prereq or a later course, and forbids claiming substitutability.
+  Don't "tidy" either label back into a short phrase — the verbosity *is* the
+  fix, and the short version is what produced the wrong answers.
+- **A course code that isn't in the graph now emits a NOT FOUND block**
+  (`graph_retrieve` returns `not_found: [{code, suggestions}]`). It used to be
+  dropped silently, leaving the model with no idea a lookup had happened —
+  so it answered from its own knowledge and stated invented catalog facts
+  confidently ("PSYC 100" produced a fabricated prereq relationship between
+  PSYC 100A and 100B). This matters far more than it sounds: **~225 course
+  bases across 59 subjects exist ONLY as lettered variants** (PSYC 100, SOCI
+  100, GEOG 101, LING 100, SPAN 100, BIOL 150/190, ATWP 100, most HSTR and MUS
+  courses) and students type the base form. `_course_suggestions()` finds those
+  variants (`PSYC100` → `PSYC100A`, `PSYC100B`) and the block tells the model to
+  answer about them. With no near-miss it says so and — deliberately —
+  forbids guessing at other codes the user might have meant, because the model
+  otherwise invents plausible-looking ones (observed on `ENGL 135`, which is
+  really a *rename* to ATWP 135; a rename/alias map would be a taxonomy concern
+  and belongs in the pipeline repo).
 - **Program query:** `_program_facts()` calls `search_programs()` (fuzzy,
   token-based, can return multiple candidates). `search_programs()` normalizes
   punctuation to spaces on both the query and the candidate "title code
@@ -539,8 +578,24 @@ gate would never open. See `BANNER_API.md` for the endpoint research.
   from `banner.uvic.ca` registration self-service (no auth for class search).
   Banner owns **only** live seats/waitlist, section schedule/room, instructor,
   delivery/campus — prereqs/credits/program requirements stay with the graph.
+- ⚠️ **Term default is date-aware — do NOT revert it to "earliest registerable"
+  (fixed 2026-08-04).** `resolve_term()` used to return the numerically smallest
+  non-"View Only" code, on the assumption that non-View-Only == {current +
+  upcoming}. It isn't: UVic leaves a term registerable well past its add
+  deadline, so on 2026-08-04 the default resolved to **Summer 2026 (202605)** —
+  a term ending that month — when every asker meant Fall. Two costs, both
+  measured: seat/schedule answers described the wrong term, and because a
+  summer term carries a fraction of the catalog, most courses returned `{}`
+  and the turn degraded into a punt that burned both `MAX_VERIFY_ROUNDS`
+  NEED_MORE rounds (19–25s) and leaked "I don't have current registration
+  data". `_default_term()` now skips any term that started more than
+  `TERM_ADD_GRACE_DAYS` (30) ago when a later registerable term exists, falling
+  back to the old behaviour if all are stale — so it can only change *which*
+  term is picked, never whether one is. A router-named term still wins outright.
+  Verified across the year: May 5→Summer, Jun 20→Fall, Aug 4→Fall, Sep 15→Fall,
+  Oct 20→Spring, Jan 10→Spring, Apr 25→Summer.
 - **`banner_retrieve(course_codes, season, year)`** (course availability) resolves
-  the term (default: nearest current/upcoming non-"View Only" term; router-named term
+  the term (default: `_default_term`, see the ⚠️ above; router-named term
   via `term_season`/`term_year` wins — today's date is injected into the router
   prompt so "next spring" resolves), then per course: `searchResults` (all
   sections) + one `getFacultyMeetingTimes` per CRN, **fanned out over a thread pool**
@@ -562,6 +617,23 @@ gate would never open. See `BANNER_API.md` for the endpoint research.
   next query and races under concurrency. The `_lock` only guards the TTL cache dicts.
   120s TTL on section payloads (seat counts must stay honest), hours-long TTL on the
   term list and per-section instructor. See `BANNER_API.md` "Request flow"/"Caching".
+- **Outbound concurrency: one request must not be able to starve the others
+  (tuned 2026-08-04, alongside the term-default fix).** Three knobs interact:
+  `MAX_OUTBOUND_CONCURRENCY` (8, global in-flight cap — this is the number that
+  protects banner.uvic.ca), `MAX_COURSE_FANOUT` (half that, the per-course
+  faculty fan-out), and `_SEM_ACQUIRE_TIMEOUT` (8s, how long a waiter queues).
+  The fan-out used to equal the global cap and the timeout was 2s, which was
+  survivable only while the term default landed on Summer — a handful of
+  sections per course. Once the default became a real teaching term (CSC 110
+  Fall 2026: **43** sections, MATH 100: 25), a single availability lookup took
+  every global slot and concurrent Banner requests timed out into `{}`, i.e.
+  into exactly the punting/leaking answer the term fix was meant to remove.
+  Measured: 3 concurrent cold lookups went 2-of-3 starved → 3-of-3 served.
+  Note the timeout bounds **queueing, not load** — peak concurrency is the
+  semaphore either way, so giving up early buys UVic nothing and costs a wrong
+  answer. Don't lower it back "to be polite"; lower `MAX_OUTBOUND_CONCURRENCY`
+  if real politeness is needed. Cold-cache cost is paid once per section per
+  `FACULTY_TTL` (6h).
 - `_banner_context_text()` (in `chatbot.py`) renders this into numbered `[n]`
   blocks tagged `source=banner`, inserted **graph → banner → rmp → vector** so all
   share one continuous `[n]` sequence. `_assemble_context()` owns that ordering
@@ -679,6 +751,26 @@ after new corpus content lands.
   streaming endpoint this means the `sources` SSE event now fires *after*
   all `token` events (previously before) — harmless, since the frontend
   already buffers sources until the answer finishes revealing regardless.
+- ⚠️ **THE BLOCK-NUMBERING CONTRACT (fixed 2026-08-04) — read before touching
+  any renderer.** `_filter_cited_sources` resolves the model's `[n]` against
+  `format_sources()`'s `n`, so **`n` is the block's index in the assembled
+  context, not its position in the source list.** Four functions assign or
+  consume those numbers and must walk the *same* sequence:
+  `_graph_context_text` → `_banner_context_text` → `_rmp_context_text` →
+  `_build_context` (assigning), `_n_graph_blocks` (the offset banner/rmp
+  continue from), and `format_sources` (what the numbers resolve to). They had
+  drifted in four places, each silently attaching the **wrong** sources to an
+  answer: a course outline was numbered by `format_sources` but folded into the
+  course block in the context (verified: every citation after an outline was off
+  by one); and an ambiguous/no-match *program*, an unmatched *RMP* name, and the
+  one-block *Banner instructor* shape each took a context number that
+  `format_sources` skipped. The rule now: **every numbered block advances `n`;
+  only citable blocks append a source entry.** A not-found course, an ambiguity
+  note, and a no-match note are instructions to the model, not pages — they
+  consume a number and contribute nothing. `scratchpad/test_numbering.py`-style
+  coverage (16 fact shapes, asserting context numbering is contiguous, source
+  `n`s are a strictly-increasing subset of it, and each vector chunk resolves to
+  its own source) is the cheapest way to re-verify after any renderer change.
 
 ### Tunable constants (top of `chatbot.py`)
 
@@ -743,6 +835,90 @@ not in the answer text.
   from its own knowledge — never announcing missing/insufficient context.
   Runs on `thinking: "disabled"`, so the prompt carries this behavior itself
   (see "what NOT to over-fix" #1).
+- **Today's date reaches the ANSWER step, not just the router (2026-08-04).**
+  `_system_prompt_with_context` injects a `TODAY'S DATE: YYYY-MM-DD` line, and
+  `_ANSWER_RULES_HEAD` has a **DATES** bullet that keys off it. Two placement
+  decisions are load-bearing:
+  - It's computed **per call**, not baked into the prompt class constants —
+    those are class-level and would freeze at import time, so a long-running
+    container would answer with the date it booted on.
+  - It sits **outside** the `=== BEGIN SYSTEM-SUPPLIED REFERENCE MATERIAL ===`
+    delimiters. Everything inside them is framed as "gathered automatically, may
+    be irrelevant, ignore what doesn't help" — precisely the wrong framing for
+    the one fact the model must never ignore.
+
+  The corpus is a static snapshot, so without a "now" the answer step read every
+  date it found as still upcoming: an acting appointment whose stated term ended
+  June 30 2026 was reported as who *currently* holds the role, and January 2026
+  info sessions were described as "their next ones". The rule now requires
+  checking any date against today before saying "current"/"upcoming"/"next",
+  and covers events, deadlines, published fees/rates, and terms of office.
+  Two guards in it exist because the first draft caused each failure in testing:
+  it must **keep the figure with its as-of date** rather than dropping it
+  (the ONECard fee went from "$25 (as of Aug 15 2025)" to a contentless "there's
+  a replacement fee"), and it must **not manufacture precision** ("mid-March"
+  became "March 15, 2027"). `_QUICK_STYLE`'s exemption bullet lists the date
+  qualification too, so quick mode can't shed it as "extra".
+  Verified: legitimately-future dates are NOT over-hedged — reading break, fall
+  start, drop deadlines and residence rates all keep full detail, and some
+  answers improved ("today is August 4, so your next tuition deadline is
+  September 30, 2026").
+  ⚠️ **This holds in DEFAULT mode only. Quick mode does not reliably apply it —
+  known and accepted, don't assume otherwise.** Asked who the current president
+  is, quick mode answers in the present tense about an appointment that ended
+  June 30 2026: 4/4 failures, still 3/3 after adding a "this is a CORRECTNESS
+  requirement, not a caveat" clause to the shared head, and still 4/4 after
+  additionally restating the rule as the last bullet of `_QUICK_STYLE` for
+  recency (that restatement was reverted — it bought nothing and was dead
+  prompt weight). The plausible mechanism is that default mode's
+  `VERIFY_ANSWER_ADDENDUM` forces an explicit sufficiency assessment before
+  answering, and that deliberation is what surfaces the date check; quick mode
+  is one flat generation under a "answer exactly what was asked and nothing
+  else" instruction that sits *later* in the prompt than the DATES rule.
+  Default is what the frontend ships (`App.tsx` defaults `thinkingMode` to
+  `'default'`), so the shipped path is covered; quick mode is opt-in, plus
+  `ask()` and the `--ask` CLI. If this is ever worth closing, the lead is
+  giving quick mode a cheap pre-answer check rather than more prompt text —
+  more prompt text has now been measured not to work.
+- **ARITHMETIC rule — the model was inventing an input, not miscalculating
+  (2026-08-04).** Asked "how much is tuition at UVic", the answer step correctly
+  sourced `$436.21 per credit unit` and then added, unsourced, "most full-time
+  students take **15 units per term** (5 courses), which works out to roughly
+  **$6,540 per term**" — about **double** the real per-term cost, rendered with
+  `cited=[1,2,3]` so it looked sourced. High-traffic question for an ad-driven
+  audience, and silent.
+  - **Root cause is a wrong-country prior, and the model's own numbers prove
+    it.** "5 courses = 15 units" is only coherent if a course is 3 units — the
+    US credit-hour convention. UVic courses are 1.5 units, so 5 courses is 7.5
+    units/term; **15 units is the UVic *year* figure, not the term figure.**
+    Corroborated independently: UVic's own viewbook sample first-year tuition
+    is ~$6,414, i.e. what the model quoted as one term is really two.
+  - **Diagnosed before fixing, and the diagnosis changed the fix.** The
+    course-load fact IS in the corpus and is highly retrievable (d≈0.45 for
+    "what is a full-time course load at UVic"; 11 chunks carry it, including the
+    calendar's part-time/full-time definition) — it just isn't what a *tuition*
+    query retrieves (that pulls fee tables and admissions pages, none of which
+    state a load). So this is **not** a `georgebot-pipeline` corpus gap, and
+    equally it is **not** fixed by retrieving the load: a single headline
+    "typical term" total is misleading regardless, since it varies by program
+    and excludes ancillary fees. The right behaviour is to not invent the input
+    and not produce the total.
+  - The rule therefore constrains **inputs, not arithmetic** — a blunt "never
+    compute totals" would break the genuinely good case ("how much does one
+    course cost" → 1.5 × $436.21, which now works and cites its source). It
+    permits calculation when every input is stated or user-supplied, names the
+    specific bad prior (unit system, not credit-hours; never assume 3-credit
+    courses or a 15-credit semester), and otherwise requires the per-unit rate
+    plus a pointer to UVic's tuition estimator.
+  - Verified 3/3 on the failing query (fabricated total gone, one run even
+    deriving the correct "5 courses × 1.5 = 7.5 units"), with the compute-when-
+    given-a-load cases preserved. Where a genuinely sourced total exists the
+    model still uses it *with* its stated assumptions — which is the intent, so
+    don't "fix" a cited multi-term figure that names its own basis.
+  - Unlike the graph-label fixes, **no line of our code was asserting anything
+    false here** — the fee table, retrieval, and labels were all correct. That
+    makes this a prompt-confidence fix, not a deterministic one; treat future
+    regressions as "re-measure across several runs", not "the rule is gone".
 - **Anti-fabrication rule for garbled table data (real incident, root-caused).**
   A user reported the bot confidently claiming "CSC 116 is no longer offered"
   plus a fabricated course-sequencing narrative, and — worse — when asked to
@@ -981,9 +1157,20 @@ layer a live request touches is exercised: router LLM call, Voyage embedding,
   Light-mode page background is white with slightly-darker (`--muted`) chat
   bubbles; dark-mode background is a dark grey (`oklch(0.19)`), a step below
   the card/bubble surfaces so they stay layered.
-- **Branding**: browser tab uses `frontend/public/favicon.svg` (a violet-
-  gradient "G" mark) + `<title>GeorgeBot</title>`; the assistant message
-  avatar (`MessageBubble.tsx`) and header both render a "G".
+- **Branding**: browser tab uses `frontend/public/favicon.svg` (a black
+  rounded square with a white stroked "G") + `<title>GeorgeBot</title>`; the
+  assistant message avatar (`MessageBubble.tsx`) and header both render a "G".
+- **Palette: deliberately achromatic.** Every token in `index.css`'s `:root`
+  and `.dark` is `oklch(L 0 0)` — chroma 0, pure greyscale — and `--primary`
+  inverts between themes (near-black `0.205` in light, near-white `0.922` in
+  dark), which is what flips the user bubbles and the "G" avatar. The only
+  chromatic tokens are `--destructive` (red) and, in dark only, an unused
+  `--sidebar-primary` (violet, a leftover shadcn default — there is no
+  sidebar). `--chart-1..5` is a greyscale ramp and is also unused. The one
+  place real color appears in the UI is `SourceBadge.tsx`: six Tailwind
+  palette pairs (`100/800` light, `900/200` dark) — blue `uvic.ca`, amber
+  `HEAT`, green `Catalog`, teal `Document`, rose `Live` (banner), orange
+  `Rating` (rmp). No `.tsx` file contains a hex value or a gradient.
 
 ### Vector chunk metadata schema (what you can filter / rank / display on)
 Every Chroma entry (one per question) carries, in `metadata`:
