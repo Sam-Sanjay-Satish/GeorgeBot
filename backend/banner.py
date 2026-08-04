@@ -234,7 +234,16 @@ def _default_term(registerable: list[str]) -> str | None:
     return registerable[0] if registerable else None
 
 
-def resolve_term(season: str | None = None, year: int | None = None) -> str | None:
+def requested_term_code(season: str | None = None, year: int | None = None) -> str | None:
+    """The YYYYMM a season+year hint literally asks for, listed or not, registerable
+    or not. Lets a caller see what `resolve_term` declined to use (see
+    `banner_retrieve`'s substitution note)."""
+    mm = _SEASON_MM.get((season or "").strip().lower()) if season else None
+    return f"{year}{mm}" if mm and year else None
+
+
+def resolve_term(season: str | None = None, year: int | None = None,
+                 require_registerable: bool = True) -> str | None:
     """Resolve a Banner term code from an optional season/year hint.
 
     - No hint          -> `_default_term` (see there): the earliest registerable
@@ -243,8 +252,19 @@ def resolve_term(season: str | None = None, year: int | None = None) -> str | No
     - season (+ year)  -> build YYYYMM from the hint and confirm it exists in the term
                           list; season-only picks the nearest registerable term of that
                           season.
-    A user-named term always wins — this default only applies when the router
-    extracted no term at all.
+    A user-named term wins over the default — but only if it's a term Banner will
+    still serve live data for; see `require_registerable`.
+
+    `require_registerable` (default True) refuses to resolve onto a "(View Only)"
+    past term and falls back to the date-aware default instead. This branch used to
+    accept ANY listed code, including View Only ones, while the season-only branch
+    above already preferred registerable terms — so the *more specific* hint got the
+    *weaker* guard. That was reachable in production: the router occasionally invents
+    a term for a question that named none ("are there seats in csc 320?" was rewritten
+    to "...winter 2026"), which resolved to 202601 (Jan-Apr 2026, View Only) and
+    returned frozen seat counts for a term that had already ended. Seat counts for a
+    View Only term are meaningless, so this is strictly worse than no Banner data.
+    Pass False only to ask what a hint literally names, without the liveness guard.
 
     Returns None only if Banner returned no terms at all.
     """
@@ -253,24 +273,28 @@ def resolve_term(season: str | None = None, year: int | None = None) -> str | No
         return None
     registerable = sorted((t["code"] for t in terms if _is_registerable(t)))
     all_codes = {t["code"] for t in terms}
+    usable = set(registerable) if require_registerable else all_codes
 
     season = (season or "").strip().lower() or None
     mm = _SEASON_MM.get(season) if season else None
 
     if mm and year:
         code = f"{year}{mm}"
-        if code in all_codes:
+        if code in usable:
             return code
-        # Named a term Banner doesn't list — fall through to the default.
+        # Named a term Banner doesn't list, or a dead one — fall through.
     elif mm:
-        # Season only: nearest registerable term of that season (else any listed one).
+        # Season only: nearest registerable term of that season. The fallback to any
+        # listed code applies only when the liveness guard is off — otherwise it would
+        # reintroduce the same dead-term hole through the other branch.
         matches = [c for c in registerable if c.endswith(mm)]
-        if not matches:
+        if not matches and not require_registerable:
             matches = sorted(c for c in all_codes if c.endswith(mm))
         if matches:
             return matches[0]
 
-    return _default_term(registerable) or (sorted(all_codes)[0] if all_codes else None)
+    fallback = sorted(all_codes)[0] if (all_codes and not require_registerable) else None
+    return _default_term(registerable) or fallback
 
 
 # ---------------------------------------------------------------------------
@@ -511,8 +535,16 @@ def banner_retrieve(course_codes: list[str], season: str | None = None,
                 courses.append({"code": code, "sections": sections})
         if not courses:
             return {}
-        return {"kind": "availability", "term": term, "term_label": term_label(term),
-                "courses": courses}
+        result = {"kind": "availability", "term": term, "term_label": term_label(term),
+                  "courses": courses}
+        # If a season/year hint pointed at a term we refused to use (a past
+        # "View Only" one), say so rather than silently answering about a
+        # different term than was named — the block renderer turns this into an
+        # explicit note for the answer model.
+        asked = requested_term_code(season, year)
+        if asked and asked != term:
+            result["requested_term_label"] = term_label(asked)
+        return result
     except Exception as e:  # noqa: BLE001 — best-effort, never break the answer
         import sys
         print(f"  [banner_retrieve] failed, skipping live availability: {e}",

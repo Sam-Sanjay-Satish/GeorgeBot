@@ -79,6 +79,26 @@ not N per corpus). Both collections share the embedding space (`voyage-4-large`,
 1024-d), which is what makes cross-collection distance-merge valid. The
 course/program graph is shared, so audience does not affect graph facts.
 
+**No graduate coverage — and the answer prompt now says so (2026-08-04).**
+There are exactly two collections; nothing in the corpus covers graduate program
+requirements, graduate admissions, funding/awards, supervision, candidacy, or
+thesis regulations. The risk this creates is not "we can't answer" — it's that a
+grad question retrieves *undergraduate* regulations and the model serves them as
+if they applied, which is a wrong answer rather than a partial one (a master's
+student asking a drop deadline would have gotten the undergrad Oct 31 date).
+`_ANSWER_RULES_HEAD` therefore opens with a **WHO YOU CURRENTLY SERVE** section
+stating the two audiences, forbidding transfer of any undergraduate regulation,
+deadline, fee, GPA/standing rule, or program requirement to a graduate student,
+and routing grad questions to the Faculty of Graduate Studies / supervisor.
+Two deliberate framings: it's phrased as a current gap ("not supported yet"),
+not a refusal; and it explicitly tells the model **not** to over-correct on
+audience-independent questions (library, parking, transit, counselling, IT,
+recreation) — a grad student asking where the gym is should just get an answer
+with no mention of the limitation. Verified 5/5 grad questions flag the gap,
+2/2 neutral ones stay silent about it, undergrad answers unchanged.
+If a graduate collection is ever added, this section is the first thing to
+update — leaving it in place would then make the bot refuse content it has.
+
 Everything lives in **one engine class**, `GeorgeBot`, in `backend/chatbot.py`.
 `backend/api.py` is a thin FastAPI wrapper around it (also used by the CLI
 `--ask` smoke test). Tuning `chatbot.py` tunes everything.
@@ -556,6 +576,63 @@ Only runs when `course_codes` or `program_query` is non-empty.
   `get_program()` + `program_requirement_groups()` + `program_specializations()`
   + `program_courses()` (flat list of every course the program references,
   capped at 60 in the rendered block).
+- ⚠️ **A zero-match program search is a NAME miss, not proof of non-existence —
+  and both the retry and the block wording exist because it was treated as proof
+  (fixed 2026-08-04).** Reported from production: "geog and environmental studies
+  general degree" was answered with *"There isn't a 'Geography and Environmental
+  Studies' combined degree at UVic"*, plus fabricated corroboration (*"UVic
+  doesn't list one in the combined-major materials"* — nothing in context said
+  that) and a leak of retrieval internals (*"A search of the academic calendar…
+  came back with no match"*). Both General programs the student meant were
+  sitting in the graph with full requirement trees: `MNR-GEGA`/`MNR-GEGS`
+  (Geography BA/BSc, "General and Minor") and `MNR-ES` (Environmental Studies,
+  "General and Minor"). Two independent causes, both fixed:
+  - **`search_programs` is an all-tokens-AND matcher over a *single* program
+    node**, so it under-matches in two ordinary cases. (a) A generic word no
+    title contains kills the whole query: only 7 of 280 programs have a word
+    starting with "degree" (the Law joint/double degrees, the post-degree BEds),
+    so `"geography general degree"` → 0 while `"geography general"` → the 2
+    correct programs. (b) A query naming **two** programs can never match one
+    node — `geography` hits 9 programs, `environmental` hits 2, intersection 0 —
+    and a UVic General degree *is* two areas, listed as one program per subject.
+    `_program_facts` now retries via `_relaxed_program_queries()`: strip
+    `_PROGRAM_FILLER` (query-side only; none of those words discriminates), then
+    split on the `and`/`&`/`,`/`+`/`/` conjunction and copy any trailing
+    `_PROGRAM_QUALIFIERS` word ("general", "major", "honours"…) onto whichever
+    part lacks one, so "…general" applies to both subjects. Only reached **after**
+    the strict search fails, which is why the split can't damage a real title
+    containing "and" (`"Physical Geography and Earth and Ocean Sciences"` matches
+    strictly and never gets there — verified). The relaxation lives in
+    `chatbot.py`, deliberately **not** in `graph_queries.py`: that file is a copy
+    of the pipeline's and already carries 4 local patches, and `search_programs`'
+    strict AND semantics are still what the auto-select ranking depends on.
+  - **The no-match block was a bare authoritative negative.** It rendered as
+    `"No matching program found in the calendar."` tagged `source=kuali` — which
+    `_ANSWER_RULES_HEAD` calls the authoritative catalog — so the model treated it
+    as a fact and denied the degree existed. Same class as the `prereq_chain` /
+    `get_alternatives` / `openSection` bugs: **our code asserted something the
+    data did not mean.** `_program_block` now states that the lookup matches
+    program *names* only, that an empty result is not evidence of non-existence,
+    forbids saying a program/degree/combination isn't offered, forbids describing
+    the lookup, notes that a two-subject degree is listed as two programs, and
+    asks for the exact calendar name. A matching bullet in `_ANSWER_RULES_HEAD`
+    (next to the multiple-candidates one) generalizes it beyond this block.
+    **Don't shorten either back to a phrase** — the verbosity is the fix, exactly
+    as with the graph-label labels above.
+  - Note the *course* path already had this guard (the NOT FOUND block with
+    near-miss suggestions); only the program path was missing it. Verified live:
+    the reported query now returns both General programs and asks BA-vs-BSc; a
+    genuine no-match ("underwater basketweaving") hedges correctly instead of
+    denying; auto-pick, ambiguity, and the course path are unchanged.
+- ⚠️ **Relaxed matching can emit MORE THAN ONE program block.** A relaxed
+  multi-subject result carries `parts: [<single-program result>, …]` and renders
+  one numbered block per entry — so the program contribution to the block count
+  is no longer a hard-coded `1`. All three walkers of the numbering contract
+  (§4) derive it from the single helper **`_n_program_blocks()`**:
+  `_graph_context_text` / `_n_graph_blocks` / `format_sources`. Ambiguity and
+  no-match parts still take a number and contribute no source. If you add
+  another program shape, change that helper — don't re-count inline in three
+  places, which is precisely how the numbering drifted before.
 - These accessors run as a deterministic **bulk fetch** — the router names a
   course/program, the code pulls the full fact set; the LLM does not pick
   accessors. Two `GraphStore` methods remain intentionally unused:
@@ -594,6 +671,34 @@ gate would never open. See `BANNER_API.md` for the endpoint research.
   term is picked, never whether one is. A router-named term still wins outright.
   Verified across the year: May 5→Summer, Jun 20→Fall, Aug 4→Fall, Sep 15→Fall,
   Oct 20→Spring, Jan 10→Spring, Apr 25→Summer.
+- ⚠️ **A router-named term must still be a LIVE term (fixed 2026-08-04).** The
+  season+year branch of `resolve_term` used to accept any code present in the
+  term list — **including "(View Only)" past terms** — while the season-only
+  branch already preferred registerable ones, so the *more specific* hint carried
+  the *weaker* guard. Reached in production: the router intermittently invents a
+  term for a question that named none ("are there seats in csc 320?" was
+  rewritten to "…winter 2026"), which resolved to **202601 (Jan–Apr 2026, View
+  Only)** and returned frozen seat counts for a term that had already ended —
+  bypassing `_default_term` entirely, since a named term wins by design.
+  `resolve_term(..., require_registerable=True)` (the default) now refuses a dead
+  term and falls back to the date-aware default; pass `False` to ask what a hint
+  literally names. `requested_term_code()` lets the caller see what was declined,
+  and `banner_retrieve` sets **`requested_term_label`** so `_banner_context_text`
+  emits an explicit note — otherwise we would silently answer about a different
+  term than the user named, which is a new wrong answer rather than a fix.
+  Note the router slip is intermittent (4/4 clean on re-test), so **don't
+  conclude it's gone from one sample** — the guard is the durable half.
+- ⚠️ **Section status comes from the SEAT COUNT, not Banner's `openSection`.**
+  They are independent fields and disagree constantly: `openSection` means "the
+  department has this section open for registration", not "it has free seats".
+  CSC 320 A01 (Fall 2026) is `seats=0 / openSection=True`, as is most of CSC 110
+  — all of which rendered as `"0 of 125 seats open — OPEN"`, the exact wrong word
+  for "are there seats?". `_banner_section_line` now derives one of four states
+  from all three signals: `CLOSED — not open for registration` (openSection
+  false, e.g. CSC 320 T02), `SEATS AVAILABLE`, `FULL — no seats left, but
+  waitlist space remains`, `FULL — no seats and no waitlist space`. Same class of
+  bug as the graph-label ones: our code was asserting something the field did not
+  mean.
 - **`banner_retrieve(course_codes, season, year)`** (course availability) resolves
   the term (default: `_default_term`, see the ⚠️ above; router-named term
   via `term_season`/`term_year` wins — today's date is injected into the router
@@ -771,6 +876,11 @@ after new corpus content lands.
   coverage (16 fact shapes, asserting context numbering is contiguous, source
   `n`s are a strictly-increasing subset of it, and each vector chunk resolves to
   its own source) is the cheapest way to re-verify after any renderer change.
+  **The program contribution is variable** — a relaxed multi-subject match
+  renders one block per program (see the `_n_program_blocks` note in §2) — so
+  all three walkers derive that count from that one helper rather than assuming
+  `1`. Re-verified after that change across 7 program shapes × 6
+  course/not-found combinations.
 
 ### Tunable constants (top of `chatbot.py`)
 

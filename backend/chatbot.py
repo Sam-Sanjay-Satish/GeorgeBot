@@ -581,7 +581,102 @@ class GeorgeBot:
         ranked.sort(key=lambda m: (m["_extra"], m["_size"]))
         return ranked
 
+    # Words a student naturally attaches to a program name that are not part of
+    # any program's title or credential. `search_programs` is an all-tokens-AND
+    # matcher, so each of these single-handedly forces a zero match: only 7 of
+    # 280 programs have a word starting with "degree" (the Law joint/double
+    # degrees and the post-degree BEds), so "geography general degree" matched
+    # nothing while "geography general" matched the two correct programs.
+    # Stripping them is query-side only and loses nothing — none of them
+    # discriminates between programs. Deliberately NOT here: "general", "major",
+    # "minor", "honours", "combined", "arts", "science" (all real credential
+    # words), "studies" (a real title word — Environmental Studies), and "and"
+    # (a real title word AND the conjunction the split below keys on).
+    _PROGRAM_FILLER = {
+        "degree", "degrees", "program", "programs", "programme", "programmes",
+        "the", "a", "an", "in", "of", "for", "at", "uvic",
+    }
+    # Credential-ish words that qualify a subject rather than name one. When a
+    # query names two subjects joined by "and", a trailing qualifier applies to
+    # both ("geography and environmental studies general" = the General program
+    # in each), so it gets copied onto whichever part lacks one.
+    _PROGRAM_QUALIFIERS = {
+        "general", "major", "minor", "honours", "honors", "combined",
+        "bachelor", "arts", "science", "sciences", "ba", "bsc",
+        "certificate", "diploma",
+    }
+
+    @staticmethod
+    def _norm_tokens(s: str) -> list[str]:
+        return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).split()
+
+    def _relaxed_program_queries(self, query: str) -> tuple[list[str], list[str]]:
+        """Rescue queries to try after a strict `search_programs` came back empty.
+
+        `search_programs` requires EVERY token to match one program node, which
+        silently returns nothing in two common cases that are not "the program
+        doesn't exist":
+
+        1. the query carries a generic word no title contains ("...general
+           degree" -> `_PROGRAM_FILLER`); and
+        2. the query names TWO programs joined by "and". A UVic General degree
+           is built from two areas and the catalog lists one program per
+           subject, so "geog and environmental studies general degree" can
+           never match a single node — geography matches 9 programs,
+           environmental matches 2, and the intersection is empty.
+
+        Returns (queries_that_matched, parts_that_matched_nothing). Only reached
+        when the strict search already failed, so the conjunction split can't
+        break a real title containing "and" ("Physical Geography and Earth and
+        Ocean Sciences" matches strictly and never gets here).
+        """
+        words = self._norm_tokens(query)
+        kept = [w for w in words if w not in self._PROGRAM_FILLER]
+        if not kept:
+            return [], []
+        # (a) filler-only relaxation — fixes "geography general degree".
+        cleaned = " ".join(kept)
+        if cleaned != " ".join(words) and self.gs.search_programs(cleaned):
+            return [cleaned], []
+        # (b) conjunction split — fixes the two-subject case.
+        raw_parts = re.split(r"\s+and\s+|[&,+/]", (query or "").lower())
+        if len(raw_parts) < 2:
+            return [], []
+        quals = [w for w in kept if w in self._PROGRAM_QUALIFIERS]
+        found, missed = [], []
+        for rp in raw_parts:
+            part = [w for w in self._norm_tokens(rp) if w not in self._PROGRAM_FILLER]
+            if not part:
+                continue
+            if not any(w in self._PROGRAM_QUALIFIERS for w in part):
+                part = part + quals
+            cand = " ".join(part)
+            (found if self.gs.search_programs(cand) else missed).append(cand)
+        return found, missed
+
     def _program_facts(self, query: str, completed: list[str]) -> dict:
+        """Resolve `query` to program facts, retrying with relaxed matching when
+        the strict name match finds nothing.
+
+        A strict hit (including a genuine ambiguity) is returned unchanged. Only
+        a zero match falls through to `_relaxed_program_queries`; if that finds
+        two or more programs the result carries a `parts` list — one entry per
+        resolved program, each in this same single-program shape — which every
+        renderer walks. See `_n_program_blocks` for the numbering contract."""
+        res = self._resolve_program(query, completed)
+        if res.get("program") or res.get("ambiguous"):
+            return res
+        found, missed = self._relaxed_program_queries(query)
+        sub = [self._resolve_program(q, completed) for q in found]
+        sub = [s for s in sub if s.get("program") or s.get("ambiguous")]
+        if not sub:
+            return res
+        if len(sub) == 1:
+            return {**sub[0], "relaxed_from": query, "unmatched_parts": missed}
+        return {"query": query, "relaxed_from": query,
+                "unmatched_parts": missed, "parts": sub}
+
+    def _resolve_program(self, query: str, completed: list[str]) -> dict:
         matches = self.gs.search_programs(query)
         if not matches:
             return {"query": query, "matches": []}
@@ -806,56 +901,106 @@ class GeorgeBot:
 
         program = graph_facts.get("program")
         if program:
-            i += 1
-            if program.get("ambiguous"):
-                names = "; ".join(f"{m['title']} ({m['code']}, {m.get('credential', '')})"
-                                   for m in program["matches"])
-                blocks.append(
-                    f"[{i}] source=kuali program_search=\"{program['query']}\"\n"
-                    f"Multiple matching programs found — ask the user to clarify which one: {names}"
-                )
-            elif program.get("program"):
-                p = program["program"]
-                lines = [
-                    f"[{i}] source=kuali program={p.get('code')}",
-                    f"URL: {p.get('url', 'n/a')}",
-                    f"{p.get('title', '')} — {p.get('credential', '')} ({p.get('total_units', '?')} units)",
-                    f"Description: {p.get('description', '')}",
-                ]
-                if program.get("auto_selected"):
-                    alts = "; ".join(f"{a['title']} ({a.get('credential', '')})"
-                                      for a in program.get("alternatives", []))
-                    lines.append(
-                        f"NOTE: the user's request \"{program['query']}\" matched several "
-                        f"programs; this is the closest one and was auto-selected. Briefly "
-                        f"state which program you're assuming, and mention they can ask about "
-                        f"another if this isn't it. Other close matches: {alts}"
-                    )
-                if program.get("requirements_remaining") is not None:
-                    lines.append(f"Given completed courses [{', '.join(program['completed_given'])}], "
-                                  f"outstanding requirements by group:")
-                    for grp in program["requirements_remaining"]:
-                        note = " (plus non-enumerable requirements not listed here)" if grp["has_non_course_reqs"] else ""
-                        lines.append(f"  - {grp['label'] or '(unlabeled)'}: "
-                                      f"{', '.join(grp['remaining']) or '(none)'}{note}")
-                else:
-                    for g in program.get("requirement_groups", []):
-                        lines.append(f"Requirement group \"{g['label']}\": {json.dumps(g['tree'])[:1500]}")
-                if program.get("specializations"):
-                    lines.append(f"Specializations: {', '.join(program['specializations'])}")
-                if program.get("all_courses"):
-                    ac = program["all_courses"]
-                    shown = ", ".join(ac[:60])
-                    more = f" (+{len(ac) - 60} more)" if len(ac) > 60 else ""
-                    lines.append(f"All courses referenced by this program (may include "
-                                  f"options, not all required): {shown}{more}")
-                blocks.append("\n".join(lines))
-            elif not program.get("matches"):
-                blocks.append(
-                    f"[{i}] source=kuali program_search=\"{program['query']}\"\n"
-                    f"No matching program found in the calendar."
-                )
+            for one in (program.get("parts") or [program]):
+                i += 1
+                blocks.append(GeorgeBot._program_block(i, one, program))
         return "\n\n".join(blocks)
+
+    @staticmethod
+    def _relaxed_note(one: dict, parent: dict) -> str:
+        """Explain to the model how a program block was reached when the user's
+        exact wording didn't match. Only fires on the relaxed path."""
+        original = parent.get("relaxed_from")
+        if not original:
+            return ""
+        note = (f" NOTE: the user asked about \"{original}\", which matches no single "
+                f"catalog program by name; the catalog lists one program per subject, "
+                f"so this was resolved as \"{one.get('query')}\". Answer about this "
+                f"program and make clear which one it is.")
+        missed = parent.get("unmatched_parts") or []
+        if missed:
+            note += (f" Part of the request matched nothing by name and is NOT covered "
+                     f"below: {'; '.join(missed)} — do not claim those don't exist; ask "
+                     f"the user for the exact calendar name if they need them.")
+        return note
+
+    @staticmethod
+    def _program_block(i: int, program: dict, parent: dict | None = None) -> str:
+        """Render ONE numbered program block. Called once per entry in a relaxed
+        multi-program `parts` list, or once for the single-program result."""
+        parent = parent if parent is not None else program
+        if program.get("ambiguous"):
+            names = "; ".join(f"{m['title']} ({m['code']}, {m.get('credential', '')})"
+                               for m in program["matches"])
+            return (
+                f"[{i}] source=kuali program_search=\"{program['query']}\"\n"
+                f"Multiple matching programs found — ask the user to clarify which one: {names}"
+                f"{GeorgeBot._relaxed_note(program, parent)}"
+            )
+        if program.get("program"):
+            p = program["program"]
+            lines = [
+                f"[{i}] source=kuali program={p.get('code')}",
+                f"URL: {p.get('url', 'n/a')}",
+                f"{p.get('title', '')} — {p.get('credential', '')} ({p.get('total_units', '?')} units)",
+                f"Description: {p.get('description', '')}",
+            ]
+            if program.get("auto_selected"):
+                alts = "; ".join(f"{a['title']} ({a.get('credential', '')})"
+                                  for a in program.get("alternatives", []))
+                lines.append(
+                    f"NOTE: the user's request \"{program['query']}\" matched several "
+                    f"programs; this is the closest one and was auto-selected. Briefly "
+                    f"state which program you're assuming, and mention they can ask about "
+                    f"another if this isn't it. Other close matches: {alts}"
+                )
+            relaxed = GeorgeBot._relaxed_note(program, parent)
+            if relaxed:
+                lines.append(relaxed.strip())
+            if program.get("requirements_remaining") is not None:
+                lines.append(f"Given completed courses [{', '.join(program['completed_given'])}], "
+                              f"outstanding requirements by group:")
+                for grp in program["requirements_remaining"]:
+                    note = " (plus non-enumerable requirements not listed here)" if grp["has_non_course_reqs"] else ""
+                    lines.append(f"  - {grp['label'] or '(unlabeled)'}: "
+                                  f"{', '.join(grp['remaining']) or '(none)'}{note}")
+            else:
+                for g in program.get("requirement_groups", []):
+                    lines.append(f"Requirement group \"{g['label']}\": {json.dumps(g['tree'])[:1500]}")
+            if program.get("specializations"):
+                lines.append(f"Specializations: {', '.join(program['specializations'])}")
+            if program.get("all_courses"):
+                ac = program["all_courses"]
+                shown = ", ".join(ac[:60])
+                more = f" (+{len(ac) - 60} more)" if len(ac) > 60 else ""
+                lines.append(f"All courses referenced by this program (may include "
+                              f"options, not all required): {shown}{more}")
+            return "\n".join(lines)
+        # No match. This block used to read only "No matching program found in the
+        # calendar." — a bare negative under source=kuali, which the answer rules
+        # call the authoritative catalog. The model read it as proof of
+        # non-existence and told a student the degree they were enrolled in
+        # doesn't exist at UVic ("geog and environmental studies general degree",
+        # which the catalog lists as two separate General programs). The lookup is
+        # a NAME match over program titles only, so an empty result carries no
+        # information about whether the program exists — say so explicitly, the
+        # same way the course NOT FOUND block does.
+        return (
+            f"[{i}] source=kuali program_search=\"{program['query']}\"\n"
+            f"No catalog program matches that NAME. This is a name-matching result "
+            f"ONLY: it means nothing in the catalog is titled that way. It is NOT "
+            f"evidence that the program does not exist, is not offered, or is not "
+            f"in the calendar. Do NOT tell the user the program/degree/combination "
+            f"doesn't exist or isn't offered at UVic, do NOT cite this block as "
+            f"support for such a claim, and do NOT describe this lookup or its "
+            f"result to the user. Students routinely name a program differently "
+            f"from the calendar, and a degree spanning two subjects is listed as "
+            f"two separate programs, one per subject — so a combination the user "
+            f"names may well exist even though no single entry is titled that way. "
+            f"Ask the user for the exact program name as it appears in the academic "
+            f"calendar (or which individual subjects they mean), and answer "
+            f"whatever else the question asks."
+        )
 
     @staticmethod
     def _banner_section_line(s: dict) -> str:
@@ -868,8 +1013,24 @@ class GeorgeBot:
 
         seat = (f"{s['seats_available']} of {s['max_enrollment']} seats open "
                 f"({s['enrollment']} enrolled)")
-        parts = [f"  {s['section']} ({s.get('schedule_type', '')}): {seat} — "
-                 f"{'OPEN' if s.get('open') else 'FULL'}."]
+        # Status must come from the SEAT COUNT, not from Banner's `openSection`.
+        # They are independent fields and disagree constantly: `openSection` means
+        # "the department has this section open for registration", NOT "it has free
+        # seats". CSC 320 A01 (Fall 2026) is seats=0 / openSection=True, as is most
+        # of CSC 110 — all of which rendered as "0 of 125 seats open — OPEN", which
+        # is precisely the wrong word for "are there seats?". `openSection=False`
+        # still means closed outright (CSC 320 T02), so all three signals matter.
+        seats_left = s.get("seats_available")
+        wait_left = s.get("wait_available") or 0
+        if not s.get("open"):
+            status = "CLOSED — not open for registration"
+        elif isinstance(seats_left, int) and seats_left > 0:
+            status = "SEATS AVAILABLE"
+        elif wait_left > 0:
+            status = "FULL — no seats left, but waitlist space remains"
+        else:
+            status = "FULL — no seats and no waitlist space"
+        parts = [f"  {s['section']} ({s.get('schedule_type', '')}): {seat} — {status}."]
         if s.get("wait_capacity"):
             parts.append(f"Waitlist {s.get('wait_count', '?')}/{s['wait_capacity']} "
                          f"({s.get('wait_available', '?')} open).")
@@ -922,13 +1083,27 @@ class GeorgeBot:
             header = f"[{i}] source=banner instructor=\"{instr or query}\" term={term_label}"
             return f"{header}\n{body}", 1
 
+        # Set when a season/year hint named a term Banner no longer serves live data
+        # for (a past "View Only" term); the data below is the current/upcoming term
+        # instead, and the model must not pass it off as the term that was named.
+        asked_for = banner_facts.get("requested_term_label")
+        substitution = ""
+        if asked_for:
+            substitution = (
+                f"\nNOTE: {asked_for} was named for this lookup, but it is a past term "
+                f"with no live registration data, so these are {term_label} numbers "
+                f"instead. Say which term these figures are for. If the user genuinely "
+                f"meant {asked_for}, tell them seat counts for a finished term aren't "
+                f"available and are not meaningful."
+            )
+
         blocks = []
         i = offset
         for course in banner_facts.get("courses", []):
             i += 1
             code = course["code"]
             lines = [
-                f"[{i}] source=banner course={code} term={term_label}",
+                f"[{i}] source=banner course={code} term={term_label}{substitution}",
                 f"LIVE class availability for {code} ({term_label}) — current seat "
                 f"counts pulled from UVic registration, subject to change:",
             ]
@@ -1232,6 +1407,30 @@ class GeorgeBot:
     _ANSWER_RULES_HEAD = (
         "You are GeorgeBot, a helpful assistant that answers questions about the "
         "University of Victoria (UVic) for students and staff.\n\n"
+        "WHO YOU CURRENTLY SERVE\n"
+        "You cover two audiences: UNDERGRADUATE students, and FACULTY/STAFF (HR, "
+        "governance, research administration). The user chooses which of those to "
+        "search. There is NO GRADUATE-STUDIES COVERAGE YET — graduate program "
+        "requirements, graduate admissions, funding and awards, supervision, "
+        "candidacy, and thesis/dissertation regulations are all out of scope for "
+        "now.\n"
+        "This matters because graduate regulations at UVic genuinely differ from "
+        "undergraduate ones. Everything you retrieve is undergraduate- or "
+        "staff-oriented, so NEVER present an undergraduate regulation, deadline, "
+        "fee, GPA or academic-standing rule, or program requirement as though it "
+        "applies to a graduate student. That is a wrong answer, not a close "
+        "approximation.\n"
+        "When the question is clearly about graduate study — or the user says "
+        "they are a grad, master's, or PhD student — say plainly that graduate "
+        "content isn't supported yet, answer only the parts that genuinely apply "
+        "to everyone on campus, and point them to the Faculty of Graduate Studies "
+        "or their supervisor / graduate adviser for the rest. Say it as a current "
+        "gap ('not supported yet'), not as a refusal, and never guess at a "
+        "graduate rule to fill it.\n"
+        "Do not over-correct: plenty of questions are audience-independent "
+        "(library, parking, transit, counselling, IT, recreation, campus "
+        "services). If a graduate student asks one of those, just answer it "
+        "normally — there is no need to mention the limitation at all.\n\n"
         "USING THE REFERENCE MATERIAL\n"
         "Alongside the user's question you are given additional reference "
         "material supplied by the SYSTEM — not by the user. The user did not "
@@ -1342,7 +1541,15 @@ class GeorgeBot:
         "non-course requirements (year standing, GPA, permission, etc.) since "
         "those can't be auto-verified from a course list.\n"
         "- If a program search returned multiple candidates, ask the user to "
-        "clarify which one they mean rather than guessing.\n\n"
+        "clarify which one they mean rather than guessing.\n"
+        "- A program search that reports no NAME match is not evidence that the "
+        "program does not exist — it only means nothing in the catalog is titled "
+        "that way. Never tell a user that a program, degree, major, minor, or "
+        "combination of subjects isn't offered at UVic, doesn't exist, or isn't "
+        "in the calendar on that basis, and never invent corroboration for such "
+        "a claim from other material. Students often name a program differently "
+        "from the calendar, and a degree spanning two subjects is listed as one "
+        "program per subject. Ask for the exact calendar name instead.\n\n"
     )
 
     _CITED_SOURCES_RULES = (
@@ -1748,9 +1955,14 @@ class GeorgeBot:
                 n += 1          # numbered in the context; nothing to link to
             program = graph_facts.get("program")
             if program:
-                n += 1          # numbered even when ambiguous / no match
-                if program.get("program"):
-                    p = program["program"]
+                # One block per resolved program (a relaxed two-subject match
+                # renders both); ambiguity / no-match notes still take a number
+                # and contribute no source. Count via `_n_program_blocks`.
+                for one in (program.get("parts") or [program]):
+                    n += 1      # numbered even when ambiguous / no match
+                    if not one.get("program"):
+                        continue
+                    p = one["program"]
                     url = p.get("url", "")
                     key = url or f"program:{p.get('code')}"
                     if key not in seen:
@@ -1949,8 +2161,19 @@ class GeorgeBot:
             len(courses)
             + sum(1 for c in courses if c.get("outline"))
             + len(graph_facts.get("not_found", []))
-            + (1 if graph_facts.get("program") else 0)
+            + GeorgeBot._n_program_blocks(graph_facts.get("program"))
         )
+
+    @staticmethod
+    def _n_program_blocks(program: dict | None) -> int:
+        """How many numbered blocks the program result emits. A relaxed
+        multi-program result renders one block per resolved program, so this is
+        the single place all three walkers derive that count from — keeping
+        `_graph_context_text`, `_n_graph_blocks` and `format_sources` from
+        drifting the way they did before the 2026-08-04 numbering fix."""
+        if not program:
+            return 0
+        return len(program["parts"]) if program.get("parts") else 1
 
     def _assemble_context(self, chunks: list[dict], graph_facts: dict,
                           banner_facts: dict, rmp_facts: dict | None = None) -> tuple[str, int]:
