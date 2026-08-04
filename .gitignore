@@ -1,7 +1,12 @@
 backend/chroma_db/
 backend/graph_data/
 backend/vector_taxonomy.json
-backend/query_logs.db*          # local query log (prod's lives on the Volume)
+# Local query log (prod's lives on the Railway Volume at $DATA_DIR/query_logs.db).
+# Keep this comment on its OWN line — .gitignore has no trailing-comment syntax,
+# so "pattern  # note" is one literal pattern and silently matches nothing.
+# Covers the -shm/-wal sidecars too: SQLite keeps un-checkpointed rows (including
+# full question and answer text) in the -wal, so it leaks even when the .db looks empty.
+backend/query_logs.db*
 
 .env
 venv/

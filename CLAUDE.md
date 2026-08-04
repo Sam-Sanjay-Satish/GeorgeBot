@@ -466,6 +466,27 @@ no new dependencies.
   signal), stats strip, CSV export. `_require_admin` fails **closed**: no
   `ADMIN_TOKEN` in the environment → 503 on every admin route.
 - **CLI peek**, no server: `python3 backend/querylog.py 20`.
+- ⚠️ **The local DB is gitignored, and it must stay that way — this repo is
+  PUBLIC (fixed 2026-08-04).** With no `DATA_DIR` set, the path falls back to
+  `backend/query_logs.db`, i.e. *inside the repo*, so just running the server
+  locally drops a log of full question + answer text into the working tree. Two
+  bugs had let that through and both are now fixed:
+  - The ignore rule was written `backend/query_logs.db*   # local query log …`.
+    **`.gitignore` has no trailing-comment syntax** — `#` only opens a comment as
+    the first character of a line — so the whole string was one literal pattern
+    matching nothing (`git check-ignore -v` confirmed no rule matched). The
+    comment now sits on its own line. No other rule in that file has an inline
+    comment; don't add one.
+  - The files were also already **tracked** (committed in `15405a4`), and
+    `.gitignore` never applies to tracked files. Cleared with
+    `git rm --cached backend/query_logs.db*` (index only — the local DB is
+    untouched on disk).
+  - The pattern must keep the trailing `*`: SQLite holds un-checkpointed rows in
+    the **`-wal`** sidecar, so `query_logs.db` can look empty (4 KB, zero tables)
+    while `query_logs.db-wal` carries every question and answer — which is exactly
+    what got committed. The 9 rows in that commit were synthetic test queries, not
+    student traffic, so history was deliberately left alone rather than rewritten
+    on an already-pushed public repo.
 - Known thin spot: `mode=quick` on the non-streaming `/api/chat` logs
   `search_query` but no `route_json` — `bot.ask()` doesn't return the route. The
   streaming path (what the frontend uses) always logs it.
