@@ -238,7 +238,13 @@ LLM_MAX_RETRIES = 2      # retry on finish_reason == "length" (truncated mid-ans
 
 # Retrieval tuning
 QUESTION_K = 40        # question-vectors pulled from Chroma before collapsing
-N_CONTEXT = 4           # distinct chunks handed to the answer model
+N_CONTEXT = 4           # distinct chunks the FILTERED pass may contribute
+N_UNFILTERED_BACKFILL = 3  # distinct chunks the UNFILTERED pass always adds on top
+                            # (so up to N_CONTEXT + this reach the answer model).
+                            # See `vector_retrieve`: the unfiltered pass used to run
+                            # only when the filtered pass came up short, which let a
+                            # single wrong `department` prediction hide the globally
+                            # best chunks in the corpus (measured 2026-08-04).
 MAX_CHUNK_DISTANCE = 0.75  # cosine distance cutoff (voyage-4-large) — chunks
                             # worse than this are dropped rather than backfilled
                             # just to hit N_CONTEXT, so a genuinely off-topic
@@ -487,15 +493,36 @@ class GeorgeBot:
         "both" returns the globally-nearest n chunks across the two corpora
         rather than n-per-corpus.
 
-        Soft filter with backfill: if topic_families/department were predicted
-        by the router, run a filtered pass first so on-topic chunks rank first;
-        then top up with an unfiltered pass (deduped) so a wrong or overly-narrow
-        prediction never drops recall to zero — it just re-prioritizes what plain
-        vector similarity already found.
+        Soft filter with an UNCONDITIONAL unfiltered pass: if topic_families/
+        department were predicted by the router, run a filtered pass first so
+        on-topic chunks rank first; then *always* add up to
+        `N_UNFILTERED_BACKFILL` more from an unfiltered pass (deduped).
+
+        ⚠️ The unfiltered pass used to run only when the filtered pass returned
+        fewer than `n`, and that was a real wrong-answer bug, not just lost
+        recall (measured 2026-08-04). A program spanning two departments carries
+        exactly ONE `department` tag, so whichever department the router names,
+        the other one's documents are filtered out — and when the filtered pass
+        still returns a full `n`, the backfill never fires and they are never
+        seen. Concretely: "geog and environmental studies general degree" routed
+        to department="Environmental Studies", while the Geography and
+        Environmental Studies Double Major worksheets are tagged
+        department="Geography". Those worksheets are the three globally-nearest
+        chunks in the corpus for that query (d=0.446/0.460/0.470) and were
+        replaced by chunks ~0.05 worse, so the answer denied that the program
+        exists. This falsified the old claim that a wrong/narrow prediction
+        "degrades to no filtering benefit, not a wrong answer".
+
+        Why the filtered budget stays at `n` rather than shrinking to make room:
+        capping it lower (3+3 was measured) evicts the filtered pass's 4th chunk,
+        which cost real content on 5 of 10 test queries (e.g. the tuition query
+        lost "International Undergraduate Tuition Fees"). Keeping `n` filtered
+        and adding `N_UNFILTERED_BACKFILL` on top makes the result a strict
+        superset of the old behaviour — zero regression — at ~1.75x context.
 
         Both passes apply MAX_CHUNK_DISTANCE, so a genuinely off-topic query can
-        return fewer than n chunks — even zero — rather than being padded out to
-        n with irrelevant ones just to hit the count.
+        return fewer chunks — even zero — rather than being padded out just to
+        hit a count.
         """
         emb = self._embed_query(query)
         auds = self._audiences(audience)
@@ -510,10 +537,13 @@ class GeorgeBot:
             ]
             results = self._merge_collapse(filtered, n, exclude=set())
 
-        if len(results) < n:
-            exclude = {r["chunk_id"] for r in results}
-            unfiltered = [self._query_candidates(self.collections[a], emb, None) for a in auds]
-            results += self._merge_collapse(unfiltered, n - len(results), exclude=exclude)
+        # With no filter the unfiltered pass IS the retrieval, so it supplies the
+        # full `n`. With a filter it always contributes N_UNFILTERED_BACKFILL on
+        # top, and still tops up to `n` if the filtered pass came up short.
+        want = max(N_UNFILTERED_BACKFILL, n - len(results)) if has_filter else n
+        exclude = {r["chunk_id"] for r in results}
+        unfiltered = [self._query_candidates(self.collections[a], emb, None) for a in auds]
+        results += self._merge_collapse(unfiltered, want, exclude=exclude)
         return results
 
     # -- graph retrieval --------------------------------------------------------
@@ -913,10 +943,46 @@ class GeorgeBot:
         original = parent.get("relaxed_from")
         if not original:
             return ""
-        note = (f" NOTE: the user asked about \"{original}\", which matches no single "
-                f"catalog program by name; the catalog lists one program per subject, "
-                f"so this was resolved as \"{one.get('query')}\". Answer about this "
-                f"program and make clear which one it is.")
+        # ⚠️ Do NOT restore the earlier phrasing "the catalog lists one program
+        # per subject" — it is FALSE and it caused a wrong answer. The program
+        # graph has no Double Major programs at all (0 of 280; see the known-issues
+        # entry in CLAUDE.md), so "Geography and Environmental Studies Double Major
+        # (BA)" is real, has a published worksheet, and is simply absent here.
+        # Stating the graph's shape as a fact about UVic, under the authoritative
+        # source=kuali tag, is what let the model deny the program existed.
+        note = (f" NOTE: the user asked about \"{original}\", which matches no program "
+                f"in this catalog index by name, so it was resolved by subject as "
+                f"\"{one.get('query')}\". This index is known to be INCOMPLETE for "
+                f"programs that span two subjects (double majors in particular are "
+                f"missing from it entirely), so treat the block below as related "
+                f"background, NOT as proof of what UVic offers. If any other "
+                f"reference material here describes a combined, double-major or "
+                f"joint program covering what the user asked about, PREFER IT over "
+                f"this block and answer from it.")
+        # A multi-part split means the user named SEVERAL subjects in one
+        # request — the parts are the halves of one question, not a menu. The
+        # first wording here ("answer about this program and make clear which
+        # one it is") made the model lead with "there isn't a single program
+        # called that" and then ask the user to choose ONE, which is the
+        # original wrong answer in a softer form: someone naming two subjects
+        # for a General degree wants BOTH, and each part is already a real
+        # program. It also volunteered an invented "Combined Major such as
+        # Geography and Environmental Studies" to bridge the two, so the
+        # anti-speculation clause is load-bearing too.
+        n_parts = len(parent.get("parts") or [])
+        if n_parts > 1:
+            note += (f" The request names {n_parts} subjects and each was resolved to its "
+                     f"own single-subject program, numbered separately here. If no other "
+                     f"material describes a real combined/double-major program covering "
+                     f"them, treat these as COMPONENTS OF ONE REQUEST, not alternatives: "
+                     f"cover every one of them rather than asking the user to pick between "
+                     f"them. Never state or imply that UVic has no program combining these "
+                     f"subjects — this index cannot support that claim. Only ask a "
+                     f"clarifying question for a part that is itself ambiguous (e.g. BA vs "
+                     f"BSc), and ask it about that part alone. Do NOT invent or speculate "
+                     f"about a combined/joint program not evidenced in the material.")
+        else:
+            note += " Otherwise answer about this program and make clear which one it is."
         missed = parent.get("unmatched_parts") or []
         if missed:
             note += (f" Part of the request matched nothing by name and is NOT covered "
@@ -994,12 +1060,13 @@ class GeorgeBot:
             f"doesn't exist or isn't offered at UVic, do NOT cite this block as "
             f"support for such a claim, and do NOT describe this lookup or its "
             f"result to the user. Students routinely name a program differently "
-            f"from the calendar, and a degree spanning two subjects is listed as "
-            f"two separate programs, one per subject — so a combination the user "
-            f"names may well exist even though no single entry is titled that way. "
-            f"Ask the user for the exact program name as it appears in the academic "
-            f"calendar (or which individual subjects they mean), and answer "
-            f"whatever else the question asks."
+            f"from the calendar, and this index is known to be INCOMPLETE for "
+            f"programs spanning two subjects (double majors are missing from it "
+            f"entirely) — so a combination the user names may well exist and be "
+            f"absent here. If any other reference material describes the program, "
+            f"answer from that. Otherwise ask the user for the exact program name "
+            f"as it appears in the academic calendar (or which individual subjects "
+            f"they mean), and answer whatever else the question asks."
         )
 
     @staticmethod

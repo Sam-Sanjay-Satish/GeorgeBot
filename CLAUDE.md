@@ -624,6 +624,26 @@ Only runs when `course_codes` or `program_query` is non-empty.
     the reported query now returns both General programs and asks BA-vs-BSc; a
     genuine no-match ("underwater basketweaving") hedges correctly instead of
     denying; auto-pick, ambiguity, and the course path are unchanged.
+  - ⚠️ **A multi-part split means COMPONENTS OF ONE REQUEST, not a menu — and
+    `_relaxed_note` has to say so explicitly.** The first version of the note
+    ended "Answer about this program and make clear which one it is", which was
+    written for the single-program case and is actively wrong for a split: the
+    model led with "there isn't a single program called that" and then asked the
+    user to pick *one* of the two — the original wrong answer in a softer form,
+    since someone naming two subjects for a General degree wants both, and each
+    part is already a real program. It also bridged the gap by volunteering an
+    invented "Combined Major such as Geography and Environmental Studies" that
+    does not exist. The note now branches on `len(parts) > 1`: cover every part,
+    don't open by denying the combined name, only ask a clarifying question for a
+    part that is *itself* ambiguous (BA vs BSc) and scope it to that part, and
+    never name or speculate about a combined/joint program absent from the
+    blocks. Verified: answers now lay out ES General's actual course list *and*
+    the Geography BA/BSc split, with no invented program. Residual, accepted:
+    the model still sometimes opens with "UVic doesn't offer a single combined
+    …" despite the instruction — but that statement is now *true* and is followed
+    by real requirements, so it's a style wobble, not the wrong answer. Like the
+    DATES and ARITHMETIC rules this is prompt-confidence, not deterministic:
+    **re-measure across several runs before concluding it regressed.**
 - ⚠️ **Relaxed matching can emit MORE THAN ONE program block.** A relaxed
   multi-subject result carries `parts: [<single-program result>, …]` and renders
   one numbered block per entry — so the program contribution to the block count
@@ -806,15 +826,41 @@ best-effort ({} on failure), like Banner. See `RMP_API.md`.
   via its tags rather than treat every retrieved chunk as relevant.
 - Runs on *every* question, graph route or not — graph facts are additive.
 
-**Metadata filtering (`department` + `topic_families`) — soft filter with
-backfill**, on top of the distance cutoff. The router predicts up to 3
-`topic_families` and one `department` from the controlled vocabulary in
-`vector_taxonomy.json`. `vector_retrieve()` runs a filtered pass first
-(`department $in [predicted, "general / cross-departmental"]` AND/OR
-`tf_<slug>` booleans), then backfills with an unfiltered pass (deduped)
-only if the filtered pass returned fewer than `N_CONTEXT`. Both passes
-respect `MAX_CHUNK_DISTANCE`. A wrong/narrow prediction degrades to
-"no filtering benefit," not "wrong answer."
+**Metadata filtering (`department` + `topic_families`) — soft filter plus an
+UNCONDITIONAL unfiltered pass**, on top of the distance cutoff. The router
+predicts up to 3 `topic_families` and one `department` from the controlled
+vocabulary in `vector_taxonomy.json`. `vector_retrieve()` runs a filtered pass
+first (`department $in [predicted, "general / cross-departmental"]` AND/OR
+`tf_<slug>` booleans) for up to `N_CONTEXT` chunks, then **always** adds up to
+`N_UNFILTERED_BACKFILL` more from an unfiltered pass (deduped) — so a normal
+turn sees up to 7 chunks. Both passes respect `MAX_CHUNK_DISTANCE`.
+
+⚠️ **The unfiltered pass used to be conditional (`only if the filtered pass
+returned fewer than N_CONTEXT`) and that was a wrong-answer bug — fixed
+2026-08-04. The old claim here, "a wrong/narrow prediction degrades to *no
+filtering benefit*, not *wrong answer*", is FALSE; don't restore it or the
+conditional.** A program spanning two departments carries exactly ONE
+`department` tag, so whichever department the router names, the other's
+documents are filtered out — and when the filtered pass still returns a full
+`N_CONTEXT`, the backfill never fires and they are never seen. Measured on the
+reported failure: "geog and environmental studies general degree" routed to
+`department="Environmental Studies"`, while the **Geography and Environmental
+Studies Double Major** worksheets are tagged `department="Geography"`. Those
+worksheets are the three globally-nearest chunks in the corpus for that query
+(d=0.446/0.460/0.470) and were displaced by chunks ~0.05 worse, so the answer
+told a student the degree they were asking about doesn't exist. The same class
+of miss was measured on other cross-departmental programs (biology+psychology,
+math+economics) — it is systematic, not a one-off.
+
+**Why the filtered budget stays at `N_CONTEXT` instead of shrinking to make
+room.** A 3-filtered + 3-unfiltered split was measured first: it fixes the
+target case but evicts the filtered pass's 4th chunk, losing real content on
+**5 of 10** test queries (the tuition query lost "International Undergraduate
+Tuition Fees"). 4+2 keeps the same total with no losses but retrieves only 2 of
+the 3 double-major chunks and misses the BA worksheet. **4+3** loses nothing
+(strict superset of the old behaviour) and catches all three, at ~1.75x context;
+4+4 bought nothing more. Verified end-to-end: the answer now names the Double
+Major and reproduces the worksheet's requirements exactly.
 
 **`department` is reliable; `topic_families` accuracy is bounded by
 taxonomy quality** — see `georgebot-pipeline`'s
@@ -890,7 +936,8 @@ after new corpus content lands.
 | `MINIMAX_MODEL` | `MiniMax-M3` (official API) | query rewrite + route classifier, and final answer |
 | `QUESTION_K` | 40 | question-vectors pulled from Chroma before collapsing |
 | `MAX_CHUNK_DISTANCE` | 0.75 | cosine distance cutoff — chunks worse than this are dropped, not backfilled |
-| `N_CONTEXT` | 4 | max distinct chunks handed to the answer model (graph blocks additive, uncapped; can be fewer if the cutoff filters hard) |
+| `N_CONTEXT` | 4 | max distinct chunks the **filtered** pass contributes (graph blocks additive, uncapped; can be fewer if the cutoff filters hard) |
+| `N_UNFILTERED_BACKFILL` | 3 | chunks the **unfiltered** pass always adds on top — so up to 7 reach the answer model. Do not make this conditional again; see the ⚠️ under "Metadata filtering" |
 | `LLM_MAX_TOKENS` | 4000 | route/rewrite budget |
 | `ANSWER_MAX_TOKENS` | 1500 | answer budget |
 | `MAX_HISTORY_TURNS` | 6 | trailing turns kept for rewrite + answer |
@@ -1086,6 +1133,36 @@ not in the answer text.
 ---
 
 ## Known issues / open items
+
+- ⚠️ **THE PROGRAM GRAPH IS MISSING EVERY DOUBLE MAJOR — fix belongs in
+  `georgebot-pipeline` (found 2026-08-04).** `program_graph.pkl` has **280
+  programs and zero `Double Major` credentials.** It has `Bachelor of Science -
+  Combined Major`, `Combined Honours` and `Bachelor of Fine Arts - Combined
+  Major`, and the two Law *Double Degrees* — but the entire Double Major class
+  is absent. Meanwhile the vector corpus carries **111 program-planning
+  worksheets, ~81 of them naming two subjects**, including
+  `ppw-ss-geog-es-ba.pdf` / `ppw-ss-geog-es-bsc.pdf` ("Geography and
+  Environmental Studies Double Major", BA and BSc, 60 units, effective Sept
+  2026). So the program exists, UVic publishes a worksheet for it, and the
+  worksheet is indexed — the **graph** just can't see it.
+  - This is what produced the user-reported wrong answer: the graph found no
+    match, and because graph blocks are tagged `source=kuali` — which
+    `_ANSWER_RULES_HEAD` calls the authoritative catalog — the model reported
+    the program doesn't exist. Fixing the retrieval filter (see "Metadata
+    filtering") makes the worksheet reachable and the live answer is now
+    correct, but that is a **mitigation**: the graph is still wrong, so a
+    question needing structured double-major facts (prereq chains, requirement
+    groups, `requirements_remaining`) still can't be served from the graph.
+  - **Serve-time code must therefore not present the program graph as a complete
+    list of what UVic offers.** `_relaxed_note` and the program no-match block in
+    `_program_block` both say explicitly that this index is incomplete for
+    two-subject programs and that other reference material wins. Earlier wording
+    asserted the opposite ("the catalog lists one program per subject") as fact —
+    **do not reintroduce it.**
+  - The real fix is regenerating `program_graph.pkl` in `georgebot-pipeline`
+    (Kuali program ingest) so Double Majors land in the graph. Nothing in this
+    repo can add them — this repo only serves what that one produces. When they
+    land, the incompleteness warnings above should be revisited.
 
 - **The extended-thinking plan system was removed (2026-07-27).** There used
   to be a "planner" layer where `rewrite_and_route(mode="default")` also
