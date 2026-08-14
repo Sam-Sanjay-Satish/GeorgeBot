@@ -35,7 +35,7 @@ Rate limiting (chat endpoints only; all optional, sane defaults):
 Concurrency (chat endpoints; all optional):
   CHAT_EXECUTOR_WORKERS   bounded thread pool for blocking chat work (default 16)
   MAX_INFLIGHT_CHAT       in-flight chat requests before 503 (default 12)
-  CHAT_TIMEOUT_SECONDS    hard wall-clock ceiling per chat turn (default 45)
+  CHAT_TIMEOUT_SECONDS    hard wall-clock ceiling per chat turn (default 75)
 """
 
 import argparse
@@ -264,7 +264,14 @@ def _check_rate_limit(request: Request, mode: str) -> None:
 
 CHAT_EXECUTOR_WORKERS = int(os.getenv("CHAT_EXECUTOR_WORKERS", "16"))
 MAX_INFLIGHT_CHAT = int(os.getenv("MAX_INFLIGHT_CHAT", "12"))
-CHAT_TIMEOUT_SECONDS = float(os.getenv("CHAT_TIMEOUT_SECONDS", "45"))
+# Raised 45 -> 75 (2026-08-15) alongside VERIFY_ANSWER_MAX_TOKENS going
+# 1500 -> 4000 in chatbot.py: that fixed default mode's adaptive-thinking
+# verify-answer call truncating mid-answer, but a bigger token budget means a
+# genuinely long generation now legitimately takes longer, and 45s was
+# already tight -- one direct pipeline run of a reasoning-heavy prompt (no
+# HTTP layer, so no other latency source) measured 34.2s end-to-end. 75s
+# gives real headroom above that instead of trading one bug for another.
+CHAT_TIMEOUT_SECONDS = float(os.getenv("CHAT_TIMEOUT_SECONDS", "75"))
 
 # A timed-out turn can't be interrupted mid-LLM-call — its worker thread runs
 # to completion in the background. This pool being bounded is what caps how
