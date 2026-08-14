@@ -234,7 +234,21 @@ VOYAGE_MODEL = "voyage-4-large"
 MINIMAX_BASE_URL = "https://api.minimax.io/v1"
 MINIMAX_MODEL = "MiniMax-M3"
 LLM_MAX_TOKENS = 4000    # route/rewrite budget
-ANSWER_MAX_TOKENS = 1500  # answer budget
+ANSWER_MAX_TOKENS = 1500  # answer budget (thinking disabled -- no reasoning overhead,
+                           # so this is a pure answer-length budget)
+# `answer_verified_stream`'s combined verify-then-answer call runs on
+# `thinking: "adaptive"`, and MiniMax counts reasoning AND the visible answer
+# against the SAME max_tokens budget (confirmed live 2026-08-15: a 1500-token
+# call produced ~1270 tokens of reasoning + ~220 tokens of visible answer
+# before hitting finish_reason=="length" mid-sentence). At ANSWER_MAX_TOKENS
+# a reasoning-heavy turn can burn the whole budget before -- or partway
+# through -- writing the actual answer, which is what caused both the
+# empty-response bug (fixed via retry, see answer_stream/answer_verified_stream)
+# and a distinct, NOT retry-fixable bug: a real answer that streams to the
+# user and then gets cut off mid-word once tokens are already sent (can't
+# retry after the fact). Root-caused to the shared budget, not something a
+# retry can paper over, so the fix is giving this call more room instead.
+VERIFY_ANSWER_MAX_TOKENS = 4000
 LLM_MAX_RETRIES = 2      # retry on finish_reason == "length" (truncated mid-answer)
 
 # Retrieval tuning
@@ -1905,7 +1919,8 @@ class GeorgeBot:
         answer_text, cited = _extract_cited_sources(text)
         return answer_text, cited, failed_reason
 
-    def _stream_answer_raw(self, messages: list[dict], system: str, thinking: str):
+    def _stream_answer_raw(self, messages: list[dict], system: str, thinking: str,
+                           max_tokens: int = ANSWER_MAX_TOKENS):
         """Low-level streamed MiniMax-M3 call, shared by `answer_stream` and
         `answer_verified_stream`. Builds the full message list, streams, and
         pipes raw `content` deltas through `_iter_visible_deltas` (drops any
@@ -1915,6 +1930,12 @@ class GeorgeBot:
         `<<CITED_SOURCES: ...>>` marker the same way). Yields raw visible
         text deltas with no leading-whitespace trimming or empty-stream
         fallback; callers own that.
+
+        `max_tokens` defaults to `ANSWER_MAX_TOKENS` (plain answer, thinking
+        disabled) — `answer_verified_stream` passes `VERIFY_ANSWER_MAX_TOKENS`
+        instead, since its `thinking: "adaptive"` call counts reasoning AND
+        the visible answer against the same budget (see that constant's
+        comment for the root-caused failure mode this avoids).
 
         Returns (via this generator's return value — retrievable through
         `yield from` or manual `next()`/`StopIteration.value`) a
@@ -1929,7 +1950,7 @@ class GeorgeBot:
         full_messages = [{"role": "system", "content": system}] + messages
         stream = self.llm.chat.completions.create(
             model=MINIMAX_MODEL,
-            max_tokens=ANSWER_MAX_TOKENS,
+            max_tokens=max_tokens,
             messages=full_messages,
             extra_body={"reasoning_split": True, "thinking": {"type": thinking}},
             stream=True,
@@ -2050,7 +2071,8 @@ class GeorgeBot:
         cited: list[int] | None = None
         failed_reason: str | None = None
         for _attempt in range(LLM_MAX_RETRIES + 1):
-            raw = self._stream_answer_raw(messages, system, thinking="adaptive")
+            raw = self._stream_answer_raw(messages, system, thinking="adaptive",
+                                          max_tokens=VERIFY_ANSWER_MAX_TOKENS)
 
             # Manual next()/StopIteration (not `for piece in raw:`) so a
             # response that's ENTIRELY reasoning -- raw exhausts before any
