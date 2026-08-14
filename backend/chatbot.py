@@ -46,6 +46,7 @@ from pathlib import Path
 
 from banner import banner_instructor_retrieve, banner_retrieve   # live class availability
 from rmp import rmp_retrieve   # RateMyProfessors ratings/reviews (student opinion)
+import hybrid_retrieve   # entity-routed hybrid vector retrieval (HYBRID_RETRIEVAL_ENABLED, default off)
 
 BASE_DIR = Path(__file__).parent          # backend/
 
@@ -397,6 +398,10 @@ class GeorgeBot:
         print(f"  Course graph: {self.gs.cg.number_of_nodes():,} nodes; "
               f"Program graph: {self.gs.pg.number_of_nodes():,} nodes; "
               f"{len(self.gs.outlines):,} outlines")
+
+        # None when HYBRID_RETRIEVAL_ENABLED is unset/false — zero file I/O,
+        # zero extra boot time in the default state. See hybrid_retrieve.py.
+        self.hybrid = hybrid_retrieve.maybe_load()
 
         print(f"Ready in {time.monotonic() - t0:.1f}s\n")
 
@@ -1316,6 +1321,27 @@ class GeorgeBot:
                 f"{glossary_lines}\n"
             )
 
+        # Gated behind the flag so the prompt sent to MiniMax is BYTE-IDENTICAL
+        # to today's whenever hybrid retrieval is disabled — no risk to the
+        # existing, well-tested router behavior in the default (off) state.
+        named_entities_field = ""
+        if hybrid_retrieve.HYBRID_RETRIEVAL_ENABLED:
+            named_entities_field = (
+                f'  "named_entities": array of genuinely distinctive proper nouns in '
+                f"search_query worth a targeted keyword search — the name of a "
+                f'specific facility/building/organization/club/service (e.g. "CARSA", '
+                f'"UVSS", "SUB"), a person\'s name, or a specific named external '
+                f'institution being compared/referenced (e.g. "SFU", "UBC"). Do NOT '
+                f"include: generic academic/grading jargon even if capitalized (GPA, "
+                f"WE, N, CGPA, SAP); course-code subject prefixes (CSC, ENGR, MATH, "
+                f'SENG, PSYC, STAT, ECE, PHYS); "UVic"/"University of Victoria" '
+                f"itself; generic program/department names (Computer Science, "
+                f"Engineering, Statistics) unless the question is fundamentally an "
+                f"identity lookup for that one unit and nothing else distinguishes "
+                f"it; generic role words alone (professor, student, staff) without "
+                f"an attached proper name. Empty array if none qualify.\n"
+            )
+
         prompt = (
             f"{convo}Today's date is {time.strftime('%Y-%m-%d')}.\n"
             f"You are the query router for a University of Victoria (UVic) "
@@ -1385,6 +1411,7 @@ class GeorgeBot:
             f"process) — null if the question is general/cross-departmental or "
             f"you're not confident which department applies:\n"
             f"{json.dumps(self.departments)}\n"
+            f"{named_entities_field}"
             f"Populate course_codes whenever the question is actually ABOUT a "
             f"specific course — either its structured catalog facts (prerequisites, "
             f"credits, cross-listings, description, degree/program requirements, "
@@ -1432,6 +1459,9 @@ class GeorgeBot:
                 "term_year": year,
                 "topic_families": [f for f in (data.get("topic_families") or []) if f in valid_families],
                 "department": dept,
+                # Only populated when HYBRID_RETRIEVAL_ENABLED (the field isn't in
+                # the prompt otherwise, so the model has nothing to return here).
+                "named_entities": [e for e in (data.get("named_entities") or []) if isinstance(e, str)],
             }
         except Exception as e:
             print(f"  [rewrite_and_route] failed, falling back to vector-only: {e}", file=sys.stderr)
@@ -1442,7 +1472,13 @@ class GeorgeBot:
                     "wants_outline": False, "wants_availability": False, "instructor_query": None,
                     "professor_query": None, "wants_rating": False,
                     "term_season": None, "term_year": None, "completed_courses": [],
-                    "topic_families": [], "department": None}
+                    "topic_families": [], "department": None,
+                    # Present in both branches so downstream code can safely use
+                    # route.get("named_entities", []) OR route["named_entities"] --
+                    # but .get() is still the documented convention (see
+                    # hybrid_retrieve.retrieve()) in case a field is ever added
+                    # here without remembering both branches again.
+                    "named_entities": []}
 
     @staticmethod
     def _build_context(chunks: list[dict], graph_text: str, offset: int) -> str:
@@ -2171,11 +2207,21 @@ class GeorgeBot:
         # naming a course, the graph/banner/rmp facts above still stand.
         chunks = []
         if route.get("needs_retrieval", True):
-            chunks = self.vector_retrieve(
-                route["search_query"], audience=audience,
-                topic_families=route["topic_families"], department=route["department"],
-            )
+            if self.hybrid is not None:
+                chunks = self.hybrid_vector_retrieve(route, audience)
+            else:
+                chunks = self.vector_retrieve(
+                    route["search_query"], audience=audience,
+                    topic_families=route["topic_families"], department=route["department"],
+                )
         return chunks, graph_facts, banner_facts, rmp_facts
+
+    def hybrid_vector_retrieve(self, route: dict, audience: str = DEFAULT_AUDIENCE) -> list[dict]:
+        """Entity-routed hybrid retrieval (dense-on-questions + dense-on-chunks,
+        plus sparse search scoped to a named entity when the router found one).
+        Only called when `self.hybrid` is loaded (HYBRID_RETRIEVAL_ENABLED=1);
+        see hybrid_retrieve.py for the full implementation."""
+        return hybrid_retrieve.retrieve(self, route, audience, self.hybrid)
 
     def retrieve(self, question: str, history: list[dict],
                  audience: str = DEFAULT_AUDIENCE) -> tuple[dict, list[dict], dict, dict, dict]:

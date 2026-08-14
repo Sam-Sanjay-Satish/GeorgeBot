@@ -11,3 +11,10 @@ requests         # UVic Banner live class-availability calls (banner.py)
 fastapi          # HTTP API
 uvicorn          # ASGI server
 python-dotenv    # loads .env (MINIMAX_SUB_KEY, VOYAGE_API_KEY)
+
+# hybrid_retrieve.py (entity-routed hybrid retrieval, HYBRID_RETRIEVAL_ENABLED)
+# — pinned, unlike the rest of this file, since these are genuinely new
+# dependencies this repo has never used before, on a bleeding-edge Python
+# base image; versions below are what was built and tested against.
+numpy==2.4.6
+rank-bm25==0.2.2

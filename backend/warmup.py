@@ -137,6 +137,20 @@ PROBES = (
           "undergrad", ("banner", "rmp", "vector"),
           force={"course_codes": ["CSC225"], "wants_availability": True,
                  "wants_rating": True}),
+    # Entity-routed hybrid retrieval (HYBRID_RETRIEVAL_ENABLED) -- warms the
+    # dense-on-chunks numpy matrix + BM25 indices and exercises the
+    # sparse-on-entity arm specifically. `named_entities` is forced the same
+    # way course_codes/wants_availability are forced above, since it's just
+    # another route field and the router's entity extraction is exactly as
+    # non-deterministic as everything else about it (see Probe docstring).
+    # No-op-equivalent to the plain "vector-faculty" probe when the flag is
+    # off (bot.hybrid is None, so retrieve_with_route falls through to
+    # legacy vector_retrieve() and named_entities is simply ignored) --
+    # harmless either way, so this probe doesn't need its own flag check.
+    Probe("hybrid-entity",
+          "where can i find a resistance band in carsa",
+          "faculty", ("vector",),
+          force={"named_entities": ["CARSA"]}),
 )
 
 
