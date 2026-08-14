@@ -263,6 +263,28 @@ MAX_CHUNK_DISTANCE = 0.75  # cosine distance cutoff (voyage-4-large) — chunks
                             # that class of case)
 MAX_HISTORY_TURNS = 6   # trailing conversation turns kept for context
 
+# Token-budget guard for the assembled context (2026-08-15). MiniMax-M3's
+# context window is 1M tokens, and nothing upstream of this hard-caps the
+# *size* of what gets assembled — N_CONTEXT/N_UNFILTERED_BACKFILL/
+# TOP_K_FUSED cap chunk COUNT, not tokens, and graph blocks (program course
+# lists, prereq chains) are explicitly uncapped (see the constants table in
+# CLAUDE.md). In practice a normal turn is nowhere close to 1M tokens, but
+# there was no code path that would ever notice or degrade gracefully if one
+# did get close — it would just fail (or get silently truncated) at the
+# MiniMax call. MAX_CONTEXT_TOKENS budgets the RETRIEVED CONTEXT specifically
+# (graph+banner+rmp+vector blocks assembled in `_assemble_context`), well
+# under the full 1M window to leave headroom for the fixed system-prompt
+# text, conversation history, the question itself, and ANSWER_MAX_TOKENS of
+# output — none of which are trimmable the way vector chunks are.
+MAX_CONTEXT_TOKENS = 800_000
+# Rough chars-per-token heuristic (see `_estimate_tokens`) — MiniMax doesn't
+# expose a public tokenizer, so this is deliberately a conservative estimate,
+# not an exact count. English prose runs ~4 chars/token; using that directly
+# would UNDER-count on token-dense text (code, URLs, CJK), so this is padded
+# down (fewer estimated chars per token = higher estimated token count) to
+# fail toward trimming too much rather than too little.
+CHARS_PER_TOKEN_ESTIMATE = 3.5
+
 # Gated the same way as rewrite_and_route's named_entities prompt field
 # (chatbot.py, "hybrid retrieval" changes): SYSTEM_PROMPT is a class-level
 # constant built once at import time, and hybrid_retrieve.HYBRID_RETRIEVAL_ENABLED
@@ -1854,23 +1876,34 @@ class GeorgeBot:
         return messages
 
     def answer(self, question: str, context: str, history: list[dict],
-               system_prompt: str | None = None) -> tuple[str, list[int] | None]:
+               system_prompt: str | None = None) -> tuple[str, list[int] | None, str | None]:
         """MiniMax-M3, thinking disabled — reference material is supplied via the
         system prompt (`_system_prompt_with_context`), not the user turn.
 
         `system_prompt` overrides the default behavioral contract (e.g. a
         mode-specific answer prompt).
 
-        Returns (answer_text, cited_source_numbers) — see
-        `_extract_cited_sources`/`_parse_cited_sources` for what the second
-        element means. Callers should pass it to `_filter_cited_sources`
-        before showing sources to the user."""
+        Returns (answer_text, cited_source_numbers, failure_reason).
+        `failure_reason` is None on a normal answer; `_call_llm` already
+        retries internally on `finish_reason == "length"` /empty content
+        (LLM_MAX_RETRIES), so a non-None reason here means every retry was
+        exhausted and `text` is the hardcoded apology, not a real answer —
+        callers should log this as an error rather than a clean "ok" (see
+        the 2026-08-15 empty-stream-logged-as-ok bug this fixes, and its
+        streaming-path counterpart in `answer_stream`/`answer_verified_stream`).
+        See `_extract_cited_sources`/`_parse_cited_sources` for what the
+        second element means. Callers should pass it to
+        `_filter_cited_sources` before showing sources to the user."""
         messages = self._answer_messages(question, history)
         text = self._call_llm(messages,
                                system=self._system_prompt_with_context(context, system_prompt),
                                max_tokens=ANSWER_MAX_TOKENS, thinking="disabled")
-        text = text or "Sorry, I couldn't generate an answer right now — please try again."
-        return _extract_cited_sources(text)
+        failed_reason = None
+        if not text:
+            failed_reason = f"LLM produced no usable answer after {LLM_MAX_RETRIES + 1} attempts"
+            text = "Sorry, I couldn't generate an answer right now — please try again."
+        answer_text, cited = _extract_cited_sources(text)
+        return answer_text, cited, failed_reason
 
     def _stream_answer_raw(self, messages: list[dict], system: str, thinking: str):
         """Low-level streamed MiniMax-M3 call, shared by `answer_stream` and
@@ -1884,8 +1917,15 @@ class GeorgeBot:
         fallback; callers own that.
 
         Returns (via this generator's return value — retrievable through
-        `yield from` or manual `next()`/`StopIteration.value`) the parsed
-        cited-source numbers (list[int] | None; see `_parse_cited_sources`)."""
+        `yield from` or manual `next()`/`StopIteration.value`) a
+        `(cited, finish_reason)` tuple: `cited` is the parsed cited-source
+        numbers (list[int] | None; see `_parse_cited_sources`); `finish_reason`
+        is the raw value MiniMax reported on the last streamed chunk (e.g.
+        "stop", "length" — "length" means the response was cut off before the
+        model finished, most often because an adaptive-thinking call spent
+        most/all of its `max_tokens` budget on reasoning before reaching the
+        visible answer — see `answer_stream`/`answer_verified_stream`, which
+        use this to decide whether to retry)."""
         full_messages = [{"role": "system", "content": system}] + messages
         stream = self.llm.chat.completions.create(
             model=MINIMAX_MODEL,
@@ -1895,16 +1935,21 @@ class GeorgeBot:
             stream=True,
         )
 
+        finish_reason = None
+
         def _content_deltas():
+            nonlocal finish_reason
             for event in stream:
-                delta = event.choices[0].delta
-                text = getattr(delta, "content", None)
+                choice = event.choices[0]
+                text = getattr(choice.delta, "content", None)
                 if text:
                     yield text
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
 
         visible = _iter_visible_deltas(_content_deltas())
         body = yield from _split_cited_sources(visible)
-        return _parse_cited_sources(body)
+        return _parse_cited_sources(body), finish_reason
 
     def answer_stream(self, question: str, context: str, history: list[dict],
                       system_prompt: str | None = None):
@@ -1919,25 +1964,45 @@ class GeorgeBot:
         to the client incrementally instead of landing as one buffered chunk.
         Leading whitespace on the first visible piece is trimmed to match the
         non-streaming `answer()` behavior.
+
+        Retries up to `LLM_MAX_RETRIES` times (same budget as `_call_llm`'s
+        non-streaming retry) if an attempt ends with ZERO visible tokens —
+        this is always safe to retry silently, since nothing was yielded to
+        the caller yet for a fully-empty attempt. If every attempt comes up
+        empty, yields `("failed", reason)` once before the hardcoded apology
+        token, so the caller can log this as a real failure instead of a
+        clean "ok" (this fixes the 2026-08-15 bug where an empty stream —
+        typically `finish_reason == "length"`, the model's `max_tokens`
+        budget spent entirely on reasoning before any visible answer text —
+        silently became a normal-looking apology with nothing in the query
+        log to show it happened).
         """
         messages = self._answer_messages(question, history)
         system = self._system_prompt_with_context(context, system_prompt)
-        gen = self._stream_answer_raw(messages, system, thinking="disabled")
         emitted = False
         cited: list[int] | None = None
-        while True:
-            try:
-                piece = next(gen)
-            except StopIteration as stop:
-                cited = stop.value
+        failed_reason: str | None = None
+        for _attempt in range(LLM_MAX_RETRIES + 1):
+            gen = self._stream_answer_raw(messages, system, thinking="disabled")
+            emitted = False
+            finish_reason = None
+            while True:
+                try:
+                    piece = next(gen)
+                except StopIteration as stop:
+                    cited, finish_reason = stop.value
+                    break
+                if not emitted:
+                    piece = piece.lstrip()
+                    if not piece:
+                        continue
+                emitted = True
+                yield ("token", piece)
+            if emitted:
                 break
-            if not emitted:
-                piece = piece.lstrip()
-                if not piece:
-                    continue
-            emitted = True
-            yield ("token", piece)
+            failed_reason = f"empty stream (finish_reason={finish_reason!r})"
         if not emitted:
+            yield ("failed", failed_reason)
             yield ("token", "Sorry, I couldn't generate an answer right now — please try again.")
         yield ("cited", cited)
 
@@ -1951,9 +2016,23 @@ class GeorgeBot:
         to the first newline — the same buffer-then-decide idiom
         `_iter_visible_deltas` already uses for `<think>` tags.
 
+        Retries up to `LLM_MAX_RETRIES` times if an attempt ends with a
+        SUFFICIENT (or unrecognized-header) verdict but ZERO visible answer
+        tokens — always safe, since nothing is yielded to the caller until a
+        verdict is known. A genuine NEED_MORE verdict is NOT a failure and is
+        never retried here. If every attempt still comes up empty, yields
+        ("failed", reason) before the hardcoded apology token (see
+        `answer_stream`'s matching docstring for the 2026-08-15 bug this
+        closes — `thinking: "adaptive"` makes this call the likelier of the
+        two to run out of `max_tokens` on reasoning alone, since the model's
+        reasoning and visible answer share one budget).
+
         Yields:
           ("token", text)   -- repeatedly, for a SUFFICIENT verdict; caller
                                 forwards these live as the answer.
+          ("failed", reason) -- at most once, only if every retry produced no
+                                visible tokens; immediately followed by a
+                                ("token", ...) apology and then ("cited", None).
           ("cited", numbers_or_None) -- once, after the last "token", for a
                                 SUFFICIENT verdict (see `_parse_cited_sources`);
                                 caller should pass it to `_filter_cited_sources`
@@ -1966,66 +2045,91 @@ class GeorgeBot:
         messages = self._answer_messages(question, history)
         system = self._system_prompt_with_context(
             context, self.SYSTEM_PROMPT + self.VERIFY_ANSWER_ADDENDUM)
-        raw = self._stream_answer_raw(messages, system, thinking="adaptive")
 
-        header, rest, found_newline = "", "", False
-        for piece in raw:
-            header += piece
-            if "\n" in header:
-                header, _, rest = header.partition("\n")
-                found_newline = True
-                break
-        header = header.strip()
-
-        if found_newline and header == "<<NEED_MORE>>":
-            body = rest + "".join(raw)
-            body = body.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            try:
-                data = json.loads(body)
-            except (json.JSONDecodeError, TypeError):
-                data = {}
-            try:
-                term_year = int(data["term_year"]) if data.get("term_year") else None
-            except (TypeError, ValueError):
-                term_year = None
-            yield ("need_more", {
-                "reason": data.get("reason") or "",
-                "search_query": data.get("search_query") or None,
-                "term_season": (data.get("term_season") or "").strip().lower() or None,
-                "term_year": term_year,
-            })
-            return
-
-        # SUFFICIENT, or an unrecognized/missing header -- fail open and
-        # answer with everything buffered so far rather than losing a real
-        # response over a malformed marker.
-        if found_newline and header == "<<SUFFICIENT>>":
-            first = rest
-        elif found_newline:
-            first = header + ("\n" + rest if rest else "")
-        else:
-            first = header
         emitted = False
         cited: list[int] | None = None
-        pending_first: str | None = first
-        while True:
-            if pending_first is not None:
-                piece, pending_first = pending_first, None
-            else:
+        failed_reason: str | None = None
+        for _attempt in range(LLM_MAX_RETRIES + 1):
+            raw = self._stream_answer_raw(messages, system, thinking="adaptive")
+
+            # Manual next()/StopIteration (not `for piece in raw:`) so a
+            # response that's ENTIRELY reasoning -- raw exhausts before any
+            # newline is ever seen -- doesn't silently discard the generator's
+            # return value the way a plain `for` loop over it would (a `for`
+            # loop drops a generator's StopIteration.value on natural
+            # exhaustion). Losing that would lose finish_reason/cited exactly
+            # in the all-reasoning-no-content case this retry exists for.
+            header, rest, found_newline, exhausted = "", "", False, False
+            finish_reason = None
+            while True:
                 try:
                     piece = next(raw)
                 except StopIteration as stop:
-                    cited = stop.value
+                    cited, finish_reason = stop.value
+                    exhausted = True
                     break
-            if not piece:
-                continue
-            if not emitted:
-                piece = piece.lstrip()
+                header += piece
+                if "\n" in header:
+                    header, _, rest = header.partition("\n")
+                    found_newline = True
+                    break
+            header = header.strip()
+
+            if found_newline and header == "<<NEED_MORE>>":
+                body = rest + "".join(raw)
+                body = body.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                try:
+                    data = json.loads(body)
+                except (json.JSONDecodeError, TypeError):
+                    data = {}
+                try:
+                    term_year = int(data["term_year"]) if data.get("term_year") else None
+                except (TypeError, ValueError):
+                    term_year = None
+                yield ("need_more", {
+                    "reason": data.get("reason") or "",
+                    "search_query": data.get("search_query") or None,
+                    "term_season": (data.get("term_season") or "").strip().lower() or None,
+                    "term_year": term_year,
+                })
+                return
+
+            # SUFFICIENT, or an unrecognized/missing header -- fail open and
+            # answer with everything buffered so far rather than losing a real
+            # response over a malformed marker.
+            if found_newline and header == "<<SUFFICIENT>>":
+                first = rest
+            elif found_newline:
+                first = header + ("\n" + rest if rest else "")
+            else:
+                first = header
+            emitted = False
+            pending_first: str | None = first
+            while True:
+                if pending_first is not None:
+                    piece, pending_first = pending_first, None
+                elif exhausted:
+                    break
+                else:
+                    try:
+                        piece = next(raw)
+                    except StopIteration as stop:
+                        cited, finish_reason = stop.value
+                        break
                 if not piece:
                     continue
-            emitted = True
-            yield ("token", piece)
+                if not emitted:
+                    piece = piece.lstrip()
+                    if not piece:
+                        continue
+                emitted = True
+                yield ("token", piece)
+            if emitted:
+                break
+            failed_reason = f"empty stream (finish_reason={finish_reason!r})"
+
         if not emitted:
+            yield ("failed", failed_reason)
             yield ("token", "Sorry, I couldn't generate an answer right now — please try again.")
         yield ("cited", cited)
 
@@ -2316,6 +2420,46 @@ class GeorgeBot:
             return 0
         return len(program["parts"]) if program.get("parts") else 1
 
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough, conservative token-count estimate — see CHARS_PER_TOKEN_ESTIMATE."""
+        return int(len(text) / CHARS_PER_TOKEN_ESTIMATE)
+
+    @classmethod
+    def _trim_chunks_to_budget(cls, chunks: list[dict], prefix: str) -> None:
+        """Drop trailing vector chunks in place until the assembled context fits
+        MAX_CONTEXT_TOKENS. Mutates `chunks` (via `del`, not reassignment) so
+        every caller's reference — `_build_context` here AND the same `chunks`
+        variable each caller later passes to `format_sources` — sees the same
+        trimmed list; that's what keeps the [n] numbering contract intact
+        without touching `format_sources` or any call site (see the numbering
+        contract note in CLAUDE.md §4).
+
+        Graph/banner/rmp blocks (`prefix`) are never trimmed — they're bounded,
+        structured facts the router deliberately asked for; vector chunks are
+        the additive, similarity-ranked-worst-first tail, so they're the right
+        thing to shed first. Chunks already arrive nearest/most-relevant-first,
+        so dropping off the end drops the least relevant ones first.
+        """
+        budget = MAX_CONTEXT_TOKENS - cls._estimate_tokens(prefix)
+        used = 0
+        keep = len(chunks)
+        for i, ch in enumerate(chunks):
+            # Matches _build_context's per-chunk rendering closely enough for
+            # a budget estimate (exact header formatting doesn't matter here).
+            meta = ch.get("metadata", {})
+            block = f"{meta.get('origin', '')}{ch.get('text', '')}"
+            used += cls._estimate_tokens(block)
+            if used > budget:
+                keep = i
+                break
+        if keep < len(chunks):
+            print(f"  [context] token budget exceeded ({used:,} est. tokens > "
+                  f"{budget:,} remaining of {MAX_CONTEXT_TOKENS:,}) — trimming "
+                  f"{len(chunks) - keep} of {len(chunks)} vector chunks",
+                  file=sys.stderr)
+            del chunks[keep:]
+
     def _assemble_context(self, chunks: list[dict], graph_facts: dict,
                           banner_facts: dict, rmp_facts: dict | None = None) -> tuple[str, int]:
         """Build the full numbered context (graph -> banner -> rmp -> vector) and
@@ -2331,6 +2475,7 @@ class GeorgeBot:
             rmp_text, n_rmp = self._rmp_context_text(rmp_facts, n_graph + n_banner)
         n_prefix = n_graph + n_banner + n_rmp
         prefix = "\n\n".join(t for t in (graph_text, banner_text, rmp_text) if t)
+        self._trim_chunks_to_budget(chunks, prefix)
         context = self._build_context(chunks, prefix, n_prefix)
         return context, n_prefix
 
@@ -2345,16 +2490,23 @@ class GeorgeBot:
         # smoke test), so it takes quick mode's contract — it was silently
         # using the default one, which is why CLI answers read longer than the
         # streaming ones the frontend shows.
-        answer, cited = self.answer(question, context, history,
+        answer, cited, failed_reason = self.answer(question, context, history,
                                     system_prompt=self.QUICK_SYSTEM_PROMPT)
         sources = _filter_cited_sources(
             self.format_sources(chunks, graph_facts, banner_facts, rmp_facts), cited)
-        return {
+        result = {
             "answer": answer,
             "sources": sources,
             "search_query": route["search_query"],
             "n_chunks": len(sources),
         }
+        # `_chat_turn_sync` (api.py) checks `result.get("error")` to decide the
+        # query-log status — without this, an exhausted-retry answer() logs as
+        # a clean "ok" with the hardcoded apology as the "answer", same bug
+        # class as the streaming path (see `answer_stream`'s docstring).
+        if failed_reason:
+            result["error"] = failed_reason
+        return result
 
 
 # ---------------------------------------------------------------------------

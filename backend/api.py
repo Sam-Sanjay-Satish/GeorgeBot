@@ -387,7 +387,7 @@ def _drain_events(events) -> dict:
             answer_parts.append(data)
         elif etype == "sources":
             sources = data
-        elif etype == "error":
+        elif etype in ("error", "log_error"):
             error = data
     if error is not None:
         return {"error": error}
@@ -410,6 +410,16 @@ def _default_verified_events(bot: GeorgeBot, question: str, history: list[dict],
     once the model has reported which numbered blocks it actually relied on
     (see `_filter_cited_sources`) -- the frontend buffers sources until the
     answer finishes revealing regardless, so this adds no visible delay.
+
+    A "failed" tuple-kind from `answer_verified_stream`/`answer_stream` (every
+    retry produced an empty response -- see their docstrings) is surfaced here
+    as a `log_error` event: an internal-only signal, not one of the SSE event
+    types the frontend knows about. `generate()` (api.py's streaming handler)
+    intercepts it to log the turn as a real query-log error instead of "ok";
+    `_drain_events` does the same for the non-streaming endpoint/CLI. The
+    user-visible apology "token" is still forwarded normally either way --
+    this only fixes what gets logged, not what the client sees (see the
+    2026-08-15 empty-stream-logged-as-ok bug this closes).
     """
     chunks, graph_facts, banner_facts, rmp_facts = bot.retrieve_with_route(route, audience)
     context, n_prefix_blocks = bot._assemble_context(chunks, graph_facts, banner_facts, rmp_facts)
@@ -423,6 +433,8 @@ def _default_verified_events(bot: GeorgeBot, question: str, history: list[dict],
                 yield {"type": "token", "data": payload}
             elif kind == "cited":
                 cited = payload
+            elif kind == "failed":
+                yield {"type": "log_error", "data": payload}
             else:  # "need_more"
                 need_more = payload
         if need_more is None:
@@ -454,6 +466,8 @@ def _default_verified_events(bot: GeorgeBot, question: str, history: list[dict],
     for kind, payload in bot.answer_stream(question, context, history):
         if kind == "token":
             yield {"type": "token", "data": payload}
+        elif kind == "failed":
+            yield {"type": "log_error", "data": payload}
         else:  # "cited"
             cited = payload
     sources = _filter_cited_sources(
@@ -654,6 +668,7 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                     events = None
 
                 if events is not None:
+                    failed_reason = None
                     for ev in events:
                         etype = ev.get("type")
                         data = ev.get("data", {})
@@ -661,8 +676,16 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                             answer_parts.append(data)
                         elif etype == "sources":
                             logged_sources = data
+                        elif etype == "log_error":
+                            # Internal-only signal (see _default_verified_events)
+                            # -- never forwarded as an SSE frame, the frontend
+                            # doesn't know this event type. The user-visible
+                            # apology "token" for this turn was already/will
+                            # still be forwarded normally below.
+                            failed_reason = data
+                            continue
                         yield f"event: {etype}\ndata: {json.dumps(data)}\n\n"
-                    _finish("ok")
+                    _finish("error" if failed_reason else "ok", failed_reason)
                     return
 
                 # Quick mode: today's flat retrieve -> answer pipeline, with a
@@ -684,12 +707,18 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                 # sources until the answer finishes revealing regardless, so
                 # this adds no visible delay.
                 cited = None
+                failed_reason = None
                 for kind, payload in bot.answer_stream(
                         question, context, req.history,
                         system_prompt=bot._quick_mode_system_prompt()):
                     if kind == "token":
                         answer_parts.append(payload)
                         yield f"event: token\ndata: {json.dumps(payload)}\n\n"
+                    elif kind == "failed":
+                        # Every retry (see answer_stream's docstring) came back
+                        # empty -- the apology "token" above is still shown to
+                        # the user normally; this only affects query-log status.
+                        failed_reason = payload
                     else:  # "cited"
                         cited = payload
                 sources = _filter_cited_sources(
@@ -697,7 +726,7 @@ def create_app(bot: GeorgeBot) -> FastAPI:
                 logged_sources = sources
                 yield f"event: sources\ndata: {json.dumps(sources)}\n\n"
                 yield "event: done\ndata: {}\n\n"
-                _finish("ok")
+                _finish("error" if failed_reason else "ok", failed_reason)
             except Exception as e:
                 _finish("error", str(e))
                 yield f"event: error\ndata: {json.dumps(str(e))}\n\n"
