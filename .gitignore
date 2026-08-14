@@ -1,6 +1,7 @@
 backend/chroma_db/
 backend/graph_data/
 backend/vector_taxonomy.json
+backend/hybrid_retrieve/
 # Local query log (prod's lives on the Railway Volume at $DATA_DIR/query_logs.db).
 # Keep this comment on its OWN line — .gitignore has no trailing-comment syntax,
 # so "pattern  # note" is one literal pattern and silently matches nothing.

@@ -67,6 +67,15 @@ user question + chat history + audience (undergrad | faculty | both)
                     the SYSTEM prompt, numbered together) + format_sources()
 ```
 
+**As of 2026-08-15, `vector_retrieve(query, audience)` above is one of two
+retrieval paths, not the only one.** `HYBRID_RETRIEVAL_ENABLED` (default off,
+**live/on in production**) swaps it for an additive entity-routed hybrid that
+fuses this same call with a dense search over chunk text directly and a
+sparse search scoped to a detected named entity — see §3b for the full
+mechanism, and the "Known issues" entry at the bottom for current rollout
+status. `chatbot.py` itself changed very little; almost all of the new logic
+lives in `backend/hybrid_retrieve.py`.
+
 **Audience (v2.2).** The corpus is split into two Chroma collections —
 `georgebot_v22_undergrad` and `georgebot_v22_faculty` — with disjoint
 topic-family vocabularies (student services vs. HR/governance/research-admin).
@@ -181,6 +190,7 @@ reading this first:
 ├── CLAUDE.md
 └── backend/
 │   ├── chatbot.py             # GeorgeBot engine — routing + retrieval + LLM pipeline (tune here)
+│   ├── hybrid_retrieve.py     # entity-routed hybrid vector retrieval, additive, HYBRID_RETRIEVAL_ENABLED (see §3b)
 │   ├── banner.py              # live class availability (UVic Banner 9 JSON): session + TTL cache + term resolution (BANNER_API.md)
 │   ├── rmp.py                 # RateMyProfessors ratings/reviews (unofficial GraphQL, UVic-scoped): TTL cache, best-effort. Student opinion, not official data
 │   ├── RMP_API.md             # RMP endpoint/auth/school-id/query research + the best-effort caveat
@@ -191,10 +201,11 @@ reading this first:
 │   ├── warmup.py              # hourly full-pipeline warm probes + per-phase timing heartbeat (see "Warm probes")
 │   ├── Dockerfile             # backend container build (Railway); multi-stage python:3.14-slim, CMD python api.py
 │   ├── .dockerignore          # excludes volume artifacts (chroma_db/graph_data/taxonomy), .env, pycache
-│   ├── requirements.txt       # serving deps only (openai, voyageai, chromadb, networkx, fastapi, uvicorn)
+│   ├── requirements.txt       # serving deps: openai, voyageai, chromadb, networkx, fastapi, uvicorn + pinned numpy/rank-bm25 (hybrid_retrieve.py only)
 │   ├── chroma_db/             # Chroma vector DB, collections georgebot_v22_undergrad + _faculty (gitignored — see Data below)
 │   ├── vector_taxonomy.json   # per-audience topic_families + shared department vocab, generated from pipeline taxonomy.yaml (gitignored)
-│   └── graph_data/            # course_graph.pkl, program_graph.pkl, heat_outlines.json (gitignored)
+│   ├── graph_data/            # course_graph.pkl, program_graph.pkl, heat_outlines.json (gitignored)
+│   └── hybrid_retrieve/       # chunk_embeddings/chunk_ids/bm25/chunk_metadata per audience (gitignored — see §3b + Data below)
 └── frontend/                  # React + Vite + TS chat UI (wired to the API)
     └── src/
         ├── App.tsx            # chat state; calls the backend, renders messages + sources
@@ -290,23 +301,34 @@ volume file API — so the seed goes over `railway ssh`:
 **Current production Volume state:** `georgebot-volume`, mounted at **`/data`**
 on the backend service, `DATA_DIR=/data` set. Holds v2.2 (`chroma_db/` two
 collections, `graph_data/{course_graph.pkl, program_graph.pkl,
-heat_outlines.json}`, `vector_taxonomy.json`), ~1.3 GB of a 5 GB volume — plus
+heat_outlines.json}`, `vector_taxonomy.json`), plus (since 2026-08-15)
+`hybrid_retrieve/` (chunk embeddings/ids/BM25/metadata per audience, ~100MB —
+see §3b for what's in it and why), ~1.4 GB of a 5 GB volume — plus
 `query_logs.db` (see Query logging below).
 
+`hybrid_retrieve/` was seeded as its **own**, separate tar via the identical
+procedure below (not merged into a combined re-seed of the other three) — it's
+an independent artifact set with its own reproduction source (the disposable
+test-suite repo that built and validated it, not `georgebot-pipeline` directly,
+though the raw chunk text it's built from does come from `georgebot-pipeline`'s
+v2.2 `d_step3` export).
+
 ⚠️ **`/data/query_logs.db` is the only NON-reproducible file on the Volume.**
-Everything else can be rebuilt from `georgebot-pipeline`; the query log cannot.
-A re-seed (step 3 above) must scope its `rm -rf` to the three artifact paths and
-never wipe `/data` wholesale. Copy it out (`railway ssh -- "cat
-/data/query_logs.db" > backup.db`) before any destructive volume work.
+Everything else can be rebuilt (`chroma_db`/`graph_data`/`vector_taxonomy.json`
+from `georgebot-pipeline`; `hybrid_retrieve/` from the chunk export, per §3b);
+the query log cannot. A re-seed (step 3 above) must scope its `rm -rf` to the
+specific artifact path(s) being replaced and never wipe `/data` wholesale. Copy
+it out (`railway ssh -- "cat /data/query_logs.db" > backup.db`) before any
+destructive volume work.
 
 **Pointing the code at the Volume (env vars — this landed 2026-07-14).**
 The artifact paths are no longer hardcoded. They resolve, in priority order:
 
-- `CHROMA_DIR` / `TAXONOMY_FILE` / `GRAPH_DATA_DIR` — per-artifact absolute
-  overrides; each wins over everything below when set.
-- `DATA_DIR` — common base for all three at once (the one-Volume case):
+- `CHROMA_DIR` / `TAXONOMY_FILE` / `GRAPH_DATA_DIR` / `HYBRID_DIR` —
+  per-artifact absolute overrides; each wins over everything below when set.
+- `DATA_DIR` — common base for all at once (the one-Volume case):
   `$DATA_DIR/chroma_db`, `$DATA_DIR/vector_taxonomy.json`,
-  `$DATA_DIR/graph_data`.
+  `$DATA_DIR/graph_data`, `$DATA_DIR/hybrid_retrieve`.
 - **Neither set** → the original `BASE_DIR`-relative defaults under
   `backend/` (local dev, unchanged).
 
@@ -337,7 +359,10 @@ three artifacts under it — no per-deploy code change.
   2026-07-15 — see "Data" section for how it was seeded and how to re-seed.
 - Backend env vars: `MINIMAX_SUB_KEY`, `VOYAGE_API_KEY`, `ADMIN_TOKEN` (gates
   `/api/admin/*` — the query log; **unset means the log is unreachable over
-  HTTP**, 503, never open). Railway also
+  HTTP**, 503, never open). `HYBRID_RETRIEVAL_ENABLED` (default off; **live/on**
+  in production as of 2026-08-15 — see §3b) gates the entity-routed hybrid
+  retrieval path; `HYBRID_DIR` overrides its Volume artifact path if ever
+  needed (defaults to `$DATA_DIR/hybrid_retrieve`). Railway also
   injects `PORT` automatically — `api.py`'s `main()` already reads
   `$PORT`/`$HOST` (default `0.0.0.0`) so no Railway-side config needed for
   that part; this was a real gap fixed on 2026-07-14 (originally hardcoded
@@ -889,6 +914,169 @@ taxonomy quality** — see `georgebot-pipeline`'s
 dedup history (46 raw families → 31) if you see a filtering-related miss
 after new corpus content lands.
 
+### 3b. Hybrid vector retrieval — `backend/hybrid_retrieve.py` (2026-08-15, `HYBRID_RETRIEVAL_ENABLED`)
+
+An **additive, flag-gated** alternative to plain `vector_retrieve()`, live in
+production as of 2026-08-15. Entirely new module — `chatbot.py` itself only
+gained a ~50-line diff (an import, one boot-time load, one call-site
+conditional, and an additive `named_entities` field on the router). Default
+**off**; requires `HYBRID_RETRIEVAL_ENABLED=1` *and* the artifacts below
+present on the Volume, or `GeorgeBot.__init__` fails loudly (missing-file
+message naming the specific artifact) rather than silently degrading — a
+production boot that quietly falls back to legacy retrieval on a missing
+file was judged a worse surprise than one that refuses to start.
+
+**Why this exists.** Offline testing (a separate, disposable test-suite repo,
+`Georgebot Testing/sparse-retrieval-test` — never committed here) found real
+cases where dense-on-reverse-HyDE-questions search (the only production
+signal until now) missed content that a different retrieval mechanism found
+cleanly: full pipeline test against 37 real logged questions (real
+`bot.answer()` calls) showed the new method feeding 252 total chunks vs. 234
+and citing 99 sources vs. 79, with the clearest wins on named-entity lookups
+(a facility like CARSA, a professor's name, an external institution like SFU)
+where `vector_retrieve()` sometimes returned **zero** chunks outright.
+
+**Mechanism — fuse up to three ranked chunk lists via Reciprocal Rank Fusion
+(`RRF_K=60`):**
+- **Arm A — dense-on-questions.** The *exact*, unmodified `vector_retrieve()`
+  call — byte-identical to today's sole production path. Deliberately called
+  as a black box rather than reimplemented against `_query_candidates`/
+  `_merge_collapse` directly, to guarantee zero drift risk on the
+  filtered/backfill logic (see the ⚠️ above this section — that's exactly the
+  class of subtle bug reimplementing it risked reintroducing).
+- **Arm C — dense-on-chunks.** Brute-force cosine search embedding the
+  **chunk text directly** (not reverse-HyDE questions), against an in-memory
+  numpy matrix (~12.5K chunk vectors, `voyage-4-large`, no Chroma/HNSW index
+  needed at this corpus size — sub-10ms). Same `MAX_CHUNK_DISTANCE=0.75`
+  cutoff as arm A, copied as a constant (can't import from `chatbot.py`,
+  which imports this module, not the reverse).
+- **Arm B — sparse-on-entity.** BM25 (`rank_bm25`), fired **only** when the
+  router detected a genuine named entity in `search_query`, and scoped to
+  **just the entity phrase** — never the full query. Full-query BM25 on
+  generic/common-word questions ("how do I apply for co-op", "what are
+  academic concessions") reliably drowned in lexical noise in testing (an
+  unrelated page sharing common words would outrank the real match); scoping
+  to the entity phrase alone is what makes sparse a clean win instead of a
+  liability. This is *why* arm B is conditional and arms A/C are not.
+- One extra Voyage call (`bot._embed_query(search_query)`, reused for arm C)
+  is the only added network round-trip — measured **~400-460ms** added to
+  `retrieve_with_route()` (two clean isolated comparisons: 566ms→1025ms,
+  519ms→919ms). No internal threading: arm A (network) dominates wall-clock,
+  arms B/C are cheap in-process work, and the whole request already runs
+  inside `api.py`'s bounded `_chat_executor` — nesting a second thread pool
+  here would risk starvation for no measurable benefit.
+- Fused, capped at **`TOP_K_FUSED=10`** (raised from an initial 7 — see
+  below).
+
+**Entity detection is folded into the existing router call, not a second LLM
+call.** `rewrite_and_route()`'s single MiniMax-M3 call gained one additive
+JSON field, `named_entities` — a tightened prompt with few-shot examples
+(CARSA/UVSS/person-names → entity; GPA/WE/N/CSC/ENGR and course-code prefixes
+→ NOT entity, even though capitalized) that only appears in the prompt when
+`HYBRID_RETRIEVAL_ENABLED` is true, so the prompt sent to MiniMax is
+byte-identical to today's whenever the flag is off — verified directly
+(`'agreement=N/M' not in SYSTEM_PROMPT`-style check, flag off). A second,
+serial classification call was considered and rejected specifically because
+it would add real latency (~0.5-2s based on observed MiniMax call times) on
+*every* turn including chit-chat; folding into the existing call costs
+nothing extra since it's the same network round-trip. **Downstream code must
+read `route.get("named_entities", [])`, never `route["named_entities"]`** —
+`rewrite_and_route`'s router-failure `except` branch returns a shorter,
+hardcoded fallback dict that omits this key (and always has, for every
+field); bracket indexing would turn a router hiccup into a crash instead of
+graceful degradation to arms A+C only. Verified directly: a route dict
+missing the key entirely does not crash `hybrid_vector_retrieve()`.
+
+**`TOP_K_FUSED` raised 7 → 10 (2026-08-15).** The original 7 matched
+`N_CONTEXT(4) + N_UNFILTERED_BACKFILL(3)` — one arm's worth. Once three arms
+compete for the same slots via RRF, 7 turned out tighter than intended: RRF
+scores by **rank within each list, not by similarity score**, so a chunk
+that's independently found by two arms (score summed across both) can
+mathematically outrank every one of arm A's individually-ranked chunks even
+though each of A's chunks legitimately passed its own distance cutoff —
+observed directly in testing (arm A contributed **zero** chunks to some
+final fused answers, e.g. the CARSA case, where it also independently
+returned zero on its own). 10 gives real room for multiple arms' distinct
+good chunks to coexist instead of pure zero-sum competition. Re-validate
+against the offline harness if this is tuned further — it hasn't been swept
+the way `N_CONTEXT` was (8→3→4).
+
+**`agreement=N/M` tag — a soft signal, deliberately not a trust hierarchy.**
+Each fused chunk is tagged with how many of the M arms that ran this turn (2
+without an entity, 3 with one) independently surfaced it — rendered by
+`_build_context()` alongside `source=`/`department=`/etc., absent entirely
+on legacy (non-hybrid) chunks. A method-based reliability hierarchy ("sparse
+is less accurate, trust dense-on-questions more") was considered and
+rejected: it doesn't match what testing actually found (arm B was the
+*cleanest, most surgically precise* arm when it fired — CARSA, professor
+names, zero noise, precisely because it's entity-gated; arm C was the mixed
+one, with both genuine precision wins and the regressions below), and it
+fights this codebase's own hard-won lesson (the `source=kuali`/`prereq_chain`
+class of bug — see §2 above) that a label telling the model to *trust*
+something instead of *judging its content* is exactly how wrong answers get
+shipped. The `_AGREEMENT_TAG_RULE` prompt bullet (gated the same way as
+`named_entities`, in `_ANSWER_RULES_HEAD`) frames it explicitly as
+non-authoritative: "a chunk multiple arms agree on can still be irrelevant,
+and a chunk only one arm found can still be exactly right."
+
+**Regressions found in the 37-question offline test, for context if oddities
+show up in the query log** — all five traced to arm C, none to arm B/entity
+routing: a campus-size answer citing two *different, unreconciled* acreage
+figures from different chunks (164 hectares vs. 200+ acres, no explanation
+of the discrepancy); a confused, visibly self-correcting sentence about an
+ambiguous department label ("the MA (Mediterranean Archaeology? — actually
+it's the Philosophy MA)"); and three cases where arm C's answer was thinner
+or less proactively helpful than arm A's (a CARSA equipment question missing
+the bookstore/physio-referral bonus info arm A had; a "when will campus
+reopen" answer that stopped offering likely interpretations; an N-grade
+answer that dropped adjacent N/X-vs-INC-vs-DEF context arm A included). One
+test question (id 21, a "What about WE?" follow-up) was **not** usable
+evidence either way — running it standalone without its original
+conversation history caused the live rewrite to misread "WE" as "Work
+Experience" (co-op) instead of "Withdrawal under Extenuating Circumstances",
+which broke both arms identically since they share one route.
+
+**Artifacts** — full corpus (12,587 chunks: 8,517 undergrad + 4,070 faculty),
+not samples, built once from `georgebot-pipeline`'s v2.2 `d_step3` chunk
+export, seeded onto the Volume 2026-08-15 via the same tar/stream/checksum/
+atomic-swap procedure documented under "Data" below for `chroma_db`:
+```
+$HYBRID_DIR/chunk_embeddings_{undergrad,faculty}.npy    # float32, 1024-d, voyage-4-large
+$HYBRID_DIR/chunk_ids_{undergrad,faculty}.json          # parallel array of chunk_id
+$HYBRID_DIR/bm25_{undergrad,faculty}.pkl                # prebuilt rank_bm25 BM25Okapi + chunk_ids
+$HYBRID_DIR/chunk_metadata_{undergrad,faculty}.jsonl    # chunk_id -> text/title/origin/source/document_type/department/topic_families
+```
+`HYBRID_DIR` defaults to `$DATA_DIR/hybrid_retrieve`, same per-artifact-
+override scheme as `CHROMA_DIR`/`TAXONOMY_FILE`. ~100MB total against the 5GB
+Volume (was ~1.2GB/5GB before this; plenty of headroom). **Deliberately not a
+second Chroma collection** — a full HNSW-indexed collection was estimated at
+200-300MB (extrapolating the existing collection's ~19.6KB/entry overhead,
+driven by 5x question-per-chunk duplication *and* per-entry SQLite/HNSW
+bookkeeping neither of which this design pays); at only 12,587 vectors,
+brute-force numpy cosine has no latency case for paying that overhead. BM25's
+query-time tokenizer (`hybrid_retrieve.bm25_tokenize`, course-code-aware) is
+copied byte-for-byte from the one used to *build* the pickles — must stay in
+sync or scores are meaningless against the indexed vocabulary, same
+"keep in sync" precedent as other tokenizer copies in this project's history.
+
+**`warmup.py` gained one probe** (`"hybrid-entity"`, forcing
+`named_entities=["CARSA"]` the same way other probes force `course_codes`/
+`wants_availability`) so the sparse-on-entity arm's health/timing is visible
+in the `[warm] ...` heartbeat rather than silently unexercised. Harmless
+no-op when the flag is off (`bot.hybrid is None`, falls through to legacy
+`vector_retrieve()`, `named_entities` simply ignored).
+
+**Known, deliberate scope boundary:** `api.py`'s default-mode targeted
+re-fetch (`_default_verified_events`, the `NEED_MORE` self-verify loop) calls
+`bot.vector_retrieve()` directly, bypassing `retrieve_with_route()` and this
+whole mechanism — a second call site, easy to miss. Left on legacy retrieval
+on purpose: it's a narrow self-correction path firing on a model-generated
+`need_more["search_query"]` that never went through `rewrite_and_route`, so
+there's no `named_entities` for it without adding a second entity-
+classification call specifically for that path (reintroducing the exact
+serial-latency cost the rest of this design avoids). Revisit once the
+primary path has proven stable in production.
+
 ### 4. Fetch + answer — `MiniMax-M3` (thinking disabled)
 - `_build_context()` numbers graph blocks first, then vector chunks
   (`source=webpage|document`, `type=<document_type>`,
@@ -962,6 +1150,15 @@ after new corpus content lands.
 | `LLM_MAX_TOKENS` | 4000 | route/rewrite budget |
 | `ANSWER_MAX_TOKENS` | 1500 | answer budget |
 | `MAX_HISTORY_TURNS` | 6 | trailing turns kept for rewrite + answer |
+
+**Hybrid retrieval constants (`backend/hybrid_retrieve.py`, only in effect when
+`HYBRID_RETRIEVAL_ENABLED=1` — see §3b):**
+
+| Const | Value | Effect |
+|---|---|---|
+| `TOP_K_FUSED` | 10 | max fused chunks reaching the answer model (raised from 7 once three arms started competing for the same slots) |
+| `RRF_K` | 60 | Reciprocal Rank Fusion constant |
+| `MAX_CHUNK_DISTANCE` | 0.75 | copied from `chatbot.py`'s constant of the same name, applied to arm C |
 
 ### System prompt (answer model) — behavioral contract
 
@@ -1145,6 +1342,13 @@ not in the answer text.
   *with* its sample size (few ratings = weak evidence), present it as opinion,
   and never fabricate a rating (say so if there's no listing; disambiguate a
   common surname). The prompt owns this contract on `thinking: "disabled"`.
+- `agreement=N/M` (hybrid retrieval only, `HYBRID_RETRIEVAL_ENABLED` — see
+  §3b) means N of M independent retrieval signals surfaced that chunk this
+  turn. Treat it as a mild extra signal, never a substitute for judging the
+  chunk's own content — a low- or no-agreement chunk can still be exactly
+  right, a high-agreement one can still be irrelevant. Gated the same way as
+  the router's `named_entities` field (§3b): this bullet is absent from the
+  prompt entirely when the flag is off, so it never affects default behavior.
 - If a program search returned multiple candidates, ask the user to
   clarify rather than guessing.
 - Concise, plain text (no LaTeX) — default mode. Quick mode replaces this
@@ -1155,6 +1359,22 @@ not in the answer text.
 
 ## Known issues / open items
 
+- ⚠️ **HYBRID RETRIEVAL IS LIVE IN PRODUCTION, RECENTLY FLIPPED ON, STILL IN A
+  MONITORED WINDOW (2026-08-15) — see §3b for the full mechanism.**
+  `HYBRID_RETRIEVAL_ENABLED=1` is set on the Railway backend service as of
+  today; the code was verified locally against the real prod pipeline (real
+  MiniMax/Voyage calls, not mocked) before deploy — flag-off byte-identical
+  parity, flag-on entity routing, router-failure fallback safety, audience
+  isolation, and a measured **~400-460ms** added latency on
+  `retrieve_with_route()` (one extra Voyage embed call) — but has not yet
+  accumulated real production traffic history. Watch `query_logs.db`'s
+  `latency_ms`/`n_sources`/`n_chunks` per turn and the `[warm] hybrid-entity
+  ...` heartbeat line for anything that diverges from the offline-validated
+  pattern (more chunks, more citations, no new regression classes beyond the
+  five documented in §3b). Rollback is a one-line env var flip (no code
+  revert) — confirm how this specific Railway project reacts to an env var
+  change (auto-restart vs. needing a manual trigger) if you haven't already,
+  since that's the actual rollback mechanism.
 - ⚠️ **THE PROGRAM GRAPH IS MISSING EVERY DOUBLE MAJOR — fix belongs in
   `georgebot-pipeline` (found 2026-08-04).** `program_graph.pkl` has **280
   programs and zero `Double Major` credentials.** It has `Bachelor of Science -

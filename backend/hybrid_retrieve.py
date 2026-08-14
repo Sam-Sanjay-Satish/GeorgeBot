@@ -48,15 +48,19 @@ HYBRID_RETRIEVAL_ENABLED = os.getenv("HYBRID_RETRIEVAL_ENABLED", "0").lower() no
 
 AUDIENCES = ("undergrad", "faculty")
 
-# Kept in sync with chatbot.py's constants of the same name (can't import
-# them directly -- chatbot.py imports this module, not the other way
-# around). TOP_K_FUSED matches chatbot.py's N_CONTEXT(4) + N_UNFILTERED_
-# BACKFILL(3) exactly, so context length / answer-LLM token cost is
-# unchanged by adding this path. MAX_CHUNK_DISTANCE matches chatbot.py's
-# vector_retrieve() cutoff, applied here to the dense-on-chunks arm for
-# the same reason it's applied there: don't force in a genuinely
-# off-topic chunk just to hit a count.
-TOP_K_FUSED = 7
+# TOP_K_FUSED was originally set to 7 to match chatbot.py's N_CONTEXT(4) +
+# N_UNFILTERED_BACKFILL(3) budget exactly (one retrieval arm's worth). Raised
+# to 10 once three arms started competing for the same slots via RRF: a
+# chunk that passed arm A's own distance cutoff can still be pushed out
+# entirely by two other arms agreeing on different chunks (observed in
+# testing -- arm A contributed zero chunks to some final answers). 10 gives
+# real room for multiple arms' distinct good chunks to coexist instead of
+# pure zero-sum competition, at the cost of a somewhat larger answer-LLM
+# context (worth re-validating against the offline harness periodically).
+# MAX_CHUNK_DISTANCE matches chatbot.py's vector_retrieve() cutoff, applied
+# here to the dense-on-chunks arm for the same reason it's applied there:
+# don't force in a genuinely off-topic chunk just to hit a count.
+TOP_K_FUSED = 10
 MAX_CHUNK_DISTANCE = 0.75
 RRF_K = 60
 
@@ -191,20 +195,28 @@ def sparse_entity_search(index: HybridIndex, entity_query: str, audience: str, k
     return [cid for cid, _ in cands[:k]]
 
 
-def _resolve_chunk(cid: str, a_chunks_by_id: dict[str, dict], metadata: dict[str, dict]) -> dict | None:
+def _resolve_chunk(cid: str, a_chunks_by_id: dict[str, dict], metadata: dict[str, dict],
+                   agreement: int, total_arms: int) -> dict | None:
     """Reconstruct the {chunk_id, text, metadata} shape `_build_context`/
-    `format_sources` already expect, reusing an arm-A chunk dict directly
-    when available (byte-identical to what vector_retrieve() would have
-    produced) and falling back to the hybrid metadata lookup otherwise."""
+    `format_sources` already expect, reusing an arm-A chunk's text/base
+    metadata directly when available (byte-identical content to what
+    vector_retrieve() would have produced) and falling back to the hybrid
+    metadata lookup otherwise. Always returns a FRESH dict (never mutates
+    the one vector_retrieve() returned) with an `agreement` field added --
+    "N of M retrieval arms independently surfaced this chunk this turn",
+    read by _build_context()'s `agreement=N/M` tag. A chunk found only by
+    arm A still gets agreement=1/M -- the tag is written uniformly by
+    whichever arm(s) actually found the chunk, not just for multi-arm hits.
+    """
     if cid in a_chunks_by_id:
-        return a_chunks_by_id[cid]
-    rec = metadata.get(cid)
-    if not rec:
-        return None
-    return {
-        "chunk_id": cid,
-        "text": rec.get("text", ""),
-        "metadata": {
+        base = a_chunks_by_id[cid]
+        text, meta = base.get("text", ""), dict(base.get("metadata") or {})
+    else:
+        rec = metadata.get(cid)
+        if not rec:
+            return None
+        text = rec.get("text", "")
+        meta = {
             "chunk_id": cid,
             "doc_id": rec.get("doc_id", ""),
             "origin": rec.get("origin", ""),
@@ -213,8 +225,9 @@ def _resolve_chunk(cid: str, a_chunks_by_id: dict[str, dict], metadata: dict[str
             "document_type": rec.get("document_type", ""),
             "department": rec.get("department", ""),
             "topic_families": " | ".join(rec.get("topic_families") or []),
-        },
-    }
+        }
+    meta["agreement"] = f"{agreement}/{total_arms}"
+    return {"chunk_id": cid, "text": text, "metadata": meta}
 
 
 def retrieve(bot, route: dict, audience: str, index: HybridIndex) -> list[dict]:
@@ -252,9 +265,14 @@ def retrieve(bot, route: dict, audience: str, index: HybridIndex) -> list[dict]:
         lists.append(b_ranked)
 
     fused_ids = rrf(lists)[:TOP_K_FUSED]
+    total_arms = len(lists)
+    agreement_counts = {
+        cid: sum(1 for ranked in lists if cid in ranked) for cid in fused_ids
+    }
     out = []
     for cid in fused_ids:
-        ch = _resolve_chunk(cid, a_chunks_by_id, index.metadata)
+        ch = _resolve_chunk(cid, a_chunks_by_id, index.metadata,
+                            agreement_counts[cid], total_arms)
         if ch:
             out.append(ch)
     return out

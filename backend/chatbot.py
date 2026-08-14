@@ -263,6 +263,28 @@ MAX_CHUNK_DISTANCE = 0.75  # cosine distance cutoff (voyage-4-large) — chunks
                             # that class of case)
 MAX_HISTORY_TURNS = 6   # trailing conversation turns kept for context
 
+# Gated the same way as rewrite_and_route's named_entities prompt field
+# (chatbot.py, "hybrid retrieval" changes): SYSTEM_PROMPT is a class-level
+# constant built once at import time, and hybrid_retrieve.HYBRID_RETRIEVAL_ENABLED
+# is already resolved by then (hybrid_retrieve is imported above), so this is
+# just as byte-identical-when-off as the router prompt change. Framed as a
+# SOFT signal on purpose, not a trust hierarchy by retrieval method — see the
+# design discussion this replaced: a chunk found by only one arm can still be
+# exactly right, and a chunk multiple arms agree on can still be irrelevant,
+# so the rule tells the model to keep judging content first.
+_AGREEMENT_TAG_RULE = (
+    "- Some vector-search chunks carry an `agreement=N/M` tag, meaning N of M "
+    "independent retrieval signals used this turn (a reverse-HyDE "
+    "question-similarity search, a direct chunk-text similarity search, and — "
+    "only when a specific named entity was detected — a keyword search) "
+    "independently surfaced that chunk. Treat higher agreement as a mild "
+    "extra signal that a chunk is on-topic, never as a substitute for judging "
+    "it — a chunk multiple signals agree on can still be irrelevant, and a "
+    "chunk only one signal found (or with no tag at all) can still be exactly "
+    "right. Judge every chunk primarily by whether its own content actually "
+    "answers the question.\n"
+) if hybrid_retrieve.HYBRID_RETRIEVAL_ENABLED else ""
+
 # Router-output hard bounds (2026-08-01, audit issue 4 — outbound amplification).
 # course_codes / completed_courses / the name queries come from the LLM router at
 # whatever length the model emits. Each course code fans out into ~10 live Banner
@@ -1494,6 +1516,11 @@ class GeorgeBot:
                 tags.append(f"department={meta['department']}")
             if meta.get("topic_families"):
                 tags.append(f"topics={meta['topic_families']}")
+            if meta.get("agreement"):
+                # Only present on hybrid-retrieval chunks (HYBRID_RETRIEVAL_ENABLED) --
+                # "N of M retrieval arms independently surfaced this chunk". See the
+                # AGREEMENT rule in _ANSWER_RULES_HEAD for how the model should read it.
+                tags.append(f"agreement={meta['agreement']}")
             header = f"[{i}] {' | '.join(tags)}\nURL: {meta.get('origin', 'n/a')}"
             blocks.append(f"{header}\n{ch.get('text', '')}")
         text = "\n\n".join(blocks)
@@ -1609,6 +1636,7 @@ class GeorgeBot:
         "themes of the written reviews, but don't present one student's take as "
         "the consensus. If a name was ambiguous, ask which professor they mean; if "
         "there's no RMP listing, say so plainly and never fabricate a rating.\n"
+        f"{_AGREEMENT_TAG_RULE}"
         "- Course outlines tagged HISTORICAL are past-term snapshots only. When "
         "you rely on one, always name the specific term, and never present "
         "historical grading weights, instructors, or schedules as current — for "
