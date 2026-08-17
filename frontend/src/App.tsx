@@ -6,6 +6,7 @@ import { ExtendedThinkingToggle } from './components/ExtendedThinkingToggle'
 import { ThemeToggle } from './components/ThemeToggle'
 import { DisclaimerPage } from './components/DisclaimerPage'
 import { AccountMenu } from './components/AccountMenu'
+import { ConfirmDialog } from './components/ConfirmDialog'
 import { askGeorgeStream } from './lib/api'
 import type { Audience, Message, Source, Theme, ThinkingMode } from './types'
 
@@ -22,6 +23,7 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)
   const [audience, setAudience] = useState<Audience>('undergrad')
+  const [confirmNewChat, setConfirmNewChat] = useState(false)
   const [thinkingMode, setThinkingMode] = useState<ThinkingMode>('default')
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = localStorage.getItem('theme')
@@ -44,6 +46,20 @@ export default function App() {
   // A finger is currently on the list. Writing scrollTop mid-drag cancels
   // Android's touch scroll outright, so auto-scroll stands down while true.
   const touchingRef = useRef(false)
+  // Bumped by every reset. A stream in flight when the conversation is cleared
+  // can't be cancelled (askGeorgeStream takes no abort signal), so its handlers
+  // compare their captured generation against this and go quiet instead —
+  // otherwise a discarded answer's finish() would re-enable the input in the
+  // middle of whatever the user asked next.
+  const streamGenRef = useRef(0)
+
+  // Clear the conversation back to the empty (post-disclaimer) home state.
+  function resetChat() {
+    streamGenRef.current += 1
+    setMessages([])
+    setLoading(false)
+    followRef.current = true
+  }
 
   function handleWheel(e: React.WheelEvent) {
     if (e.deltaY < 0) followRef.current = false // scrolling up = stop following
@@ -112,6 +128,11 @@ export default function App() {
     setMessages((prev) => [...prev, userMsg, loadingMsg])
     setLoading(true)
 
+    // If the chat is reset while this stream is running, its message is gone and
+    // nothing it reports should touch the UI any more (see streamGenRef).
+    const gen = streamGenRef.current
+    const stale = () => streamGenRef.current !== gen
+
     // `revealed` is what's on screen; `pending` is arrived-but-not-yet-shown
     // text, drained onto `revealed` at a fixed pace by the interval below.
     let revealed = ''
@@ -124,6 +145,7 @@ export default function App() {
     let bufferedSources: Source[] | null = null
 
     function updateContent() {
+      if (stale()) return
       setMessages((prev) =>
         prev.map((m) =>
           m.id === loadingId ? { ...m, loading: false, content: revealed } : m
@@ -138,6 +160,7 @@ export default function App() {
         clearInterval(flushTimer)
         flushTimer = null
       }
+      if (stale()) return
       setMessages((prev) =>
         prev.map((m) =>
           m.id === loadingId
@@ -196,6 +219,7 @@ export default function App() {
               clearInterval(flushTimer)
               flushTimer = null
             }
+            if (stale()) return
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === loadingId
@@ -214,6 +238,7 @@ export default function App() {
         },
       }, thinkingMode)
     } catch (err) {
+      if (stale()) return
       setMessages((prev) =>
         prev.map((m) =>
           m.id === loadingId
@@ -244,18 +269,29 @@ export default function App() {
     <div className="flex flex-col h-dvh bg-background overflow-hidden">
       {/* Header */}
       <header className="border-b border-border px-6 py-4 flex items-center gap-3 shrink-0">
-        <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-primary-foreground font-bold text-sm">
-          G
-        </div>
-        <div className="flex-1">
-          <h1 className="text-base font-semibold leading-none">GeorgeBot</h1>
-          <p className="text-xs text-muted-foreground mt-0.5">UVic AI Assistant</p>
-        </div>
+        {/* Logo doubles as "home": returns to the empty question page, after
+            confirming, since it throws away the visible conversation. Inert
+            when there's nothing to lose. */}
+        <button
+          onClick={() => { if (!empty) setConfirmNewChat(true) }}
+          disabled={empty}
+          aria-label="Start a new chat"
+          className="flex items-center gap-3 rounded-lg -m-1 p-1 text-left enabled:hover:opacity-80 transition-opacity disabled:cursor-default"
+        >
+          <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-primary-foreground font-bold text-sm shrink-0">
+            G
+          </div>
+          <div>
+            <h1 className="text-base font-semibold leading-none">GeorgeBot</h1>
+            <p className="text-xs text-muted-foreground mt-0.5">UVic AI Assistant</p>
+          </div>
+        </button>
+        <div className="flex-1" />
         <ThemeToggle theme={theme} onToggle={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))} />
         <AccountMenu
           onReset={() => {
             setAcknowledged(false)
-            setMessages([])
+            resetChat()
           }}
         />
       </header>
@@ -320,6 +356,19 @@ export default function App() {
 
       {/* Balances the message area above, centering the composer while empty. */}
       {empty && <div className="flex-1 min-h-0" aria-hidden />}
+
+      <ConfirmDialog
+        open={confirmNewChat}
+        title="Start a new chat?"
+        description="This clears the current conversation. It isn't saved, so you won't be able to get it back."
+        confirmLabel="Start new chat"
+        cancelLabel="Keep chatting"
+        onConfirm={() => {
+          setConfirmNewChat(false)
+          resetChat()
+        }}
+        onCancel={() => setConfirmNewChat(false)}
+      />
     </div>
   )
 }
