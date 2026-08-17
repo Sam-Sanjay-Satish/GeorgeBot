@@ -40,6 +40,17 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+# The constants below are read at IMPORT time, and `chatbot.py` imports this
+# module before it calls `load_dotenv()` (inside `GeorgeBot.__init__`) -- so
+# without this, HYBRID_RETRIEVAL_ENABLED/HYBRID_DIR set in a local .env were
+# silently ignored and local dev always ran the legacy retrieval path while
+# production (real env vars, set on Railway) ran hybrid. No effect in
+# production: load_dotenv() is a no-op when there is no .env file, and it
+# never overrides an env var that is already set.
+from dotenv import load_dotenv
+
+load_dotenv()
+
 BASE_DIR = Path(__file__).parent
 _DATA_DIR = Path(os.environ["DATA_DIR"]) if os.getenv("DATA_DIR") else BASE_DIR
 HYBRID_DIR = Path(os.getenv("HYBRID_DIR", _DATA_DIR / "hybrid_retrieve"))

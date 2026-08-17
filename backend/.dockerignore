@@ -2,6 +2,7 @@
 chroma_db/
 graph_data/
 vector_taxonomy.json
+hybrid_retrieve/
 
 # Query log — prod's lives on the Volume; never bake a local one into the image
 query_logs.db*

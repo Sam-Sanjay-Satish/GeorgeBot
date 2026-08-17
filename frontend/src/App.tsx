@@ -31,21 +31,48 @@ export default function App() {
   const bottomRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   // Whether we keep the view stuck to the bottom as new content streams in.
-  // An upward wheel/scroll turns this off *immediately* (intent), and it only
+  // Any upward movement turns this off *immediately* (intent), and it only
   // turns back on once the user returns to the very bottom — otherwise the
-  // 16ms re-snap traps them, since a single wheel notch is smaller than any
-  // position threshold and gets snapped back before it registers.
+  // 16ms re-snap traps them, since a single wheel notch or short drag is
+  // smaller than any position threshold and gets snapped back before it
+  // registers.
   const followRef = useRef(true)
+  // Last scroll position we've seen, so `handleScroll` can tell direction.
+  // The auto-scroll effect writes this too, so its own (downward) jump is
+  // never mistaken for the user moving.
+  const lastTopRef = useRef(0)
+  // A finger is currently on the list. Writing scrollTop mid-drag cancels
+  // Android's touch scroll outright, so auto-scroll stands down while true.
+  const touchingRef = useRef(false)
 
   function handleWheel(e: React.WheelEvent) {
     if (e.deltaY < 0) followRef.current = false // scrolling up = stop following
   }
 
+  function handleTouchStart() {
+    touchingRef.current = true
+  }
+
+  function handleTouchEnd() {
+    touchingRef.current = false
+  }
+
   function handleScroll() {
     const el = scrollRef.current
     if (!el) return
-    const dist = el.scrollHeight - el.scrollTop - el.clientHeight
-    if (dist < 4) followRef.current = true // returned to the bottom → resume
+    const top = el.scrollTop
+    const prevTop = lastTopRef.current
+    lastTopRef.current = top
+    const dist = el.scrollHeight - top - el.clientHeight
+    if (dist < 4) {
+      followRef.current = true // returned to the bottom → resume
+      return
+    }
+    // Touch scrolling fires no wheel event, so direction has to come from the
+    // scroll position itself — without this, a short upward drag on Android
+    // left `dist` under the 120px threshold and got re-snapped to the bottom
+    // every ~16ms, making the answer impossible to scroll back through.
+    if (top < prevTop - 1) followRef.current = false
     else if (dist > 120) followRef.current = false // clearly scrolled away (scrollbar/keys)
   }
 
@@ -55,8 +82,9 @@ export default function App() {
     // bottom even after the user scrolls up, fighting them. A direct scrollTop
     // set has no in-flight animation to fight.
     const el = scrollRef.current
-    if (el && followRef.current) {
+    if (el && followRef.current && !touchingRef.current) {
       el.scrollTop = el.scrollHeight
+      lastTopRef.current = el.scrollTop
     }
   }, [messages])
 
@@ -207,8 +235,13 @@ export default function App() {
     return <DisclaimerPage onContinue={() => setAcknowledged(true)} />
   }
 
+  // No conversation yet → the composer is the hero: centered in the viewport
+  // with the greeting sitting directly above it, rather than pinned to the
+  // bottom edge of an empty page.
+  const empty = messages.length === 0
+
   return (
-    <div className="flex flex-col h-screen bg-background overflow-hidden">
+    <div className="flex flex-col h-dvh bg-background overflow-hidden">
       {/* Header */}
       <header className="border-b border-border px-6 py-4 flex items-center gap-3 shrink-0">
         <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-primary-foreground font-bold text-sm">
@@ -228,13 +261,23 @@ export default function App() {
       </header>
 
       {/* Messages */}
-      <div ref={scrollRef} onScroll={handleScroll} onWheel={handleWheel} className="flex-1 overflow-y-auto px-4 py-6">
-        {messages.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-center gap-3 text-muted-foreground pt-24">
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        onWheel={handleWheel}
+        onTouchStart={handleTouchStart}
+        onTouchEnd={handleTouchEnd}
+        onTouchCancel={handleTouchEnd}
+        className="flex-1 overflow-y-auto overscroll-contain px-4 py-6"
+      >
+        {empty ? (
+          // Bottom-aligned so the greeting hugs the composer below it; the
+          // spacer after the composer is what lifts the pair to the middle.
+          <div className="flex flex-col items-center justify-end h-full text-center gap-3 text-muted-foreground pb-8">
             <div className="w-14 h-14 rounded-full bg-muted flex items-center justify-center text-2xl font-bold text-foreground">
               G
             </div>
-            <p className="text-base font-medium text-foreground">Ask GeorgeBot anything about UVic</p>
+            <p className="text-lg font-medium text-foreground">Ask GeorgeBot anything about UVic</p>
             <p className="text-sm max-w-xs">
               Courses, registration, campus life, and anything else — all sourced from uvic.ca.
             </p>
@@ -249,8 +292,16 @@ export default function App() {
         )}
       </div>
 
-      {/* Input */}
-      <div className="border-t border-border px-4 py-4 shrink-0">
+      {/* Input — same element in both layouts (and at the same child index, so
+          the trailing spacer appearing/disappearing never remounts ChatInput
+          and drops focus on the first send). */}
+      {/* `mb-24` while empty pulls the textbox up to look centered on the
+          *screen*, not just within the area under the header. Equal flex
+          spacers alone leave it sitting low twice over: the header eats ~65px
+          off the top of the viewport, and inside this block the textbox has
+          the toggles above it but only the thin disclaimer below. Bottom
+          margin shifts the block up by half its value, correcting both. */}
+      <div className={`px-4 py-4 shrink-0 ${empty ? 'mb-24' : 'border-t border-border'}`}>
         <div className="max-w-2xl mx-auto">
           <div className="mb-4 flex flex-wrap items-center justify-center gap-2">
             <AudienceToggle value={audience} onChange={setAudience} disabled={loading} />
@@ -266,6 +317,9 @@ export default function App() {
           </p>
         </div>
       </div>
+
+      {/* Balances the message area above, centering the composer while empty. */}
+      {empty && <div className="flex-1 min-h-0" aria-hidden />}
     </div>
   )
 }

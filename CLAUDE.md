@@ -200,12 +200,12 @@ reading this first:
 │   ├── admin_page.py          # the /admin query-log viewer, one self-contained HTML string (no build step)
 │   ├── warmup.py              # hourly full-pipeline warm probes + per-phase timing heartbeat (see "Warm probes")
 │   ├── Dockerfile             # backend container build (Railway); multi-stage python:3.14-slim, CMD python api.py
-│   ├── .dockerignore          # excludes volume artifacts (chroma_db/graph_data/taxonomy), .env, pycache
+│   ├── .dockerignore          # excludes volume artifacts (chroma_db/graph_data/taxonomy/hybrid_retrieve), .env, pycache
 │   ├── requirements.txt       # serving deps: openai, voyageai, chromadb, networkx, fastapi, uvicorn + pinned numpy/rank-bm25 (hybrid_retrieve.py only)
 │   ├── chroma_db/             # Chroma vector DB, collections georgebot_v22_undergrad + _faculty (gitignored — see Data below)
 │   ├── vector_taxonomy.json   # per-audience topic_families + shared department vocab, generated from pipeline taxonomy.yaml (gitignored)
 │   ├── graph_data/            # course_graph.pkl, program_graph.pkl, heat_outlines.json (gitignored)
-│   └── hybrid_retrieve/       # chunk_embeddings/chunk_ids/bm25/chunk_metadata per audience (gitignored — see §3b + Data below)
+│   └── hybrid_retrieve/       # chunk_embeddings/chunk_ids/bm25/chunk_metadata per audience (gitignored, present locally since 2026-08-17 — see §3b + Data below)
 └── frontend/                  # React + Vite + TS chat UI (wired to the API)
     └── src/
         ├── App.tsx            # chat state; calls the backend, renders messages + sources
@@ -271,6 +271,9 @@ via a **Railway Volume**, not a git commit:
      rule must match `f_embed/embed.py`. Verify generated slugs equal the
      `tf_*` keys actually present in each collection before trusting the
      filter.
+   - `hybrid_retrieve/` does **not** come from `georgebot-pipeline` — see
+     the local-copy note in §3b. It was copied into `backend/hybrid_retrieve/`
+     on 2026-08-17 from the test repo's `prod_artifacts_staging/`.
 3. **Separately**, push the same data into the Railway Volume mounted on
    the backend service in production — copying locally does **not**
    propagate to Railway by itself.
@@ -1047,9 +1050,35 @@ $HYBRID_DIR/bm25_{undergrad,faculty}.pkl                # prebuilt rank_bm25 BM2
 $HYBRID_DIR/chunk_metadata_{undergrad,faculty}.jsonl    # chunk_id -> text/title/origin/source/document_type/department/topic_families
 ```
 `HYBRID_DIR` defaults to `$DATA_DIR/hybrid_retrieve`, same per-artifact-
-override scheme as `CHROMA_DIR`/`TAXONOMY_FILE`. ~100MB total against the 5GB
-Volume (was ~1.2GB/5GB before this; plenty of headroom). **Deliberately not a
-second Chroma collection** — a full HNSW-indexed collection was estimated at
+override scheme as `CHROMA_DIR`/`TAXONOMY_FILE` — and with no `DATA_DIR` set
+(local dev) that falls back to `backend/hybrid_retrieve/`.
+
+**Local dev copy (2026-08-17).** All 8 artifacts now live in
+`backend/hybrid_retrieve/` (~99MB), sha256-identical to the
+`prod_artifacts_staging/` copies in the `Georgebot Testing/sparse-retrieval-test`
+repo that produced them — which is also what the Railway Volume was seeded from,
+so local and prod are the same bytes. Three things make this safe to keep in the
+working tree, and all three must stay true:
+- `.gitignore` already carried `backend/hybrid_retrieve/`; the trailing slash
+  scopes it to the **directory**, so the tracked `backend/hybrid_retrieve.py`
+  module is unaffected. Don't drop the slash.
+- `backend/.dockerignore` needed `hybrid_retrieve/` **added** — it wasn't there,
+  and without it the folder would ride into every Railway build context (+99MB
+  for files the Volume supplies at runtime anyway). Verified by a real build that
+  the pattern excludes the directory while still shipping `hybrid_retrieve.py`.
+- The local `.env` used to set `HYBRID_DIR` to the testing folder's absolute
+  path as a workaround. That override is **removed** — the default now resolves
+  correctly. `HYBRID_RETRIEVAL_ENABLED=1` stays, to match prod.
+
+The **build scripts were deliberately not vendored** — they remain in the test
+repo, keeping this repo serve-only per the boundary at the top of this file. The
+tradeoff is unchanged from the ⚠️ under "Data": `hybrid_retrieve/` is reproducible
+only from a repo that was never committed, so **these local files are now the most
+accessible copy of that artifact set** and shouldn't be deleted casually.
+
+The artifact set is ~100MB total against the 5GB Volume (was ~1.2GB/5GB before
+this; plenty of headroom). **Deliberately not a second Chroma collection** — a
+full HNSW-indexed collection was estimated at
 200-300MB (extrapolating the existing collection's ~19.6KB/entry overhead,
 driven by 5x question-per-chunk duplication *and* per-entry SQLite/HNSW
 bookkeeping neither of which this design pays); at only 12,587 vectors,
