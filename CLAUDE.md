@@ -26,7 +26,7 @@ relative to *this* repo's root.
 ```
 user question + chat history + audience (undergrad | faculty | both)
    │
-   ├─ rewrite_and_route(…, audience)  → MiniMax-M3 (official API, thinking DISABLED)
+   ├─ rewrite_and_route(…, audience)  → deepseek-flash (official API, thinking DISABLED)
    │                          (ONE call: standalone search query +
    │                          course_codes[] + program_query + wants_outline
    │                          + wants_availability + instructor_query
@@ -62,7 +62,7 @@ user question + chat history + audience (undergrad | faculty | both)
    │        → merged by distance across collections → collapse by chunk_id →
    │          up to N_CONTEXT=4 distinct chunks (full text)
    │
-   └─ answer()  → MiniMax-M3 (official API, thinking DISABLED)
+   └─ answer()  → deepseek-flash (official API, thinking DISABLED)
                   → answer from graph + banner + rmp + vector blocks (supplied via
                     the SYSTEM prompt, numbered together) + format_sources()
 ```
@@ -114,11 +114,42 @@ Everything lives in **one engine class**, `GeorgeBot`, in `backend/chatbot.py`.
 
 **No BM25.** The index is dense-only (reverse-HyDE question embeddings).
 
-**Single LLM provider — the official MiniMax API**, `MiniMax-M3` via
-`https://api.minimax.io/v1` (OpenAI-compatible SDK, `MINIMAX_SUB_KEY`).
-Replaced an earlier Kesar-router/Chinese-API-answer split — there is **no
-cross-provider fallback** anymore. Every call sets
-`extra_body={"reasoning_split": True, "thinking": {"type": ...}}`:
+**Single LLM provider — the official DeepSeek API**, `deepseek-flash`
+(DeepSeek-V4.1-Flash) via `https://api.deepseek.com` (OpenAI-compatible SDK,
+`DEEPSEEK_API_KEY`). **Switched from MiniMax-M3 on 2026-09-26**, when the
+MiniMax account ran out of credits. There is still **no cross-provider
+fallback**. The code keeps MiniMax's two thinking modes, and
+`_thinking_kwargs()` maps them to DeepSeek params: `"disabled"` →
+`extra_body={"thinking": {"type": "disabled"}}`; `"adaptive"` (only the
+default-mode verify call) → thinking enabled at `reasoning_effort=
+ADAPTIVE_REASONING_EFFORT` (`"low"`). DeepSeek counts reasoning against
+`max_tokens`, like MiniMax did.
+
+- **Why flash over `deepseek-v4-pro`:** both were run through the real
+  default-mode pipeline on the 40-query golden set
+  (`georgebot-pipeline` `v2/reverse-hyde-validation/golden_queries.json`).
+  Quality was close (no clear factual errors from either); flash was ~2x
+  faster (median 6.6s vs 13.0s end-to-end, pro p90 25s with a 52s outlier
+  against the 75s `CHAT_TIMEOUT_SECONDS`) and ~4x cheaper (~$4.40 vs ~$18.70
+  per 1k turns at peak rates). Flash answers run longer (~2.1k vs ~1.2k chars).
+- **`api.deepseek.com` is blocked on UVic campus wifi** (a firewall resets the
+  TLS handshake by hostname, so a DNS/`/etc/hosts` workaround doesn't help).
+  Local runs from campus fail every LLM call; use a hotspot, or run on Railway
+  (`railway ssh`), which is unaffected. Production traffic never crosses the
+  campus network, since the backend makes the call.
+- **Prompt fixes made during the switch (2026-09-26).** The prompts were tuned
+  on MiniMax, and flash broke three of their output contracts on the golden
+  set. All three were fixed in the prompt, not in code:
+  (a) it copied the backticks the prompt wrapped around `<<SUFFICIENT>>` and
+  put answer text on the same line, so the header parse failed and the marker
+  reached the user; the backticks are gone from every machine-read tag, and
+  `VERIFY_ANSWER_ADDENDUM` now says the header line is exact characters only.
+  (b) it wrote internal `[n]` block numbers into the answer and talked about
+  its own lookup ("what I can see", "the search also surfaced"); the head's
+  USING THE REFERENCE MATERIAL section now requires attributing facts to UVic
+  and forbids `[n]` in answer text. (c) pro once omitted the
+  `<<CITED_SOURCES>>` tag, hiding sources; `_CITED_SOURCES_RULES` now says
+  every answer needs it, including short "go to this page" ones.
 
 - **Route/rewrite: `thinking: "disabled"`** — mechanical classification,
   ~90x faster per a measured MiniMax finding, and doesn't need reasoning.
@@ -135,8 +166,8 @@ cross-provider fallback** anymore. Every call sets
   vs disabled ~4.8s). **If you see retrieval-internals leakage return,
   fix the prompt — do not silently flip back to adaptive without re-reading
   that section.**
-- `reasoning_split` keeps `<think>...</think>` text out of visible `content`
-  (reasoning lands in a separate `reasoning_content` field we never read).
+- DeepSeek returns reasoning in a separate `reasoning_content` field we never
+  read (MiniMax needed `reasoning_split: True` for this, and still leaked).
   With the answer step now on `thinking: "disabled"` there should be no
   reasoning at all, but `_call_llm` (regex) and `answer_stream`
   (`_iter_visible_deltas`, a streaming tag-stripper) both still strip any
@@ -360,7 +391,7 @@ three artifacts under it — no per-deploy code change.
 - Backend service has a **Volume** (`georgebot-volume`) mounted at **`/data`**
   holding the three artifacts, with `DATA_DIR=/data` set. Live as of
   2026-07-15 — see "Data" section for how it was seeded and how to re-seed.
-- Backend env vars: `MINIMAX_SUB_KEY`, `VOYAGE_API_KEY`, `ADMIN_TOKEN` (gates
+- Backend env vars: `DEEPSEEK_API_KEY`, `VOYAGE_API_KEY`, `ADMIN_TOKEN` (gates
   `/api/admin/*` — the query log; **unset means the log is unreachable over
   HTTP**, 503, never open). `HYBRID_RETRIEVAL_ENABLED` (default off; **live/on**
   in production as of 2026-08-15 — see §3b) gates the entity-routed hybrid
@@ -407,7 +438,7 @@ three artifacts under it — no per-deploy code change.
 - **Venv:** not yet set up in this repo standalone — currently tested by
   reusing `georgebot-pipeline`'s `venv/`. Worth creating this repo's own
   venv + lockfile before it's truly independent of the pipeline repo.
-- **.env** (this repo's root, gitignored): `MINIMAX_SUB_KEY`, `VOYAGE_API_KEY`
+- **.env** (this repo's root, gitignored): `DEEPSEEK_API_KEY`, `VOYAGE_API_KEY`
   (plus optionally `ADMIN_TOKEN` to try `/admin` locally) — this repo does
   **not** use `KESAR_API_KEY`/`CHINESE_API_KEY` (that
   provider split was retired; see the "Single LLM provider" section above).
@@ -523,7 +554,7 @@ no new dependencies.
 
 ## Retrieval Pipeline — Full Detail (tune here)
 
-### 1. Query rewrite + route — `MiniMax-M3` (thinking disabled)
+### 1. Query rewrite + route — `deepseek-flash` (thinking disabled)
 `rewrite_and_route(question, history, audience)` is **one** call that returns
 JSON: `search_query`, `course_codes` (normalized, no space — `"CSC 225"` →
 `"CSC225"`), `program_query`, `wants_outline`, `wants_availability`, `instructor_query`
@@ -1106,7 +1137,7 @@ classification call specifically for that path (reintroducing the exact
 serial-latency cost the rest of this design avoids). Revisit once the
 primary path has proven stable in production.
 
-### 4. Fetch + answer — `MiniMax-M3` (thinking disabled)
+### 4. Fetch + answer — `deepseek-flash` (thinking disabled)
 - `_build_context()` numbers graph blocks first, then vector chunks
   (`source=webpage|document`, `type=<document_type>`,
   `department=<department>`, `topics=<pipe-joined topic_families>`) + URL
@@ -1116,7 +1147,7 @@ primary path has proven stable in production.
   "SYSTEM-SUPPLIED REFERENCE MATERIAL (the user didn't write or see this)"
   delimiters, and `_answer_messages()` puts only the question in the user
   turn. This is what stops the model treating the material as user-provided.
-- `answer()`/`answer_stream()` call MiniMax-M3 with `thinking: "disabled"`,
+- `answer()`/`answer_stream()` call deepseek-flash with `thinking: "disabled"`,
   `max_tokens=1500`, the context-augmented system prompt, and the last
   `MAX_HISTORY_TURNS` conversation turns. Both defensively strip any leaked
   `<think>` block (see "Single LLM provider" above); `answer_stream`
@@ -1171,7 +1202,8 @@ primary path has proven stable in production.
 | Const | Value | Effect |
 |---|---|---|
 | `VOYAGE_MODEL` | `voyage-4-large` | embedding model (query + doc must match index) |
-| `MINIMAX_MODEL` | `MiniMax-M3` (official API) | query rewrite + route classifier, and final answer |
+| `DEEPSEEK_MODEL` | `deepseek-flash` (official API) | query rewrite + route classifier, and final answer |
+| `ADAPTIVE_REASONING_EFFORT` | `low` | DeepSeek effort used where the code asks for `adaptive` thinking (default-mode verify call) |
 | `QUESTION_K` | 40 | question-vectors pulled from Chroma before collapsing |
 | `MAX_CHUNK_DISTANCE` | 0.75 | cosine distance cutoff — chunks worse than this are dropped, not backfilled |
 | `N_CONTEXT` | 4 | max distinct chunks the **filtered** pass contributes (graph blocks additive, uncapped; can be fewer if the cutoff filters hard) |
@@ -1457,7 +1489,7 @@ not in the answer text.
   branch. If course planning (or research/guidance modes) get rebuilt later,
   they're starting from scratch — no scaffolding (`PlanningState`, the
   `planning_state` SSE event, `ModeTag.tsx`, `Message.mode`) was preserved.
-- **MiniMax account-level Token Plan rate limit (429)**: opaque,
+- **(Historical — MiniMax, replaced 2026-09-26.) MiniMax account-level Token Plan rate limit (429)**: opaque,
   token-throughput-based (not a flat request cap). Hit reliably under
   back-to-back calls (e.g. batch testing) — surfaces as `rate_limit_error
   (2062)` and, in `rewrite_and_route`, falls back to vector-only. The answer

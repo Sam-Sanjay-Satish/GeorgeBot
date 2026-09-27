@@ -2,7 +2,7 @@
 """
 GeorgeBot — v2 RAG backend.
 
-Two retrieval paths, routed per-query by a single MiniMax-M3 call:
+Two retrieval paths, routed per-query by a single deepseek-flash call:
 
   - Graph path   — course/program facts (prereqs, credits, cross-listings,
                    descriptions, program requirements, outlines) come straight
@@ -18,22 +18,22 @@ Two retrieval paths, routed per-query by a single MiniMax-M3 call:
                    distance, then collapse by `chunk_id` back to distinct
                    parent chunks (full text + metadata).
 
-Then MiniMax-M3 reads whichever context was assembled and writes the final,
+Then deepseek-flash reads whichever context was assembled and writes the final,
 source-cited answer (see `_call_llm`/`answer`/`answer_stream`). Single
-provider — the official MiniMax API (OpenAI-compatible), not the Kesar-
-proxied alias. Both route/rewrite AND the answer step run with
+provider — the official DeepSeek API (OpenAI-compatible); it replaced
+MiniMax-M3 on 2026-09-26. Both route/rewrite AND the answer step run with
 `thinking: "disabled"` — the answer step was switched off (from adaptive)
 once the reference material moved into the system prompt and the prompt was
 rewritten to own the "ignore irrelevant material / answer from own knowledge"
 behavior directly (see `SYSTEM_PROMPT` / `_system_prompt_with_context`), for
-~2x lower answer latency. Both set `reasoning_split: True` so any hidden
-reasoning stays out of visible content.
+~2x lower answer latency. DeepSeek returns any reasoning in a separate
+`reasoning_content` field, which is never read.
 
 Usage:
   python3 backend/chatbot.py --ask "your question"   # one-shot CLI (no server)
   python3 backend/api.py                              # FastAPI server (see api.py)
 
-Env (.env): MINIMAX_SUB_KEY, VOYAGE_API_KEY
+Env (.env): DEEPSEEK_API_KEY, VOYAGE_API_KEY
 """
 
 import argparse
@@ -84,9 +84,9 @@ def _iter_visible_deltas(chunks):
     dropping any `<think>...</think>` span — even when the tags are split across
     chunk boundaries. Streaming equivalent of `THINK_TAG_RE.sub("", ...)`.
 
-    `reasoning_split: True` is supposed to keep reasoning out of `content`
-    entirely (it lands in a separate `reasoning_content` field we never read),
-    but leaks were observed in practice (see `_call_llm`), so filter defensively.
+    DeepSeek returns reasoning in a separate `reasoning_content` field we never
+    read, so `content` should be clean — but raw `<think>` leaks were observed
+    under the previous provider (MiniMax), so filter defensively.
     """
     pending = ""
     in_think = False
@@ -122,6 +122,18 @@ def _iter_visible_deltas(chunks):
     # Flush any trailing text that wasn't a real (partial) tag.
     if not in_think and pending:
         yield pending
+
+
+def _thinking_kwargs(thinking: str) -> dict:
+    """Map the code's thinking modes onto DeepSeek's request params.
+
+    "disabled" -> thinking off. Anything else ("adaptive", MiniMax's old mode) ->
+    thinking on at ADAPTIVE_REASONING_EFFORT. DeepSeek counts reasoning tokens
+    against max_tokens, same as MiniMax did (see VERIFY_ANSWER_MAX_TOKENS)."""
+    if thinking == "disabled":
+        return {"extra_body": {"thinking": {"type": "disabled"}}}
+    return {"extra_body": {"thinking": {"type": "enabled"}},
+            "reasoning_effort": ADAPTIVE_REASONING_EFFORT}
 
 
 _CITED_TAG_OPEN = "<<CITED_SOURCES:"
@@ -229,10 +241,15 @@ VALID_AUDIENCES = ("undergrad", "faculty", "both")
 DEFAULT_AUDIENCE = "both"
 VOYAGE_MODEL = "voyage-4-large"
 
-# Single provider — official MiniMax API (OpenAI-compatible), not the
-# Kesar-proxied alias. See repo memory: minimax-official-api.
-MINIMAX_BASE_URL = "https://api.minimax.io/v1"
-MINIMAX_MODEL = "MiniMax-M3"
+# Single provider — official DeepSeek API (OpenAI-compatible). Replaced MiniMax-M3
+# on 2026-09-26; deepseek-flash was picked over deepseek-v4-pro on the 40-query
+# golden set (similar quality, ~2x faster, ~4x cheaper). Note api.deepseek.com is
+# blocked on UVic campus wifi — local runs from campus fail; Railway is unaffected.
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL = "deepseek-flash"
+# The code keeps MiniMax's two thinking modes ("disabled" / "adaptive").
+# DeepSeek has no "adaptive": it maps to thinking enabled at this effort.
+ADAPTIVE_REASONING_EFFORT = "low"
 LLM_MAX_TOKENS = 4000    # route/rewrite budget
 ANSWER_MAX_TOKENS = 1500  # answer budget (thinking disabled -- no reasoning overhead,
                            # so this is a pure answer-length budget)
@@ -397,7 +414,7 @@ class GeorgeBot:
         from dotenv import load_dotenv
         load_dotenv()
 
-        missing = [k for k in ("MINIMAX_SUB_KEY", "VOYAGE_API_KEY") if not os.getenv(k)]
+        missing = [k for k in ("DEEPSEEK_API_KEY", "VOYAGE_API_KEY") if not os.getenv(k)]
         if missing:
             print(f"ERROR: missing env var(s): {', '.join(missing)} (set them in .env)",
                   file=sys.stderr)
@@ -412,8 +429,8 @@ class GeorgeBot:
         t0 = time.monotonic()
         print("Loading GeorgeBot...")
 
-        # Route/rewrite + answer — official MiniMax API (OpenAI-compatible).
-        self.llm = openai.OpenAI(api_key=os.getenv("MINIMAX_SUB_KEY"), base_url=MINIMAX_BASE_URL)
+        # Route/rewrite + answer — official DeepSeek API (OpenAI-compatible).
+        self.llm = openai.OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"), base_url=DEEPSEEK_BASE_URL)
         self.voyage = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
 
         if not TAXONOMY_FILE.exists():
@@ -1307,22 +1324,20 @@ class GeorgeBot:
     def _call_llm(self, messages: list[dict], system: str | None = None,
                    max_tokens: int = LLM_MAX_TOKENS, thinking: str = "disabled") -> str | None:
         """
-        Call MiniMax-M3 and return the visible text, or None on failure.
+        Call deepseek-flash and return the visible text, or None on failure.
 
-        `reasoning_split: True` is supposed to keep `message.content` clean of
-        raw `<think>...</think>` text regardless of the `thinking` setting
-        (see memory: minimax-official-api), but this isn't 100% reliable in
-        practice (observed leaks even with the flag set) — strip any
-        `<think>` block defensively regardless. If the response gets cut off
+        DeepSeek puts reasoning in `reasoning_content`, never `content`, but
+        the previous provider (MiniMax) leaked raw `<think>...</think>` text
+        into `content`, so any `<think>` block is still stripped defensively. If the response gets cut off
         mid-answer (finish_reason == "length") discard and retry rather than
         return a truncated answer.
         """
         full_messages = ([{"role": "system", "content": system}] if system else []) + messages
         kwargs: dict = {
-            "model": MINIMAX_MODEL,
+            "model": DEEPSEEK_MODEL,
             "max_tokens": max_tokens,
             "messages": full_messages,
-            "extra_body": {"reasoning_split": True, "thinking": {"type": thinking}},
+            **_thinking_kwargs(thinking),
         }
         for _attempt in range(LLM_MAX_RETRIES + 1):
             resp = self.llm.chat.completions.create(**kwargs)
@@ -1616,7 +1631,19 @@ class GeorgeBot:
         "directly and helpfully. If there is a specific UVic fact you cannot "
         "confirm, point the user to where they can get it (e.g. 'check your "
         "course syllabus or ask your department directly') rather than saying "
-        "you don't have it.\n\n"
+        "you don't have it.\n"
+        "Talk about UVic, never about your own lookup. Attribute facts to UVic "
+        "itself ('UVic's Visual Arts page says…', 'the History department "
+        "lists…'), never to what you were shown or searched. The user has no "
+        "idea a lookup happened, so phrasing like 'in the material above', 'in "
+        "what I have', 'what I can see', 'in front of me', 'as captured', 'the "
+        "search also surfaced', 'the worksheet I'm drawing on', or 'I can't see "
+        "a list' exposes machinery they never asked about — rephrase to be about "
+        "UVic, or point them to where to look.\n"
+        "The [n] block numbers exist only for the CITED SOURCES tag at the end. "
+        "Never write them anywhere in the answer text — no '[1]', '[2][5]', "
+        "'(see [3])', or 'referenced in [4]'. The user cannot see the blocks, so "
+        "a bracketed number means nothing to them.\n\n"
         "ACCURACY\n"
         "- Ground specific facts (a status like 'no longer offered', a course "
         "sequence, a number, a date, a policy detail) in what the reference "
@@ -1724,12 +1751,16 @@ class GeorgeBot:
         "After you finish writing your answer, on a new line by itself, "
         "report which numbered reference blocks (the [n] tags in the "
         "reference material above) you actually relied on to write it. "
-        "Format: `<<CITED_SOURCES: 2,3>>` listing only the numbers you "
+        "Format: <<CITED_SOURCES: 2,3>> listing only the numbers you "
         "used, in any order — not every number that was offered to you, "
         "just the ones you actually leaned on. If you answered from your "
         "own knowledge without relying on any numbered material (including "
-        "when all of it was irrelevant), write `<<CITED_SOURCES: none>>` "
-        "instead. This must be the very last thing in your response, "
+        "when all of it was irrelevant), write <<CITED_SOURCES: none>> "
+        "instead. Write the tag as plain characters, with no backticks, "
+        "quotes, or other formatting around it. Every answer needs it, "
+        "including a very short one or one that just points the user to a "
+        "page or form — a missing tag hides the sources that answer used. "
+        "This must be the very last thing in your response, "
         "exactly once, with nothing after it, and never mentioned or "
         "explained anywhere in the visible answer. (This does not apply "
         "when you are writing a NEED_MORE JSON response instead of an "
@@ -1800,13 +1831,13 @@ class GeorgeBot:
         "- If it is — the common case, including when the material is "
         "irrelevant and you should answer from your own knowledge per the "
         "rules above — start your response with exactly the line "
-        "`<<SUFFICIENT>>` followed by a newline, then write the answer "
+        "<<SUFFICIENT>> followed by a newline, then write the answer "
         "normally.\n"
         "- ONLY if there is a concrete, identifiable gap that better "
         "retrieval could plausibly fix — the question names a specific "
         "term/date you have no data for, or the search query clearly "
         "doesn't match what was actually asked — start your response with "
-        "exactly the line `<<NEED_MORE>>` followed by a newline, then a "
+        "exactly the line <<NEED_MORE>> followed by a newline, then a "
         "single JSON object and nothing else: {\"reason\": \"<one short "
         "sentence>\", \"search_query\": \"<a better search query>\" or "
         "null, \"term_season\": \"spring\"|\"summer\"|\"fall\" or null, "
@@ -1818,7 +1849,11 @@ class GeorgeBot:
         "thorough, more detailed, or cover more related topics — that is "
         "not what this is for, and it should be rare. Reserve it strictly "
         "for a clear, nameable retrieval miss, never for general "
-        "thoroughness."
+        "thoroughness.\n"
+        "- The header line is machine-read and removed before the user sees "
+        "anything. It must contain only those exact characters — no "
+        "backticks, quotes, bold, or other formatting around it, and no "
+        "answer text on the same line. The answer starts on the next line."
     )
 
     def _quick_mode_system_prompt(self) -> str:
@@ -1949,11 +1984,11 @@ class GeorgeBot:
         use this to decide whether to retry)."""
         full_messages = [{"role": "system", "content": system}] + messages
         stream = self.llm.chat.completions.create(
-            model=MINIMAX_MODEL,
+            model=DEEPSEEK_MODEL,
             max_tokens=max_tokens,
             messages=full_messages,
-            extra_body={"reasoning_split": True, "thinking": {"type": thinking}},
             stream=True,
+            **_thinking_kwargs(thinking),
         )
 
         finish_reason = None

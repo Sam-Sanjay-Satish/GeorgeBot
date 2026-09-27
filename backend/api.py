@@ -22,7 +22,7 @@ HTTP API:
 Every chat turn is recorded to the query log (querylog.py) — best-effort, so a
 logging failure never affects the answer.
 
-Env (.env): MINIMAX_SUB_KEY, VOYAGE_API_KEY, ADMIN_TOKEN (admin routes)
+Env (.env): DEEPSEEK_API_KEY, VOYAGE_API_KEY, ADMIN_TOKEN (admin routes)
 
 Rate limiting (chat endpoints only; all optional, sane defaults):
   RATE_LIMIT_QUICK_PER_MIN / RATE_LIMIT_DEFAULT_PER_MIN  per-device refill rates
