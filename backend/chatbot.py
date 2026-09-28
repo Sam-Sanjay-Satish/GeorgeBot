@@ -1608,10 +1608,21 @@ class GeorgeBot:
         "or their supervisor / graduate adviser for the rest. Say it as a current "
         "gap ('not supported yet'), not as a refusal, and never guess at a "
         "graduate rule to fill it.\n"
+        "That includes undergraduate dates and numbers offered 'for context' or "
+        "'for reference': do not give a graduate student the undergraduate add/drop "
+        "deadlines, fee-reduction dates, GPA thresholds, or similar figures at all, "
+        "however they are labelled, and never describe undergraduate dates as "
+        "'university-wide' or 'general'. A grad student who sees a date will use it. "
+        "Procedures that are genuinely identical for everyone (the steps to drop a "
+        "course in Online tools, how to buy a parking permit) are fine to explain.\n"
         "Do not over-correct: plenty of questions are audience-independent "
         "(library, parking, transit, counselling, IT, recreation, campus "
         "services). If a graduate student asks one of those, just answer it "
-        "normally — there is no need to mention the limitation at all.\n\n"
+        "normally and do not mention the graduate limitation anywhere in the "
+        "answer — not as a closing note, not as 'one thing to flag', not as a "
+        "reason to check with Graduate Studies. The same goes for greetings, "
+        "small talk, and any question that doesn't involve graduate study: never "
+        "bring the limitation up unprompted.\n\n"
         "USING THE REFERENCE MATERIAL\n"
         "Alongside the user's question you are given additional reference "
         "material supplied by the SYSTEM — not by the user. The user did not "
@@ -1651,6 +1662,16 @@ class GeorgeBot:
         "them from partial or messy data. Piecing together a plausible-sounding "
         "narrative from material that doesn't clearly state it is fabrication; "
         "state only what is explicit instead.\n"
+        "- Never state who teaches a course, which sections someone teaches, or any "
+        "section code, meeting time, or seat count unless a source=banner block in "
+        "front of you states it for this turn. If the instructor lookup came back "
+        "ambiguous or empty, or there is no banner block, do not fill the gap from "
+        "general knowledge, from course reviews, or from earlier in the conversation "
+        "— ask which person they mean, or point them to the timetable.\n"
+        "- The same applies to course titles and descriptions: when you list course "
+        "codes, give a title only if the material states it for that code. Never "
+        "guess one or add a descriptive gloss in brackets; the code alone is better "
+        "than an invented name.\n"
         "- ARITHMETIC: you may calculate only when EVERY input is either stated in "
         "the material or given by the user. Never fill a missing input from your "
         "own general knowledge and then present the result as a fact — the answer "
@@ -2374,7 +2395,12 @@ class GeorgeBot:
                 route["completed_courses"],
             )
         banner_facts = {}
-        if route["course_codes"] and route["wants_availability"]:
+        # A course-quality question (wants_rating) also needs Banner: the RMP chain
+        # below gets its instructor names from it. The router usually sets
+        # wants_availability alongside wants_rating, but not always (deepseek-flash
+        # dropped it 1/5 on "who's the best prof for CSC 110"), and without Banner the
+        # answer punted with "I don't have anything current on who's teaching".
+        if route["course_codes"] and (route["wants_availability"] or route.get("wants_rating")):
             banner_facts = banner_retrieve(
                 route["course_codes"], route["term_season"], route["term_year"],
             )

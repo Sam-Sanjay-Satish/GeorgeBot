@@ -467,6 +467,16 @@ def search_by_instructor(name: str, term: str) -> dict:
     # Dedup by display name (one person can appear once per term-assignment).
     descs = list(dict.fromkeys(m.get("description") for m in matches if m.get("description")))
 
+    # Exact-name short-circuit (same fix as rmp._professor_entry). get_instructor is
+    # fuzzy on every token, so a full name drags back everyone sharing a substring —
+    # "Yun Lu" returns 15 names containing "lu", "Celina Berg" returns 7 — which used
+    # to trip the ambiguity path even though the person asked about was in the list.
+    # Verified 2026-09-28: 2 of 5 real CSC/MATH instructors were un-lookup-able.
+    wanted = " ".join(name.split()).lower()
+    exact = [m for m in matches if " ".join((m.get("description") or "").split()).lower() == wanted]
+    if len({m["description"] for m in exact}) == 1:
+        matches, descs = exact, [exact[0]["description"]]
+
     if not descs:
         result = {"instructor": None, "candidates": [], "sections": []}
     elif len(descs) > 1:

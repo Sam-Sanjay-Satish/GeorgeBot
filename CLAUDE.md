@@ -815,6 +815,15 @@ gate would never open. See `BANNER_API.md` for the endpoint research.
   (120s). A common surname returns multiple `get_instructor` matches → the block tells
   the model to ask the user to disambiguate (like the ambiguous-program flow). See the
   `get_instructor` gotcha in `BANNER_API.md`.
+  ⚠️ **`get_instructor` is fuzzy on every token, so a FULL name can come back
+  "ambiguous" too — an exact-name short-circuit handles it (fixed 2026-09-28).**
+  "Yun Lu" returned 15 names containing "lu" and "Celina Berg" 7, so 2 of 5 real
+  CSC/MATH instructors could not be looked up at all, even though the exact person
+  was in the list. `search_by_instructor` now resolves to the one match whose
+  display name equals the query (case/whitespace-insensitive) before falling back
+  to the ambiguity path — the same fix `rmp._professor_entry` already had. The
+  ambiguous block was also the trigger for the one live-data fabrication seen in
+  testing (the model filled in a schedule from memory), so don't remove it.
 - **Caching is in-process + ephemeral (NOT the Volume)** — freshness is the point.
   Each search uses its **own dedicated `requests.Session`** (`_handshake_session`),
   NOT a shared one: Banner's `searchResults` replays the session's *previous* search
@@ -861,6 +870,10 @@ best-effort ({} on failure), like Banner. See `RMP_API.md`.
   look that name up directly; (b) router set `wants_rating` on a *course*-quality
   question → chain on the instructor names Banner just resolved
   (`_instructor_names_from_banner`, both Banner shapes). Neither → no call.
+  Because (b) depends on Banner, `retrieve_with_route` runs the Banner course
+  lookup on `course_codes` + (`wants_availability` **or** `wants_rating`) — the
+  router doesn't always set both (deepseek-flash dropped `wants_availability` 1/5
+  on "who's the best prof for CSC 110", and the answer punted).
   `professor_query` wins if both are present.
 - **One GraphQL search call** returns the summary fields on the teacher node
   directly; a **second call** pulls the 20 reviews only for a single clean match.
@@ -1167,7 +1180,14 @@ primary path has proven stable in production.
   return/yield the parsed numbers alongside the answer. `_filter_cited_sources`
   then trims `format_sources()`'s output down to just those numbers before
   it's sent to the frontend — `cited=None` (marker missing/malformed) fails
-  open and shows everything rather than hiding real sources. In the
+  open and shows everything rather than hiding real sources. ⚠️ Fail-open makes
+  the omission rate matter: deepseek-flash left the marker off ~10-15% of answers
+  on every path (measured 2026-09-28, 50-question probe), each time padding the
+  Sources panel with every retrieved page. A prompt fix was tried and measured to
+  do nothing: a one-line REMINDER of the tag appended *after* the reference
+  material (the rule itself sits before it) went 16/147 missing → 15/147, so it
+  was reverted as dead weight. Fixing this needs a code decision on what
+  `cited=None` should show — fail-open was deliberately left as-is for now. In the
   streaming endpoint this means the `sources` SSE event now fires *after*
   all `token` events (previously before) — harmless, since the frontend
   already buffers sources until the answer finishes revealing regardless.
@@ -1355,6 +1375,16 @@ not in the answer text.
     false here** — the fee table, retrieval, and labels were all correct. That
     makes this a prompt-confidence fix, not a deterministic one; treat future
     regressions as "re-measure across several runs", not "the rule is gone".
+- **Live-data and course-title fabrication rules (2026-09-28, deepseek-flash).**
+  Two ACCURACY bullets: never state who teaches what, section codes, times or seat
+  counts without a `source=banner` block for this turn (seen once: after an
+  ambiguous instructor lookup, quick mode invented "CSC 110 A01/A02, 60 seats
+  open" from RMP reviews / conversation history), and never guess a course title
+  or add a bracketed gloss ("CSC 350 – (Computer Architecture / …)"). The grad
+  section in `_ANSWER_RULES_HEAD` was tightened at the same time: no undergraduate
+  dates/figures "for context" to a grad student (they were being labelled
+  "university-wide"), and no unprompted mention of the grad gap on neutral
+  questions or greetings (deepseek-flash over-mentioned it ~5/25 runs).
 - **Anti-fabrication rule for garbled table data (real incident, root-caused).**
   A user reported the bot confidently claiming "CSC 116 is no longer offered"
   plus a fabricated course-sequencing narrative, and — worse — when asked to
