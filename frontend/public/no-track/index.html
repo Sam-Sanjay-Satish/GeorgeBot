@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>GeorgeBot</title>
+  </head>
+  <body style="font-family: system-ui, sans-serif; padding: 2rem">
+    <p id="msg">Analytics disabled for this browser.</p>
+    <script>
+      try {
+        localStorage.setItem('va-disable', 'true')
+      } catch {
+        document.getElementById('msg').textContent =
+          'Could not save the opt-out (storage is blocked in this browser).'
+      }
+    </script>
+  </body>
+</html>
